@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment variables (NEVER push these)
+.env
+.env.local
+
+# Firebase Admin SDK keys (NEVER push these)
+*.json
+!package-lock.json  # Keep package-lock, ignore all other json files for safety
+!tsconfig.json      # Keep tsconfig
+# Or specifically:
+# tagaaara-app-firebase-adminsdk*.json
+
+# Compiled output (don't push the built JS, let the cloud build it)
+/dist/
+/build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
