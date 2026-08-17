@@ -3,111 +3,122 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+    App,
     cert,
     getApps,
     initializeApp,
 } from 'firebase-admin/app';
 
-import {
-    getAuth,
-    Auth,
-} from 'firebase-admin/auth';
-
-import {
-    getDatabase,
-    Database,
-} from 'firebase-admin/database';
+import { getAuth, Auth } from 'firebase-admin/auth';
+import { getDatabase, Database } from 'firebase-admin/database';
 
 dotenv.config();
 
-let firebaseApp;
+/*
+|--------------------------------------------------------------------------
+| Environment variables
+|--------------------------------------------------------------------------
+*/
 
-if (getApps().length === 0) {
-    const databaseURL = process.env.FIREBASE_DATABASE_URL;
+const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
+const firebaseClientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+const firebasePrivateKey = process.env.FIREBASE_PRIVATE_KEY;
+const firebaseDatabaseUrl = process.env.FIREBASE_DATABASE_URL;
+const firebaseAdminSdkPath = process.env.FIREBASE_ADMIN_SDK_PATH;
 
-    if (!databaseURL) {
-        throw new Error('Missing FIREBASE_DATABASE_URL');
-    }
+/*
+|--------------------------------------------------------------------------
+| Initialize Firebase Admin
+|--------------------------------------------------------------------------
+*/
 
-    // ============================================================
-    // LOCAL DEVELOPMENT
-    // Uses Firebase service-account JSON
-    // ============================================================
+let firebaseApp: App;
 
-    const serviceAccountPath = process.env.FIREBASE_ADMIN_SDK_PATH;
+/*
+|--------------------------------------------------------------------------
+| Option 1: Service account JSON file
+|--------------------------------------------------------------------------
+*/
 
-    if (serviceAccountPath) {
-        const resolvedPath = path.resolve(
-            process.cwd(),
-            serviceAccountPath,
-        );
+if (firebaseAdminSdkPath) {
+    const resolvedPath = path.resolve(
+        process.cwd(),
+        firebaseAdminSdkPath,
+    );
 
-        if (!fs.existsSync(resolvedPath)) {
-            throw new Error(
-                `Firebase service account file not found: ${resolvedPath}`,
-            );
-        }
-
-        const serviceAccount = JSON.parse(
-            fs.readFileSync(resolvedPath, 'utf8'),
-        );
-
-        firebaseApp = initializeApp({
-            credential: cert(serviceAccount),
-            databaseURL,
-        });
-
-        console.log(
-            '✅ Firebase Admin initialized using service account file',
+    if (!fs.existsSync(resolvedPath)) {
+        throw new Error(
+            `Firebase service account file not found: ${resolvedPath}`,
         );
     }
 
-    // ============================================================
-    // RENDER / PRODUCTION
-    // Uses environment variables
-    // ============================================================
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const serviceAccount = require(resolvedPath);
 
-    else {
-        const projectId = process.env.FIREBASE_PROJECT_ID;
-        const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-        const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    firebaseApp =
+        getApps().length > 0
+            ? getApps()[0]
+            : initializeApp({
+                credential: cert(serviceAccount),
+                databaseURL: firebaseDatabaseUrl,
+            });
 
-        if (!projectId) {
-            throw new Error('Missing FIREBASE_PROJECT_ID');
-        }
-
-        if (!clientEmail) {
-            throw new Error('Missing FIREBASE_CLIENT_EMAIL');
-        }
-
-        if (!privateKey) {
-            throw new Error('Missing FIREBASE_PRIVATE_KEY');
-        }
-
-        firebaseApp = initializeApp({
-            credential: cert({
-                projectId,
-                clientEmail,
-                privateKey: privateKey.replace(/\\n/g, '\n'),
-            }),
-            databaseURL,
-        });
-
-        console.log(
-            '✅ Firebase Admin initialized using environment variables',
-        );
-    }
-} else {
-    firebaseApp = getApps()[0];
-
-    console.log('ℹ️ Firebase Admin already initialized');
+    console.log('✅ Firebase Admin initialized using service account file');
 }
 
-// ============================================================
-// Firebase services
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| Option 2: Render / production environment variables
+|--------------------------------------------------------------------------
+|
+| This is useful when the JSON service-account file is NOT committed
+| to GitHub.
+|--------------------------------------------------------------------------
+*/
 
-export const adminAuth: Auth = getAuth(firebaseApp);
+else if (
+    firebaseProjectId &&
+    firebaseClientEmail &&
+    firebasePrivateKey
+) {
+    const privateKey = firebasePrivateKey.replace(/\\n/g, '\n');
+
+    firebaseApp =
+        getApps().length > 0
+            ? getApps()[0]
+            : initializeApp({
+                credential: cert({
+                    projectId: firebaseProjectId,
+                    clientEmail: firebaseClientEmail,
+                    privateKey,
+                }),
+                databaseURL: firebaseDatabaseUrl,
+            });
+
+    console.log(
+        '✅ Firebase Admin initialized using environment variables',
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Firebase configuration missing
+|--------------------------------------------------------------------------
+*/
+
+else {
+    throw new Error(
+        'Firebase configuration is missing. Set either FIREBASE_ADMIN_SDK_PATH or FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, and FIREBASE_PRIVATE_KEY.',
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Firebase services
+|--------------------------------------------------------------------------
+*/
+
+export const firebaseAuth: Auth = getAuth(firebaseApp);
 
 export const realtimeDb: Database = getDatabase(firebaseApp);
 
