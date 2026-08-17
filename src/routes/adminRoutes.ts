@@ -1,17 +1,20 @@
 import { Router, Request, Response } from 'express';
-import { adminAuth, realtimeDb } from '../config/firebase';
+import { firebaseAuth, realtimeDb } from '../config/firebase';
 import pool from '../config/database';
 
 const router = Router();
 
 /*
 |--------------------------------------------------------------------------
-| CREATE ADMIN
+| POST /api/admin/create
 |--------------------------------------------------------------------------
-| Creates the admin in:
+| Creates an admin in:
+|
 | 1. Firebase Authentication
 | 2. PostgreSQL
 | 3. Firebase Realtime Database
+|
+| If a later step fails, earlier steps are rolled back where possible.
 |--------------------------------------------------------------------------
 */
 
@@ -37,85 +40,119 @@ router.post('/create', async (req: Request, res: Response) => {
         });
     }
 
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedFullName = String(fullName).trim();
+
     try {
+        // ---------------------------------------------------------
+        // Check if admin already exists in PostgreSQL
+        // ---------------------------------------------------------
+
+        const existingAdmin = await pool.query(
+            `
+            SELECT id
+            FROM public.admins
+            WHERE LOWER(email) = $1
+            LIMIT 1
+            `,
+            [normalizedEmail],
+        );
+
+        if (existingAdmin.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                error: 'An admin with this email already exists.',
+                code: 'ADMIN_ALREADY_EXISTS',
+            });
+        }
+
         // ---------------------------------------------------------
         // 1. CREATE USER IN FIREBASE AUTHENTICATION
         // ---------------------------------------------------------
 
-        const firebaseUser = await adminAuth.createUser({
-            email,
+        const firebaseUser = await firebaseAuth.createUser({
+            email: normalizedEmail,
             password,
-            displayName: fullName,
+            displayName: normalizedFullName,
         });
 
         const firebaseUid = firebaseUser.uid;
 
         console.log(
             '✅ Firebase Auth user created:',
-            firebaseUid
+            firebaseUid,
         );
 
         // ---------------------------------------------------------
         // 2. SAVE ADMIN IN POSTGRESQL
         // ---------------------------------------------------------
 
-        const query = `
-            INSERT INTO public.admins
-            (
-                firebase_uid,
-                email,
-                full_name,
-                phone_number,
-                username,
-                profile_photo_url,
-                account_status
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id;
-        `;
-
-        const values = [
-            firebaseUid,
-            email,
-            fullName,
-            phoneNumber || null,
-            username || null,
-            profilePhoto || null,
-            accountStatus || 'active',
-        ];
-
         let result;
 
         try {
+            const query = `
+                INSERT INTO public.admins
+                (
+                    firebase_uid,
+                    email,
+                    full_name,
+                    phone_number,
+                    username,
+                    profile_photo_url,
+                    account_status,
+                    role
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    $8
+                )
+                RETURNING *;
+            `;
+
+            const values = [
+                firebaseUid,
+                normalizedEmail,
+                normalizedFullName,
+                phoneNumber || null,
+                username || null,
+                profilePhoto || null,
+                accountStatus || 'active',
+                'admin',
+            ];
+
             result = await pool.query(query, values);
 
             console.log(
                 '✅ Admin saved to PostgreSQL:',
-                result.rows[0].id
+                result.rows[0].id,
             );
-        } catch (postgresError) {
-            /*
-             * PostgreSQL failed after Firebase Auth succeeded.
-             *
-             * Delete Firebase user so we don't leave
-             * an incomplete admin account behind.
-             */
-
+        } catch (postgresError: any) {
             console.error(
                 '❌ PostgreSQL insert failed:',
-                postgresError
+                postgresError,
             );
 
+            // -----------------------------------------------------
+            // Roll back Firebase Authentication
+            // -----------------------------------------------------
+
             try {
-                await adminAuth.deleteUser(firebaseUid);
+                await firebaseAuth.deleteUser(firebaseUid);
 
                 console.log(
-                    '↩️ Firebase Auth user rolled back.'
+                    '↩️ Firebase Auth user rolled back.',
                 );
             } catch (rollbackError) {
                 console.error(
-                    '❌ Firebase rollback failed:',
-                    rollbackError
+                    '❌ Firebase Auth rollback failed:',
+                    rollbackError,
                 );
             }
 
@@ -128,8 +165,8 @@ router.post('/create', async (req: Request, res: Response) => {
 
         const adminData = {
             uid: firebaseUid,
-            email: email,
-            fullName: fullName,
+            email: normalizedEmail,
+            fullName: normalizedFullName,
             phoneNumber: phoneNumber || '',
             username: username || '',
             profilePhoto: profilePhoto || '',
@@ -145,36 +182,52 @@ router.post('/create', async (req: Request, res: Response) => {
                 .set(adminData);
 
             console.log(
-                '✅ Admin saved to Firebase Realtime Database'
+                '✅ Admin saved to Firebase Realtime Database:',
+                `admins/${firebaseUid}`,
             );
-        } catch (firebaseDbError) {
-            /*
-             * Realtime Database failed.
-             *
-             * Delete the PostgreSQL record and Firebase Auth
-             * user to prevent an incomplete account.
-             */
-
+        } catch (firebaseDbError: any) {
             console.error(
                 '❌ Firebase Realtime Database failed:',
-                firebaseDbError
+                firebaseDbError,
             );
+
+            // -----------------------------------------------------
+            // Roll back PostgreSQL
+            // -----------------------------------------------------
 
             try {
                 await pool.query(
-                    'DELETE FROM public.admins WHERE id = $1',
-                    [result.rows[0].id]
+                    `
+                    DELETE FROM public.admins
+                    WHERE id = $1
+                    `,
+                    [result.rows[0].id],
                 );
-
-                await adminAuth.deleteUser(firebaseUid);
 
                 console.log(
-                    '↩️ Account creation rolled back.'
+                    '↩️ PostgreSQL admin record rolled back.',
                 );
-            } catch (rollbackError) {
+            } catch (postgresRollbackError) {
                 console.error(
-                    '❌ Rollback failed:',
-                    rollbackError
+                    '❌ PostgreSQL rollback failed:',
+                    postgresRollbackError,
+                );
+            }
+
+            // -----------------------------------------------------
+            // Roll back Firebase Authentication
+            // -----------------------------------------------------
+
+            try {
+                await firebaseAuth.deleteUser(firebaseUid);
+
+                console.log(
+                    '↩️ Firebase Auth user rolled back.',
+                );
+            } catch (firebaseRollbackError) {
+                console.error(
+                    '❌ Firebase Auth rollback failed:',
+                    firebaseRollbackError,
                 );
             }
 
@@ -191,35 +244,127 @@ router.post('/create', async (req: Request, res: Response) => {
             uid: firebaseUid,
             adminId: result.rows[0].id,
             realtimeDatabasePath: `admins/${firebaseUid}`,
+            admin: {
+                id: result.rows[0].id,
+                firebaseUid: result.rows[0].firebase_uid,
+                email: result.rows[0].email,
+                fullName: result.rows[0].full_name,
+                phoneNumber: result.rows[0].phone_number,
+                username: result.rows[0].username,
+                profilePhoto: result.rows[0].profile_photo_url,
+                accountStatus: result.rows[0].account_status,
+                role: result.rows[0].role,
+                createdAt: result.rows[0].created_at,
+            },
         });
-
     } catch (error: any) {
         console.error(
             '❌ Error creating admin:',
-            error
+            error,
         );
 
+        // ---------------------------------------------------------
         // Firebase duplicate email
-        if (error.code === 'auth/email-already-exists') {
+        // ---------------------------------------------------------
+
+        if (
+            error?.code ===
+            'auth/email-already-exists'
+        ) {
             return res.status(409).json({
                 success: false,
-                error: 'An account with this email already exists.',
+                error: 'An account with this email already exists in Firebase.',
+                code: 'FIREBASE_EMAIL_EXISTS',
             });
         }
 
-        // PostgreSQL duplicate constraint
-        if (error.code === '23505') {
-            return res.status(409).json({
+        // ---------------------------------------------------------
+        // Firebase invalid email
+        // ---------------------------------------------------------
+
+        if (
+            error?.code ===
+            'auth/invalid-email'
+        ) {
+            return res.status(400).json({
                 success: false,
-                error: 'An admin with this email, username, or Firebase UID already exists.',
+                error: 'The email address is invalid.',
+                code: 'INVALID_EMAIL',
             });
         }
+
+        // ---------------------------------------------------------
+        // Firebase weak password
+        // ---------------------------------------------------------
+
+        if (
+            error?.code ===
+            'auth/password-does-not-meet-requirements'
+        ) {
+            return res.status(400).json({
+                success: false,
+                error: 'The password does not meet Firebase password requirements.',
+                code: 'WEAK_PASSWORD',
+            });
+        }
+
+        // ---------------------------------------------------------
+        // PostgreSQL duplicate constraint
+        // ---------------------------------------------------------
+
+        if (error?.code === '23505') {
+            return res.status(409).json({
+                success: false,
+                error:
+                    'An admin with this email, username, or Firebase UID already exists.',
+                code: 'ADMIN_DUPLICATE',
+            });
+        }
+
+        // ---------------------------------------------------------
+        // Generic server error
+        // ---------------------------------------------------------
 
         return res.status(500).json({
             success: false,
             error:
-                error.message ||
+                error?.message ||
                 'Failed to create admin account.',
+            code: 'ADMIN_CREATION_FAILED',
+        });
+    }
+});
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/admin/exists
+|--------------------------------------------------------------------------
+*/
+
+router.get('/exists', async (_req: Request, res: Response) => {
+    try {
+        const result = await pool.query(
+            `
+            SELECT id
+            FROM public.admins
+            LIMIT 1
+            `,
+        );
+
+        return res.status(200).json({
+            success: true,
+            exists: result.rows.length > 0,
+        });
+    } catch (error: any) {
+        console.error(
+            '❌ Error checking admin existence:',
+            error,
+        );
+
+        return res.status(500).json({
+            success: false,
+            exists: false,
+            error: 'Database error while checking admin existence.',
         });
     }
 });
