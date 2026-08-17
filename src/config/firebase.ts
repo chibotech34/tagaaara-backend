@@ -1,9 +1,26 @@
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { cert, getApps, initializeApp } from 'firebase-admin/app';
+
+import {
+    cert,
+    getApps,
+    initializeApp,
+} from 'firebase-admin/app';
+
+import {
+    getAuth,
+    Auth,
+} from 'firebase-admin/auth';
+
+import {
+    getDatabase,
+    Database,
+} from 'firebase-admin/database';
 
 dotenv.config();
+
+let firebaseApp;
 
 if (getApps().length === 0) {
     const databaseURL = process.env.FIREBASE_DATABASE_URL;
@@ -13,7 +30,8 @@ if (getApps().length === 0) {
     }
 
     // ============================================================
-    // OPTION 1: Local development using Firebase service account
+    // LOCAL DEVELOPMENT
+    // Uses Firebase service-account JSON
     // ============================================================
 
     const serviceAccountPath = process.env.FIREBASE_ADMIN_SDK_PATH;
@@ -34,7 +52,7 @@ if (getApps().length === 0) {
             fs.readFileSync(resolvedPath, 'utf8'),
         );
 
-        initializeApp({
+        firebaseApp = initializeApp({
             credential: cert(serviceAccount),
             databaseURL,
         });
@@ -45,7 +63,8 @@ if (getApps().length === 0) {
     }
 
     // ============================================================
-    // OPTION 2: Render / production environment variables
+    // RENDER / PRODUCTION
+    // Uses environment variables
     // ============================================================
 
     else {
@@ -65,7 +84,7 @@ if (getApps().length === 0) {
             throw new Error('Missing FIREBASE_PRIVATE_KEY');
         }
 
-        initializeApp({
+        firebaseApp = initializeApp({
             credential: cert({
                 projectId,
                 clientEmail,
@@ -79,7 +98,17 @@ if (getApps().length === 0) {
         );
     }
 } else {
+    firebaseApp = getApps()[0];
+
     console.log('ℹ️ Firebase Admin already initialized');
 }
 
-export default getApps()[0];
+// ============================================================
+// Firebase services
+// ============================================================
+
+export const adminAuth: Auth = getAuth(firebaseApp);
+
+export const realtimeDb: Database = getDatabase(firebaseApp);
+
+export default firebaseApp;
