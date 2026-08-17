@@ -1,24 +1,55 @@
-# Dependencies
+# ============================================
+# Tegaara Backend - Git Ignore
+# ============================================
+
+# Node.js dependencies
 node_modules/
 
-# Environment variables (NEVER push these)
+# ============================================
+# Environment variables - NEVER COMMIT
+# ============================================
 .env
 .env.local
+.env.*.local
 
-# Firebase Admin SDK keys (NEVER push these)
-*.json
-!package-lock.json  # Keep package-lock, ignore all other json files for safety
-!tsconfig.json      # Keep tsconfig
-# Or specifically:
-# tagaaara-app-firebase-adminsdk*.json
+# ============================================
+# Firebase Admin SDK credentials - NEVER COMMIT
+# ============================================
+firebase-service-account.json
+serviceAccountKey.json
+*-firebase-adminsdk-*.json
+firebase-adminsdk*.json
 
-# Compiled output (don't push the built JS, let the cloud build it)
-/dist/
-/build/
+# ============================================
+# Build / compiled files
+# ============================================
+dist/
+build/
+coverage/
 
-# IDE
+# ============================================
+# Logs
+# ============================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ============================================
+# IDE / Editor files
+# ============================================
 .vscode/
 .idea/
 
-# OS files
+# ============================================
+# Operating system files
+# ============================================
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================
+# Temporary files
+# ============================================
+*.tmp
+*.temp
