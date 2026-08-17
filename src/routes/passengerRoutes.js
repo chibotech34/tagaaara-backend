@@ -398,6 +398,121 @@ router.get('/wallet/transactions', verifyFirebaseToken, async (req, res) => {
             message: 'Server error while fetching transactions'
         });
     }
+    // ============================================================
+    // ALERTS ROUTES
+    // ============================================================
+
+    // GET /api/passenger/alerts
+    router.get('/alerts', verifyFirebaseToken, async (req, res) => {
+        const uid = req.decodedToken.uid;
+        try {
+            // Query alerts for this passenger from your alerts table.
+            // Adapt the column names to match your actual schema.
+            const result = await pool.query(
+                `SELECT 
+                id,
+                title,
+                description,
+                created_at AS timestamp,
+                is_read AS "isRead",
+                priority,
+                category,
+                target_screen AS "targetScreen",
+                metadata
+             FROM alerts
+             WHERE passenger_uid = $1
+             ORDER BY created_at DESC`,
+                [uid]
+            );
+
+            res.status(200).json({
+                success: true,
+                alerts: result.rows
+            });
+        } catch (error) {
+            console.error('❌ Error fetching passenger alerts:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Server error while fetching alerts'
+            });
+        }
+    });
+
+    // POST /api/passenger/alerts/:id/read
+    router.patch('/alerts/:id/read', verifyFirebaseToken, async (req, res) => {
+        const uid = req.decodedToken.uid;
+        const alertId = req.params.id;
+        try {
+            // Only mark as read if this alert belongs to this passenger
+            const result = await pool.query(
+                `UPDATE alerts
+             SET is_read = TRUE
+             WHERE id = $1 AND passenger_uid = $2
+             RETURNING id`,
+                [alertId, uid]
+            );
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Alert not found or not owned by this user'
+                });
+            }
+            res.status(200).json({ success: true });
+        } catch (error) {
+            console.error('❌ Error marking alert as read:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Server error'
+            });
+        }
+    });
+
+    // POST /api/passenger/alerts/read-all
+    router.patch('/alerts/read-all', verifyFirebaseToken, async (req, res) => {
+        const uid = req.decodedToken.uid;
+        try {
+            await pool.query(
+                `UPDATE alerts
+             SET is_read = TRUE
+             WHERE passenger_uid = $1 AND is_read = FALSE`,
+                [uid]
+            );
+            res.status(200).json({ success: true });
+        } catch (error) {
+            console.error('❌ Error marking all alerts as read:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Server error'
+            });
+        }
+    });
+
+    // DELETE /api/passenger/alerts/:id
+    router.delete('/alerts/:id', verifyFirebaseToken, async (req, res) => {
+        const uid = req.decodedToken.uid;
+        const alertId = req.params.id;
+        try {
+            const result = await pool.query(
+                `DELETE FROM alerts
+             WHERE id = $1 AND passenger_uid = $2
+             RETURNING id`,
+                [alertId, uid]
+            );
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Alert not found or not owned by this user'
+                });
+            }
+            res.status(200).json({ success: true });
+        } catch (error) {
+            console.error('❌ Error deleting alert:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Server error'
+            });
+        }
+    });
 });
 
 module.exports = router;
