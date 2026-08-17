@@ -1,58 +1,85 @@
-import {
-    cert,
-    getApps,
-    initializeApp,
-} from 'firebase-admin/app';
-
-import {
-    getAuth,
-} from 'firebase-admin/auth';
-
-import {
-    getDatabase,
-} from 'firebase-admin/database';
-
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
 
 dotenv.config();
 
-const projectId = process.env.FIREBASE_PROJECT_ID;
-const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-const privateKey = process.env.FIREBASE_PRIVATE_KEY;
-const databaseURL = process.env.FIREBASE_DATABASE_URL;
+if (getApps().length === 0) {
+    const databaseURL = process.env.FIREBASE_DATABASE_URL;
 
-if (!projectId) {
-    throw new Error('Missing FIREBASE_PROJECT_ID');
-}
+    if (!databaseURL) {
+        throw new Error('Missing FIREBASE_DATABASE_URL');
+    }
 
-if (!clientEmail) {
-    throw new Error('Missing FIREBASE_CLIENT_EMAIL');
-}
+    // ============================================================
+    // OPTION 1: Local development using Firebase service account
+    // ============================================================
 
-if (!privateKey) {
-    throw new Error('Missing FIREBASE_PRIVATE_KEY');
-}
+    const serviceAccountPath = process.env.FIREBASE_ADMIN_SDK_PATH;
 
-if (!databaseURL) {
-    throw new Error('Missing FIREBASE_DATABASE_URL');
-}
+    if (serviceAccountPath) {
+        const resolvedPath = path.resolve(
+            process.cwd(),
+            serviceAccountPath,
+        );
 
-const firebasePrivateKey = privateKey.replace(/\\n/g, '\n');
+        if (!fs.existsSync(resolvedPath)) {
+            throw new Error(
+                `Firebase service account file not found: ${resolvedPath}`,
+            );
+        }
 
-const firebaseApp =
-    getApps().length > 0
-        ? getApps()[0]
-        : initializeApp({
+        const serviceAccount = JSON.parse(
+            fs.readFileSync(resolvedPath, 'utf8'),
+        );
+
+        initializeApp({
+            credential: cert(serviceAccount),
+            databaseURL,
+        });
+
+        console.log(
+            '✅ Firebase Admin initialized using service account file',
+        );
+    }
+
+    // ============================================================
+    // OPTION 2: Render / production environment variables
+    // ============================================================
+
+    else {
+        const projectId = process.env.FIREBASE_PROJECT_ID;
+        const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+        const privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+        if (!projectId) {
+            throw new Error('Missing FIREBASE_PROJECT_ID');
+        }
+
+        if (!clientEmail) {
+            throw new Error('Missing FIREBASE_CLIENT_EMAIL');
+        }
+
+        if (!privateKey) {
+            throw new Error('Missing FIREBASE_PRIVATE_KEY');
+        }
+
+        initializeApp({
             credential: cert({
                 projectId,
                 clientEmail,
-                privateKey: firebasePrivateKey,
+                privateKey: privateKey.replace(/\\n/g, '\n'),
             }),
             databaseURL,
         });
 
-export const adminAuth = getAuth(firebaseApp);
+        console.log(
+            '✅ Firebase Admin initialized using environment variables',
+        );
+    }
+} else {
+    console.log('ℹ️ Firebase Admin already initialized');
+}
 
-export const realtimeDb = getDatabase(firebaseApp);
-
-console.log('✅ Firebase Admin initialized');
+export default getApps()[0];
