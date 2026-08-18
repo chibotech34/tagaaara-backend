@@ -19,6 +19,7 @@ firebase-service-account.json
 serviceAccountKey.json
 *-firebase-adminsdk-*.json
 firebase-adminsdk*.json
+tagaara-app-firebase-adminsdk.json
 
 # ============================================
 # Build / compiled files
