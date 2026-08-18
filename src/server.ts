@@ -437,7 +437,7 @@ app.post(
 */
 
 app.use(
-    '/api/passengers',
+    '/api/passenger',
     passengerRoutes,
 );
 
