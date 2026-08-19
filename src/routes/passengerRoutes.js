@@ -41,7 +41,6 @@ const verifyFirebaseToken = async (req, res, next) => {
 // PROFILE (GET & PATCH)
 // ============================================================
 
-// GET /api/passengers/profile
 router.get('/profile', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -95,12 +94,10 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// PATCH /api/passengers/profile
 router.patch('/profile', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     const updates = req.body;
 
-    // Allowed fields that can be updated (whitelist)
     const allowedFields = [
         'full_name', 'phone', 'email', 'gender',
         'emergency_contact_name', 'emergency_contact_phone', 'emergency_relationship',
@@ -109,16 +106,13 @@ router.patch('/profile', verifyFirebaseToken, async (req, res) => {
         'language_preference', 'notification_enabled', 'privacy_enabled'
     ];
 
-    // Build dynamic SET clause
     const setClauses = [];
     const values = [];
     let paramIndex = 1;
 
     for (const field of allowedFields) {
         if (updates.hasOwnProperty(field)) {
-            // Handle JSONB field separately
             if (field === 'saved_locations') {
-                // Ensure it's a valid JSON array
                 const locations = Array.isArray(updates[field]) ? updates[field] : [];
                 setClauses.push(`saved_locations = $${paramIndex}::jsonb`);
                 values.push(JSON.stringify(locations));
@@ -137,7 +131,6 @@ router.patch('/profile', verifyFirebaseToken, async (req, res) => {
         });
     }
 
-    // Add updated_at
     setClauses.push(`updated_at = NOW()`);
 
     const query = `
@@ -173,10 +166,9 @@ router.patch('/profile', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// CREATE PASSENGER (used for initial creation)
+// CREATE PASSENGER
 // ============================================================
 
-// POST /api/passengers/create
 router.post('/create', verifyFirebaseToken, async (req, res) => {
     try {
         const { uid, email, phone, displayName } = req.body;
@@ -229,11 +221,6 @@ router.post('/create', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// ============================================================
-// FULL REGISTRATION (extended details)
-// ============================================================
-
-// POST /api/passengers/register
 router.post('/register', verifyFirebaseToken, async (req, res) => {
     try {
         const {
@@ -313,7 +300,6 @@ router.post('/register', verifyFirebaseToken, async (req, res) => {
 // WALLET (GET and POST)
 // ============================================================
 
-// GET /api/passengers/wallet
 router.get('/wallet', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -362,7 +348,6 @@ router.get('/wallet', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// POST /api/passengers/wallet (create wallet if not exists)
 router.post('/wallet', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     const { full_name, email, phone } = req.body;
@@ -431,10 +416,9 @@ router.post('/wallet', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// TRANSACTIONS (GET)
+// TRANSACTIONS
 // ============================================================
 
-// GET /api/passengers/transactions
 router.get('/transactions', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -467,7 +451,6 @@ router.get('/transactions', verifyFirebaseToken, async (req, res) => {
 
         const walletId = walletResult.rows[0].id;
 
-        // Optional limit from query param
         const limit = parseInt(req.query.limit) || 50;
 
         const transactions = await pool.query(
@@ -498,10 +481,9 @@ router.get('/transactions', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// RIDE HISTORY (GET)
+// RIDE HISTORY
 // ============================================================
 
-// GET /api/passengers/rides
 router.get('/rides', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -534,7 +516,6 @@ router.get('/rides', verifyFirebaseToken, async (req, res) => {
             [passengerId, limit]
         );
 
-        // Return an array (even if empty)
         return res.status(200).json({
             success: true,
             rides: rides.rows
@@ -553,13 +534,10 @@ router.get('/rides', verifyFirebaseToken, async (req, res) => {
 // DELETE ACCOUNT
 // ============================================================
 
-// DELETE /api/passengers/account
 router.delete('/account', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
     try {
-        // Delete passenger; cascade will remove wallet, rides, transactions if foreign keys have ON DELETE CASCADE
-        // If not, you may need to delete related records manually.
         const result = await pool.query(
             `DELETE FROM passengers WHERE firebase_uid = $1 RETURNING id`,
             [uid]
@@ -572,10 +550,7 @@ router.delete('/account', verifyFirebaseToken, async (req, res) => {
             });
         }
 
-        // Optional: delete Firebase user as well? Usually you'd let the user re-authenticate.
-        // We'll just delete from our DB.
-
-        return res.status(204).send(); // No content
+        return res.status(204).send();
 
     } catch (error) {
         console.error('❌ Error deleting account:', error);
@@ -587,10 +562,9 @@ router.delete('/account', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// ALERTS (as originally defined)
+// ALERTS (existing)
 // ============================================================
 
-// GET /api/passengers/alerts
 router.get('/alerts', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     console.log('🔔 Loading alerts for Firebase UID:', uid);
@@ -624,7 +598,6 @@ router.get('/alerts', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// PATCH /api/passengers/alerts/:id/read
 router.patch('/alerts/:id/read', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     const alertId = req.params.id;
@@ -660,7 +633,6 @@ router.patch('/alerts/:id/read', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// PATCH /api/passengers/alerts/read-all
 router.patch('/alerts/read-all', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -688,7 +660,6 @@ router.patch('/alerts/read-all', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// DELETE /api/passengers/alerts/:id
 router.delete('/alerts/:id', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     const alertId = req.params.id;
@@ -723,7 +694,6 @@ router.delete('/alerts/:id', verifyFirebaseToken, async (req, res) => {
     }
 });
 
-// DELETE /api/passengers/alerts
 router.delete('/alerts', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
 
@@ -745,6 +715,140 @@ router.delete('/alerts', verifyFirebaseToken, async (req, res) => {
             success: false,
             message: 'Server error',
             details: error.message
+        });
+    }
+});
+
+// ============================================================
+// NEW: PASSENGER LOCATION AND NEARBY ENDPOINTS
+// ============================================================
+
+/**
+ * POST /api/passengers/update-location
+ * Update passenger's current location and online status.
+ * Body: { latitude, longitude, isOnline? }
+ */
+router.post('/update-location', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { latitude, longitude, isOnline } = req.body;
+        const uid = req.decodedToken.uid;
+
+        if (latitude == null || longitude == null) {
+            return res.status(400).json({
+                success: false,
+                message: 'latitude and longitude are required'
+            });
+        }
+
+        const lat = Number(latitude);
+        const lng = Number(longitude);
+        if (!isFinite(lat) || !isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid coordinates'
+            });
+        }
+
+        const online = (isOnline === undefined) ? true : Boolean(isOnline);
+
+        const result = await pool.query(
+            `UPDATE passengers
+             SET current_latitude = $1,
+                 current_longitude = $2,
+                 is_online = $3,
+                 last_location_update = NOW()
+             WHERE firebase_uid = $4
+             RETURNING id, current_latitude, current_longitude, is_online, last_location_update`,
+            [lat, lng, online, uid]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Passenger not found'
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            passenger: result.rows[0]
+        });
+
+    } catch (error) {
+        console.error('❌ Update passenger location error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
+        });
+    }
+});
+
+/**
+ * GET /api/passengers/nearby
+ * Returns online passengers within a radius (meters).
+ * Query: ?lat=...&lng=...&radius=5000 (default 5 km)
+ */
+router.get('/nearby', verifyFirebaseToken, async (req, res) => {
+    try {
+        const { lat, lng, radius = 5000 } = req.query;
+
+        if (!lat || !lng) {
+            return res.status(400).json({
+                success: false,
+                message: 'lat and lng are required'
+            });
+        }
+
+        const latitude = Number(lat);
+        const longitude = Number(lng);
+        if (!isFinite(latitude) || !isFinite(longitude)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid coordinates'
+            });
+        }
+
+        const query = `
+            SELECT id,
+                   firebase_uid AS uid,
+                   full_name,
+                   phone,
+                   email,
+                   current_latitude AS latitude,
+                   current_longitude AS longitude,
+                   is_online,
+                   last_location_update,
+                   ROUND(
+                       ST_Distance(
+                           ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                           ST_SetSRID(ST_MakePoint(current_longitude, current_latitude), 4326)::geography
+                       )
+                   ) AS distance_meters
+            FROM passengers
+            WHERE is_online = true
+              AND current_latitude IS NOT NULL
+              AND current_longitude IS NOT NULL
+              AND ST_DWithin(
+                    ST_SetSRID(ST_MakePoint(current_longitude, current_latitude), 4326)::geography,
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                    $3
+                  )
+            ORDER BY distance_meters ASC
+            LIMIT 50;
+        `;
+
+        const result = await pool.query(query, [longitude, latitude, radius]);
+
+        return res.status(200).json({
+            success: true,
+            passengers: result.rows
+        });
+
+    } catch (error) {
+        console.error('❌ Fetch nearby passengers error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error'
         });
     }
 });
