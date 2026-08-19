@@ -1256,6 +1256,125 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
+| GET /api/drivers/nearby
+|--------------------------------------------------------------------------
+|
+| Returns online, available drivers within a radius (in meters).
+| Query parameters:
+|   - lat (required): passenger's current latitude
+|   - lng (required): passenger's current longitude
+|   - radius (optional, default: 5000): search radius in meters
+|   - onlyOnline (optional, default: true): filter by is_online = true
+|   - onlyAvailable (optional, default: true): filter by is_available = true
+|
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+    '/nearby',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        try {
+            const { lat, lng, radius = 5000, onlyOnline = 'true', onlyAvailable = 'true' } = req.query;
+
+            if (!lat || !lng) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Missing required query parameters: lat and lng',
+                    code: 'MISSING_PARAMETERS',
+                });
+            }
+
+            const latitude = Number(lat);
+            const longitude = Number(lng);
+            const searchRadius = Number(radius);
+
+            if (
+                !Number.isFinite(latitude) ||
+                !Number.isFinite(longitude) ||
+                !Number.isFinite(searchRadius)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid numeric values for lat, lng, or radius',
+                    code: 'INVALID_PARAMETERS',
+                });
+            }
+
+            // Build WHERE clause with optional filters
+            const conditions: string[] = [
+                "status = 'approved'", // Only approved drivers
+            ];
+            const values: any[] = [longitude, latitude, searchRadius];
+            let paramIndex = 4;
+
+            if (onlyOnline === 'true') {
+                conditions.push(`is_online = $${paramIndex++}`);
+                values.push(true);
+            }
+            if (onlyAvailable === 'true') {
+                conditions.push(`is_available = $${paramIndex++}`);
+                values.push(true);
+            }
+
+            const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
+            const query = `
+                SELECT
+                    id,
+                    uid,
+                    full_name,
+                    phone,
+                    email,
+                    profile_photo_url,
+                    vehicle_type,
+                    registration_number,
+                    vehicle_color,
+                    vehicle_model,
+                    is_online,
+                    is_available,
+                    rating,
+                    current_latitude,
+                    current_longitude,
+                    ROUND(
+                        ST_Distance(
+                            location,
+                            ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+                        )
+                    ) AS distance_meters
+                FROM public.drivers
+                ${whereClause}
+                AND ST_DWithin(
+                    location,
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                    $3
+                )
+                ORDER BY distance_meters ASC
+                LIMIT 50;
+            `;
+
+            const result = await pool.query(query, values);
+
+            return res.status(200).json({
+                success: true,
+                drivers: result.rows,
+            });
+        } catch (error: unknown) {
+            console.error('❌ Error fetching nearby drivers:', error);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to fetch nearby drivers',
+                code: 'NEARBY_DRIVERS_FAILED',
+            });
+        }
+    },
+);
+
+/*
+|--------------------------------------------------------------------------
 | EXPORT ROUTER
 |--------------------------------------------------------------------------
 |
