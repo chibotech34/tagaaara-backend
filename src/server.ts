@@ -15,6 +15,7 @@ import pool from './config/database';
 // Initialize Firebase ONCE.
 // This import executes config/firebase.ts.
 import './config/firebase';
+import { getAuth } from 'firebase-admin/auth'; // 👈 added for token verification
 
 import adminAuth from './middleware/firebaseAdmin';
 
@@ -454,7 +455,164 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
+| RIDE BOOKING (Passenger)
+|--------------------------------------------------------------------------
+|
+| This endpoint is publicly accessible but requires a valid Firebase token.
+| The passenger_id in the request must belong to the authenticated user.
+|
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    '/api/rides',
+    async (req: Request, res: Response) => {
+        // 1. Extract and verify Firebase token
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({
+                success: false,
+                error: 'Missing or invalid Authorization header. Expected Bearer token.',
+            });
+        }
+        const token = authHeader.split(' ')[1];
+        let decodedToken;
+        try {
+            decodedToken = await getAuth().verifyIdToken(token);
+        } catch (error: any) {
+            console.error('❌ Firebase token verification failed:', error);
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid Firebase token.',
+                details: error.message,
+            });
+        }
+        const firebaseUid = decodedToken.uid;
+
+        // 2. Validate request body
+        const {
+            passenger_id,
+            driver_id,
+            pickup,
+            destination,
+            distance,
+            duration,
+            fare,
+            ride_type,
+        } = req.body;
+
+        if (
+            !passenger_id ||
+            !driver_id ||
+            !pickup?.lat ||
+            !pickup?.lng ||
+            !destination?.lat ||
+            !destination?.lng ||
+            distance == null ||
+            duration == null ||
+            fare == null
+        ) {
+            return res.status(400).json({
+                success: false,
+                error: 'Missing required fields: passenger_id, driver_id, pickup, destination, distance, duration, fare',
+            });
+        }
+
+        // 3. Ensure passenger exists and belongs to the authenticated user
+        try {
+            const passengerCheck = await pool.query(
+                `SELECT id FROM public.passengers WHERE id = $1 AND firebase_uid = $2`,
+                [passenger_id, firebaseUid]
+            );
+            if (passengerCheck.rows.length === 0) {
+                return res.status(403).json({
+                    success: false,
+                    error: 'Passenger ID does not match authenticated user',
+                });
+            }
+
+            // 4. Check driver availability (optional but recommended)
+            const driverCheck = await pool.query(
+                `SELECT id FROM public.drivers WHERE id = $1 AND status = 'approved' AND is_online = true`,
+                [driver_id]
+            );
+            if (driverCheck.rows.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    error: 'Driver not available or not approved',
+                });
+            }
+
+            // 5. Insert the ride
+            const result = await pool.query(
+                `
+                INSERT INTO public.rides (
+                    passenger_id,
+                    driver_id,
+                    pickup,
+                    destination,
+                    distance,
+                    duration,
+                    fare,
+                    payment_method,
+                    payment_status,
+                    status,
+                    requested_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    ST_SetSRID(ST_MakePoint($3, $4), 4326),
+                    ST_SetSRID(ST_MakePoint($5, $6), 4326),
+                    $7,
+                    $8,
+                    $9,
+                    $10,
+                    'pending',
+                    'requested',
+                    NOW()
+                )
+                RETURNING id
+                `,
+                [
+                    passenger_id,
+                    driver_id,
+                    pickup.lng,  // longitude first for ST_MakePoint
+                    pickup.lat,
+                    destination.lng,
+                    destination.lat,
+                    distance,
+                    duration,
+                    fare,
+                    ride_type || 'standard', // fallback
+                ]
+            );
+
+            const rideId = result.rows[0].id;
+
+            return res.status(201).json({
+                success: true,
+                message: 'Ride booked successfully',
+                rideId,
+            });
+        } catch (error: any) {
+            console.error('❌ Ride booking error:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to book ride',
+                details: error.message,
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
 | ADMIN AUTHENTICATION
+|--------------------------------------------------------------------------
+|
+| All routes below this middleware are protected and require admin rights.
+|
 |--------------------------------------------------------------------------
 */
 
