@@ -854,6 +854,265 @@ router.get('/nearby', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
+// WALLET TOP-UP (Add Money)
+// ============================================================
+router.post('/wallet/topup', verifyFirebaseToken, async (req, res) => {
+    const uid = req.decodedToken.uid;
+    const { amount, payment_method, provider } = req.body;
+
+    // Validate input
+    if (amount == null || amount <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'Invalid amount. Must be a positive number.'
+        });
+    }
+    if (!payment_method) {
+        return res.status(400).json({
+            success: false,
+            message: 'Payment method is required.'
+        });
+    }
+
+    try {
+        // 1. Get passenger by firebase_uid
+        const passengerResult = await pool.query(
+            `SELECT id FROM passengers WHERE firebase_uid = $1`,
+            [uid]
+        );
+        if (passengerResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Passenger not found.'
+            });
+        }
+        const passengerId = passengerResult.rows[0].id;
+
+        // 2. Get the wallet
+        const walletResult = await pool.query(
+            `SELECT id, balance FROM wallets WHERE passenger_id = $1`,
+            [passengerId]
+        );
+        if (walletResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Wallet not found. Please create one first.'
+            });
+        }
+        const wallet = walletResult.rows[0];
+        const walletId = wallet.id;
+        const oldBalance = parseFloat(wallet.balance);
+        const newBalance = oldBalance + amount;
+
+        // 3. Begin a transaction to update balance and create a transaction record
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // Update wallet balance
+            await client.query(
+                `UPDATE wallets
+                 SET balance = $1, last_transaction_at = NOW(), updated_at = NOW()
+                 WHERE id = $2`,
+                [newBalance, walletId]
+            );
+
+            // Insert transaction record
+            const txResult = await client.query(
+                `INSERT INTO transactions (
+                    wallet_id, passenger_id, type, amount,
+                    balance_before, balance_after, status,
+                    payment_method, provider, description, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+                RETURNING id`,
+                [
+                    walletId,
+                    passengerId,
+                    'topup',
+                    amount,
+                    oldBalance,
+                    newBalance,
+                    'completed',
+                    payment_method,
+                    provider || null,
+                    `Top-up via ${payment_method}`
+                ]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(201).json({
+                success: true,
+                message: 'Top-up successful',
+                transactionId: txResult.rows[0].id,
+                newBalance: newBalance
+            });
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ Top-up error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error while processing top-up'
+        });
+    }
+});
+
+// ============================================================
+// WALLET PAY FOR RIDE
+// ============================================================
+router.post('/wallet/pay', verifyFirebaseToken, async (req, res) => {
+    const uid = req.decodedToken.uid;
+    const { ride_id, amount } = req.body;
+
+    if (ride_id == null || amount == null || amount <= 0) {
+        return res.status(400).json({
+            success: false,
+            message: 'ride_id and amount (positive number) are required.'
+        });
+    }
+
+    try {
+        // 1. Get passenger
+        const passengerResult = await pool.query(
+            `SELECT id FROM passengers WHERE firebase_uid = $1`,
+            [uid]
+        );
+        if (passengerResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Passenger not found.'
+            });
+        }
+        const passengerId = passengerResult.rows[0].id;
+
+        // 2. Verify that the ride belongs to this passenger and is in a payable state
+        const rideCheck = await pool.query(
+            `SELECT id, driver_id, fare, payment_status, status
+             FROM rides
+             WHERE id = $1 AND passenger_id = $2`,
+            [ride_id, passengerId]
+        );
+        if (rideCheck.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Ride not found or does not belong to you.'
+            });
+        }
+        const ride = rideCheck.rows[0];
+        if (ride.payment_status === 'completed') {
+            return res.status(400).json({
+                success: false,
+                message: 'Ride already paid.'
+            });
+        }
+        if (ride.status !== 'completed') {
+            return res.status(400).json({
+                success: false,
+                message: 'Ride must be completed before payment.'
+            });
+        }
+        // Optionally check that amount matches fare, or allow partial – here we require full fare
+        if (parseFloat(ride.fare) !== amount) {
+            return res.status(400).json({
+                success: false,
+                message: `Amount must match ride fare of ${ride.fare}.`
+            });
+        }
+
+        // 3. Get wallet and check balance
+        const walletResult = await pool.query(
+            `SELECT id, balance FROM wallets WHERE passenger_id = $1`,
+            [passengerId]
+        );
+        if (walletResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'Wallet not found.'
+            });
+        }
+        const wallet = walletResult.rows[0];
+        const walletId = wallet.id;
+        const currentBalance = parseFloat(wallet.balance);
+        if (currentBalance < amount) {
+            return res.status(400).json({
+                success: false,
+                message: 'Insufficient balance.'
+            });
+        }
+        const newBalance = currentBalance - amount;
+
+        // 4. Begin transaction
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // Deduct from wallet
+            await client.query(
+                `UPDATE wallets
+                 SET balance = $1, total_spent = total_spent + $2,
+                     last_transaction_at = NOW(), updated_at = NOW()
+                 WHERE id = $3`,
+                [newBalance, amount, walletId]
+            );
+
+            // Insert transaction record
+            const txResult = await client.query(
+                `INSERT INTO transactions (
+                    wallet_id, passenger_id, ride_id, type, amount,
+                    balance_before, balance_after, status,
+                    description, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+                RETURNING id`,
+                [
+                    walletId,
+                    passengerId,
+                    ride_id,
+                    'ridePayment',
+                    amount,
+                    currentBalance,
+                    newBalance,
+                    'completed',
+                    `Payment for ride #${ride_id}`
+                ]
+            );
+
+            // Update ride payment status
+            await client.query(
+                `UPDATE rides
+                 SET payment_status = 'completed', paid_at = NOW()
+                 WHERE id = $1`,
+                [ride_id]
+            );
+
+            await client.query('COMMIT');
+
+            return res.status(201).json({
+                success: true,
+                message: 'Ride paid successfully',
+                transactionId: txResult.rows[0].id,
+                newBalance: newBalance
+            });
+        } catch (err) {
+            await client.query('ROLLBACK');
+            throw err;
+        } finally {
+            client.release();
+        }
+    } catch (error) {
+        console.error('❌ Pay for ride error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error while processing payment'
+        });
+    }
+});
+
+// ============================================================
 // EXPORT
 // ============================================================
 
