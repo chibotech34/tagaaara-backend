@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-
+import rideRoutes from './routes/rideRoutes';
 dotenv.config();
 
 import express, {
@@ -15,7 +15,7 @@ import pool from './config/database';
 // Initialize Firebase ONCE.
 // This import executes config/firebase.ts.
 import './config/firebase';
-import { getAuth } from 'firebase-admin/auth'; // 👈 added for token verification
+import { getAuth } from 'firebase-admin/auth';
 
 import adminAuth from './middleware/firebaseAdmin';
 
@@ -81,6 +81,7 @@ app.use(
         credentials: true,
     }),
 );
+app.use('/api', rideRoutes);
 
 app.use(
     express.json({
@@ -543,7 +544,7 @@ app.post(
                 });
             }
 
-            // 5. Insert the ride
+            // 5. Insert the ride - FIXED: status is now 'accepted' and earnings are computed
             const result = await pool.query(
                 `
                 INSERT INTO public.rides (
@@ -557,6 +558,8 @@ app.post(
                     payment_method,
                     payment_status,
                     status,
+                    driver_earnings,
+                    tegaara_commission,
                     requested_at
                 )
                 VALUES (
@@ -569,7 +572,9 @@ app.post(
                     $9,
                     $10,
                     'pending',
-                    'requested',
+                    'accepted',           -- ✅ Changed from 'requested' to 'accepted'
+                    $9 * 0.8,             -- Driver earnings (80% of fare)
+                    $9 * 0.2,             -- Tegaara commission (20% of fare)
                     NOW()
                 )
                 RETURNING id

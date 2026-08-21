@@ -11,6 +11,7 @@ import {
 
 import { getAuth, Auth } from 'firebase-admin/auth';
 import { getDatabase, Database } from 'firebase-admin/database';
+import { getMessaging, Messaging } from 'firebase-admin/messaging'; // 👈 ADD THIS
 
 dotenv.config();
 
@@ -70,10 +71,6 @@ if (firebaseAdminSdkPath) {
 |--------------------------------------------------------------------------
 | Option 2: Render / production environment variables
 |--------------------------------------------------------------------------
-|
-| This is useful when the JSON service-account file is NOT committed
-| to GitHub.
-|--------------------------------------------------------------------------
 */
 
 else if (
@@ -119,7 +116,7 @@ else {
 */
 
 export const firebaseAuth: Auth = getAuth(firebaseApp);
-
 export const realtimeDb: Database = getDatabase(firebaseApp);
+export const firebaseMessaging: Messaging = getMessaging(firebaseApp); // 👈 ADD THIS
 
 export default firebaseApp;
