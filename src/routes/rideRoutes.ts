@@ -134,9 +134,11 @@ async function sendRideNotificationToDriver(
 }
 
 // -------------------------------------------------------------------
-// 5. POST /rides – Create ride (direct driver assignment)  [FIXED]
+// 5. POST /rides – Create ride (direct driver assignment)  [FIXED with detailed error logging & transaction]
 // -------------------------------------------------------------------
 router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res: Response) => {
+    const client = await pool.connect(); // for transaction
+
     try {
         const {
             passenger_id,
@@ -159,7 +161,7 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
             });
         }
 
-        // 1. Verify passenger belongs to authenticated user
+        // Verify passenger belongs to authenticated user
         const passengerCheck = await pool.query(
             `SELECT id FROM passengers WHERE id = $1 AND firebase_uid = $2`,
             [passenger_id, req.decodedToken?.uid]
@@ -171,22 +173,29 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
             });
         }
 
-        // 2. Verify driver exists and is available (optional but recommended)
-        if (driver_id) {
-            const driverCheck = await pool.query(
-                `SELECT id FROM drivers WHERE id = $1 AND status = 'approved' AND is_online = true AND is_available = true`,
-                [driver_id]
-            );
-            if (driverCheck.rows.length === 0) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Driver not available or not found.'
-                });
-            }
+        // Verify driver exists and is available
+        if (!driver_id) {
+            return res.status(400).json({
+                success: false,
+                message: 'driver_id is required for direct assignment.'
+            });
+        }
+        const driverCheck = await pool.query(
+            `SELECT id FROM drivers WHERE id = $1 AND status = 'approved' AND is_online = true AND is_available = true`,
+            [driver_id]
+        );
+        if (driverCheck.rows.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Driver not available or not found.'
+            });
         }
 
-        // 3. Insert ride with driver_earnings and tegaara_commission
-        const insertResult = await pool.query(
+        // Start transaction
+        await client.query('BEGIN');
+
+        // Insert ride
+        const insertResult = await client.query(
             `
             INSERT INTO public.rides (
                 passenger_id,
@@ -216,25 +225,25 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
                 $9,
                 $10,
                 'pending',
-                'accepted',          // direct assignment → accepted
+                'accepted',
                 $11,
                 $12,
                 $13,
-                $9 * 0.8,            // driver earnings (80%)
-                $9 * 0.2,            // Tegaara commission (20%)
+                $9 * 0.8,
+                $9 * 0.2,
                 NOW()
             )
             RETURNING id
             `,
             [
                 passenger_id,
-                driver_id || null,
+                driver_id,
                 pickup.lng, pickup.lat,
                 destination.lng, destination.lat,
                 distance || null,
                 duration || null,
                 fare || 0,
-                'standard',           // payment_method default
+                'standard',
                 ride_type || 'standard',
                 pickup_address || null,
                 destination_address || null,
@@ -243,58 +252,71 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
 
         const rideId = insertResult.rows[0].id;
 
-        // Optionally notify the driver (if driver_id is provided)
-        if (driver_id) {
-            // Fetch driver FCM token and send notification
-            const driverToken = await pool.query(
-                `SELECT fcm_token FROM drivers WHERE id = $1`,
-                [driver_id]
+        // Optionally notify driver
+        const driverToken = await client.query(
+            `SELECT fcm_token FROM drivers WHERE id = $1`,
+            [driver_id]
+        );
+        if (driverToken.rows.length > 0 && driverToken.rows[0].fcm_token) {
+            const passengerNameResult = await client.query(
+                `SELECT full_name FROM passengers WHERE id = $1`,
+                [passenger_id]
             );
-            if (driverToken.rows.length > 0 && driverToken.rows[0].fcm_token) {
-                // Get passenger name
-                const passengerNameResult = await pool.query(
-                    `SELECT full_name FROM passengers WHERE id = $1`,
-                    [passenger_id]
-                );
-                const passengerName = passengerNameResult.rows[0]?.full_name || 'Passenger';
-                await sendRideNotificationToDriver(
-                    driverToken.rows[0].fcm_token,
-                    {
-                        rideId: rideId.toString(),
-                        passengerId: passenger_id.toString(),
-                        passengerName,
-                        pickupAddress: pickup_address || 'Pickup location',
-                        pickupLat: pickup.lat.toString(),
-                        pickupLng: pickup.lng.toString(),
-                        destinationAddress: destination_address || 'Destination',
-                        destLat: destination.lat.toString(),
-                        destLng: destination.lng.toString(),
-                        rideType: ride_type || 'standard',
-                        distanceKm: distance?.toString() || '0',
-                        durationMin: duration?.toString() || '0',
-                        fare: fare?.toString() || '0',
-                        driverEarnings: fare ? (fare * 0.8).toFixed(2) : '0',
-                    },
+            const passengerName = passengerNameResult.rows[0]?.full_name || 'Passenger';
+            await sendRideNotificationToDriver(
+                driverToken.rows[0].fcm_token,
+                {
+                    rideId: rideId.toString(),
+                    passengerId: passenger_id.toString(),
                     passengerName,
-                    ride_type || 'standard'
-                );
-            }
+                    pickupAddress: pickup_address || 'Pickup location',
+                    pickupLat: pickup.lat.toString(),
+                    pickupLng: pickup.lng.toString(),
+                    destinationAddress: destination_address || 'Destination',
+                    destLat: destination.lat.toString(),
+                    destLng: destination.lng.toString(),
+                    rideType: ride_type || 'standard',
+                    distanceKm: distance?.toString() || '0',
+                    durationMin: duration?.toString() || '0',
+                    fare: fare?.toString() || '0',
+                    driverEarnings: fare ? (fare * 0.8).toFixed(2) : '0',
+                },
+                passengerName,
+                ride_type || 'standard'
+            );
         }
+
+        await client.query('COMMIT');
 
         return res.status(201).json({
             success: true,
             rideId,
             message: 'Ride booked successfully.',
         });
+
     } catch (error: unknown) {
+        await client.query('ROLLBACK');
+
+        // --- DETAILED ERROR LOGGING ---
         console.error('❌ Ride creation error:', error);
-        const dbError = error as { code?: string; detail?: string; message?: string };
-        if (dbError.code) console.error('DB Error Code:', dbError.code);
-        if (dbError.detail) console.error('DB Detail:', dbError.detail);
+        const dbError = error as { code?: string; detail?: string; message?: string; stack?: string };
+        console.error('DB Error Code:', dbError.code);
+        console.error('DB Detail:', dbError.detail);
+        console.error('DB Message:', dbError.message);
+        console.error('Stack:', dbError.stack);
+
+        // In development, return the actual error message for debugging
         return res.status(500).json({
             success: false,
             message: 'Server error while creating ride.',
+            ...(process.env.NODE_ENV === 'development' && {
+                error: dbError.message,
+                code: dbError.code,
+                detail: dbError.detail,
+            }),
         });
+    } finally {
+        client.release();
     }
 });
 
@@ -451,9 +473,12 @@ router.post('/rides/request', verifyFirebaseToken, async (req: AuthenticatedRequ
         });
     } catch (error: unknown) {
         console.error('❌ Direct ride request error:', error);
+        const dbError = error as { message?: string; stack?: string };
+        console.error('Error details:', dbError.message);
         return res.status(500).json({
             success: false,
             message: 'Server error while requesting ride.',
+            ...(process.env.NODE_ENV === 'development' && { error: dbError.message }),
         });
     }
 });
@@ -472,7 +497,6 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
         });
     }
 
-    // Verify the authenticated user owns this driver
     const uid = getAuthenticatedUid(req);
     if (!uid) {
         return res.status(401).json({ success: false, message: 'Unauthenticated.' });
@@ -488,7 +512,6 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
         });
     }
 
-    // Atomically assign driver to ride if still in 'requested' state
     const updateResult = await pool.query(
         `
         UPDATE public.rides
@@ -511,8 +534,6 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
         });
     }
 
-    // Optionally notify passenger (implement if needed)
-
     return res.status(200).json({
         success: true,
         ride: updateResult.rows[0],
@@ -531,8 +552,7 @@ router.post('/driver/accept-ride', verifyFirebaseToken, async (req: Authenticate
             message: 'Missing rideId or driverId.',
         });
     }
-    // Re-use the accept logic by calling the same route handler
-    // We'll emulate the same logic inline
+
     try {
         const uid = getAuthenticatedUid(req);
         if (!uid) {
@@ -606,7 +626,6 @@ router.get('/drivers/:uid/current-request', verifyFirebaseToken, async (req: Aut
     }
 
     try {
-        // Get driver_id
         const driverResult = await pool.query(`SELECT id FROM drivers WHERE uid = $1`, [uid]);
         if (driverResult.rows.length === 0) {
             return res.status(404).json({
@@ -616,7 +635,6 @@ router.get('/drivers/:uid/current-request', verifyFirebaseToken, async (req: Aut
         }
         const driverId = driverResult.rows[0].id;
 
-        // Fetch the most recent ride that is accepted or started, and not completed/cancelled
         const rideResult = await pool.query(
             `
             SELECT
@@ -738,7 +756,6 @@ router.post('/rides/:rideId/start', verifyFirebaseToken, async (req: Authenticat
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
     try {
-        // Verify driver owns this ride
         const check = await pool.query(
             `SELECT id FROM rides WHERE id = $1 AND driver_id = (SELECT id FROM drivers WHERE uid = $2) AND status = 'accepted'`,
             [rideId, uid]
@@ -799,7 +816,6 @@ router.post('/rides/:rideId/cancel', verifyFirebaseToken, async (req: Authentica
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
     try {
-        // Check if the user is either the passenger or the driver of this ride
         const rideCheck = await pool.query(
             `
             SELECT id FROM rides
