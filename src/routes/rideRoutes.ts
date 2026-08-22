@@ -1,11 +1,11 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import pool from '../config/database';
-import { firebaseAuth, firebaseMessaging } from '../config/firebase'; // ensure these exports exist
+import { firebaseAuth, firebaseMessaging } from '../config/firebase';
 
 const router = Router();
 
 // -------------------------------------------------------------------
-// 1. Firebase Token Middleware (copied from driverRoutes)
+// 1. Firebase Token Middleware
 // -------------------------------------------------------------------
 interface DecodedFirebaseToken {
     uid: string;
@@ -134,12 +134,13 @@ async function sendRideNotificationToDriver(
 }
 
 // -------------------------------------------------------------------
-// 5. POST /rides – Broadcast ride request to nearby drivers
+// 5. POST /rides – Create ride (direct driver assignment)  [FIXED]
 // -------------------------------------------------------------------
 router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res: Response) => {
     try {
         const {
             passenger_id,
+            driver_id,
             pickup,          // { lat, lng }
             destination,     // { lat, lng }
             distance,
@@ -150,6 +151,7 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
             destination_address,
         } = req.body;
 
+        // Validate required fields
         if (!passenger_id || !pickup || !destination) {
             return res.status(400).json({
                 success: false,
@@ -157,49 +159,82 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
             });
         }
 
-        // Insert ride
+        // 1. Verify passenger belongs to authenticated user
+        const passengerCheck = await pool.query(
+            `SELECT id FROM passengers WHERE id = $1 AND firebase_uid = $2`,
+            [passenger_id, req.decodedToken?.uid]
+        );
+        if (passengerCheck.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Passenger ID does not match authenticated user or not found.'
+            });
+        }
+
+        // 2. Verify driver exists and is available (optional but recommended)
+        if (driver_id) {
+            const driverCheck = await pool.query(
+                `SELECT id FROM drivers WHERE id = $1 AND status = 'approved' AND is_online = true AND is_available = true`,
+                [driver_id]
+            );
+            if (driverCheck.rows.length === 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Driver not available or not found.'
+                });
+            }
+        }
+
+        // 3. Insert ride with driver_earnings and tegaara_commission
         const insertResult = await pool.query(
             `
-      INSERT INTO public.rides (
-        passenger_id,
-        pickup,
-        destination,
-        distance,
-        duration,
-        fare,
-        payment_method,
-        payment_status,
-        status,
-        ride_type,
-        pickup_address,
-        destination_address,
-        requested_at
-      )
-      VALUES (
-        $1,
-        ST_SetSRID(ST_MakePoint($2, $3), 4326),
-        ST_SetSRID(ST_MakePoint($4, $5), 4326),
-        $6,
-        $7,
-        $8,
-        $9,
-        'pending',
-        'requested',
-        $10,
-        $11,
-        $12,
-        NOW()
-      )
-      RETURNING id
-      `,
-            [
+            INSERT INTO public.rides (
                 passenger_id,
-                pickup.lng, pickup.lat,
-                destination.lng, destination.lat,
+                driver_id,
+                pickup,
+                destination,
                 distance,
                 duration,
                 fare,
-                ride_type || 'standard',
+                payment_method,
+                payment_status,
+                status,
+                ride_type,
+                pickup_address,
+                destination_address,
+                driver_earnings,
+                tegaara_commission,
+                requested_at
+            )
+            VALUES (
+                $1,
+                $2,
+                ST_SetSRID(ST_MakePoint($3, $4), 4326),
+                ST_SetSRID(ST_MakePoint($5, $6), 4326),
+                $7,
+                $8,
+                $9,
+                $10,
+                'pending',
+                'accepted',          // direct assignment → accepted
+                $11,
+                $12,
+                $13,
+                $9 * 0.8,            // driver earnings (80%)
+                $9 * 0.2,            // Tegaara commission (20%)
+                NOW()
+            )
+            RETURNING id
+            `,
+            [
+                passenger_id,
+                driver_id || null,
+                pickup.lng, pickup.lat,
+                destination.lng, destination.lat,
+                distance || null,
+                duration || null,
+                fare || 0,
+                'standard',           // payment_method default
                 ride_type || 'standard',
                 pickup_address || null,
                 destination_address || null,
@@ -208,55 +243,54 @@ router.post('/rides', verifyFirebaseToken, async (req: AuthenticatedRequest, res
 
         const rideId = insertResult.rows[0].id;
 
-        // Get passenger details for notification
-        const passengerInfo = await pool.query(
-            `SELECT full_name, profile_photo_url FROM passengers WHERE id = $1`,
-            [passenger_id]
-        );
-        const passenger = passengerInfo.rows[0] || { full_name: 'Passenger', profile_photo_url: '' };
-
-        // Build notification payload
-        const notificationPayload = {
-            rideId: rideId.toString(),
-            passengerId: passenger_id.toString(),
-            passengerName: passenger.full_name || 'Passenger',
-            passengerPhotoUrl: passenger.profile_photo_url || '',
-            passengerRating: '4.5', // you can compute average rating if needed
-            passengerRides: '0',
-            pickupAddress: pickup_address || 'Pickup location',
-            pickupLat: pickup.lat.toString(),
-            pickupLng: pickup.lng.toString(),
-            destinationAddress: destination_address || 'Destination',
-            destLat: destination.lat.toString(),
-            destLng: destination.lng.toString(),
-            rideType: ride_type || 'standard',
-            distanceKm: distance?.toString() || '0',
-            durationMin: duration?.toString() || '0',
-            fare: fare?.toString() || '0',
-            driverEarnings: fare ? (fare * 0.8).toFixed(2) : '0',
-        };
-
-        // Find nearby drivers
-        const nearbyDrivers = await getNearbyDrivers(pickup.lat, pickup.lng, 15000);
-
-        // Send notifications
-        const notifyPromises = nearbyDrivers.map((driver) =>
-            sendRideNotificationToDriver(
-                driver.fcm_token,
-                notificationPayload,
-                passenger.full_name || 'Passenger',
-                ride_type || 'standard'
-            )
-        );
-        await Promise.allSettled(notifyPromises);
+        // Optionally notify the driver (if driver_id is provided)
+        if (driver_id) {
+            // Fetch driver FCM token and send notification
+            const driverToken = await pool.query(
+                `SELECT fcm_token FROM drivers WHERE id = $1`,
+                [driver_id]
+            );
+            if (driverToken.rows.length > 0 && driverToken.rows[0].fcm_token) {
+                // Get passenger name
+                const passengerNameResult = await pool.query(
+                    `SELECT full_name FROM passengers WHERE id = $1`,
+                    [passenger_id]
+                );
+                const passengerName = passengerNameResult.rows[0]?.full_name || 'Passenger';
+                await sendRideNotificationToDriver(
+                    driverToken.rows[0].fcm_token,
+                    {
+                        rideId: rideId.toString(),
+                        passengerId: passenger_id.toString(),
+                        passengerName,
+                        pickupAddress: pickup_address || 'Pickup location',
+                        pickupLat: pickup.lat.toString(),
+                        pickupLng: pickup.lng.toString(),
+                        destinationAddress: destination_address || 'Destination',
+                        destLat: destination.lat.toString(),
+                        destLng: destination.lng.toString(),
+                        rideType: ride_type || 'standard',
+                        distanceKm: distance?.toString() || '0',
+                        durationMin: duration?.toString() || '0',
+                        fare: fare?.toString() || '0',
+                        driverEarnings: fare ? (fare * 0.8).toFixed(2) : '0',
+                    },
+                    passengerName,
+                    ride_type || 'standard'
+                );
+            }
+        }
 
         return res.status(201).json({
             success: true,
             rideId,
-            message: 'Ride requested, drivers notified.',
+            message: 'Ride booked successfully.',
         });
-    } catch (error) {
+    } catch (error: unknown) {
         console.error('❌ Ride creation error:', error);
+        const dbError = error as { code?: string; detail?: string; message?: string };
+        if (dbError.code) console.error('DB Error Code:', dbError.code);
+        if (dbError.detail) console.error('DB Detail:', dbError.detail);
         return res.status(500).json({
             success: false,
             message: 'Server error while creating ride.',
@@ -319,58 +353,56 @@ router.post('/rides/request', verifyFirebaseToken, async (req: AuthenticatedRequ
         // Insert ride with driver assigned immediately (status = 'accepted')
         const insertResult = await pool.query(
             `
-      INSERT INTO public.rides (
-        passenger_id,
-        driver_id,
-        pickup,
-        destination,
-        distance,
-        duration,
-        fare,
-        payment_method,
-        payment_status,
-        status,
-        ride_type,
-        pickup_address,
-        destination_address,
-        driver_earnings,
-        tegaara_commission,
-        requested_at
-      )
-      VALUES (
-        $1,
-        $2,
-        ST_SetSRID(ST_MakePoint($3, $4), 4326),
-        ST_SetSRID(ST_MakePoint($5, $6), 4326),
-        $7,
-        $8,
-        $9,
-        $10,
-        'pending',
-        'accepted',
-        $11,
-        $12,
-        $13,
-        $14,
-        $15,
-        NOW()
-      )
-      RETURNING id
-      `,
+            INSERT INTO public.rides (
+                passenger_id,
+                driver_id,
+                pickup,
+                destination,
+                distance,
+                duration,
+                fare,
+                payment_method,
+                payment_status,
+                status,
+                ride_type,
+                pickup_address,
+                destination_address,
+                driver_earnings,
+                tegaara_commission,
+                requested_at
+            )
+            VALUES (
+                $1,
+                $2,
+                ST_SetSRID(ST_MakePoint($3, $4), 4326),
+                ST_SetSRID(ST_MakePoint($5, $6), 4326),
+                $7,
+                $8,
+                $9,
+                $10,
+                'pending',
+                'accepted',
+                $11,
+                $12,
+                $13,
+                $9 * 0.8,
+                $9 * 0.2,
+                NOW()
+            )
+            RETURNING id
+            `,
             [
                 passengerId,
                 driver_id,
                 pickup.lng, pickup.lat,
                 destination.lng, destination.lat,
-                null, // distance – can be calculated or left null
+                null, // distance – can be calculated later
                 null, // duration
                 estimated_fare || 0,
-                'standard', // payment_method
+                'standard',
                 ride_type || 'standard',
                 pickup_address || null,
                 destination_address || null,
-                estimated_fare ? estimated_fare * 0.8 : 0,
-                estimated_fare ? estimated_fare * 0.2 : 0,
             ]
         );
 
@@ -417,7 +449,7 @@ router.post('/rides/request', verifyFirebaseToken, async (req: AuthenticatedRequ
             rideId,
             message: 'Ride requested directly to driver.',
         });
-    } catch (error) {
+    } catch (error: unknown) {
         console.error('❌ Direct ride request error:', error);
         return res.status(500).json({
             success: false,
@@ -459,16 +491,16 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
     // Atomically assign driver to ride if still in 'requested' state
     const updateResult = await pool.query(
         `
-    UPDATE public.rides
-    SET driver_id = $1,
-        status = 'accepted',
-        driver_earnings = fare * 0.8,
-        tegaara_commission = fare * 0.2
-    WHERE id = $2
-      AND status = 'requested'
-      AND driver_id IS NULL
-    RETURNING id, passenger_id, driver_id, status
-    `,
+        UPDATE public.rides
+        SET driver_id = $1,
+            status = 'accepted',
+            driver_earnings = fare * 0.8,
+            tegaara_commission = fare * 0.2
+        WHERE id = $2
+          AND status = 'requested'
+          AND driver_id IS NULL
+        RETURNING id, passenger_id, driver_id, status
+        `,
         [driver_id, rideId]
     );
 
@@ -479,8 +511,7 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
         });
     }
 
-    // Optionally notify passenger (we can fetch passenger's FCM token and send push)
-    // Not implemented here for brevity.
+    // Optionally notify passenger (implement if needed)
 
     return res.status(200).json({
         success: true,
@@ -490,7 +521,7 @@ router.post('/rides/:rideId/accept', verifyFirebaseToken, async (req: Authentica
 });
 
 // -------------------------------------------------------------------
-// 8. POST /driver/accept-ride – Wrapper for accept (called from Flutter)
+// 8. POST /driver/accept-ride – Wrapper for accept
 // -------------------------------------------------------------------
 router.post('/driver/accept-ride', verifyFirebaseToken, async (req: AuthenticatedRequest, res: Response) => {
     const { rideId, driverId } = req.body;
@@ -500,27 +531,61 @@ router.post('/driver/accept-ride', verifyFirebaseToken, async (req: Authenticate
             message: 'Missing rideId or driverId.',
         });
     }
-    // Forward to the accept endpoint
-    req.params.rideId = rideId;
-    req.body.driver_id = driverId;
-    // Directly call the handler logic (refactor to a shared function to avoid duplication)
-    // For simplicity, we'll call the existing handler by re-invoking the route – but that's not clean.
-    // Better to extract the logic into a separate function.
-    // I'll implement a shared function `acceptRideHandler` and use it in both endpoints.
-    // For now, I'll write the logic inline (duplicate) to keep the file self-contained.
-    // Actually I'll refactor: create a helper `acceptRide(rideId, driverId)` and call it.
-    // Let's implement a helper function below and use it here.
-    // I'll write the helper after this.
-    // For brevity, I'll copy-paste the logic (not DRY but clear).
-    // But I'll define a local function inside this endpoint to avoid duplication.
-    // However, to keep the answer clean, I'll add a helper function above all endpoints.
+    // Re-use the accept logic by calling the same route handler
+    // We'll emulate the same logic inline
+    try {
+        const uid = getAuthenticatedUid(req);
+        if (!uid) {
+            return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        }
+        const driverCheck = await pool.query(
+            `SELECT id FROM drivers WHERE uid = $1 AND id = $2`,
+            [uid, driverId]
+        );
+        if (driverCheck.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Forbidden: driver_id does not match authenticated user.',
+            });
+        }
+        const updateResult = await pool.query(
+            `
+            UPDATE public.rides
+            SET driver_id = $1,
+                status = 'accepted',
+                driver_earnings = fare * 0.8,
+                tegaara_commission = fare * 0.2
+            WHERE id = $2
+              AND status = 'requested'
+              AND driver_id IS NULL
+            RETURNING id, passenger_id, driver_id, status
+            `,
+            [driverId, rideId]
+        );
+        if (updateResult.rows.length === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Ride already accepted or no longer available.',
+            });
+        }
+        return res.status(200).json({
+            success: true,
+            ride: updateResult.rows[0],
+            message: 'Ride accepted successfully.',
+        });
+    } catch (error: unknown) {
+        console.error('❌ Accept ride error:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'Server error while accepting ride.',
+        });
+    }
 });
 
 // -------------------------------------------------------------------
 // 9. POST /driver/decline-ride – No-op, just acknowledge
 // -------------------------------------------------------------------
 router.post('/driver/decline-ride', verifyFirebaseToken, (req: AuthenticatedRequest, res: Response) => {
-    // In a real system, you might log declines or update driver stats.
     return res.status(200).json({
         success: true,
         message: 'Ride declined.',
@@ -554,29 +619,29 @@ router.get('/drivers/:uid/current-request', verifyFirebaseToken, async (req: Aut
         // Fetch the most recent ride that is accepted or started, and not completed/cancelled
         const rideResult = await pool.query(
             `
-      SELECT
-        id as "rideId",
-        passenger_id as "passengerId",
-        pickup_address as "pickupAddress",
-        destination_address as "destinationAddress",
-        ST_X(pickup) as "pickupLat",
-        ST_Y(pickup) as "pickupLng",
-        ST_X(destination) as "destLat",
-        ST_Y(destination) as "destLng",
-        distance as "distanceKm",
-        duration as "durationMin",
-        fare,
-        driver_earnings as "driverEarnings",
-        status,
-        ride_type as "rideType",
-        (SELECT full_name FROM passengers WHERE id = rides.passenger_id) as "passengerName",
-        (SELECT profile_photo_url FROM passengers WHERE id = rides.passenger_id) as "passengerPhotoUrl"
-      FROM rides
-      WHERE driver_id = $1
-        AND status IN ('accepted', 'started')
-      ORDER BY requested_at DESC
-      LIMIT 1
-      `,
+            SELECT
+                id as "rideId",
+                passenger_id as "passengerId",
+                pickup_address as "pickupAddress",
+                destination_address as "destinationAddress",
+                ST_X(pickup) as "pickupLat",
+                ST_Y(pickup) as "pickupLng",
+                ST_X(destination) as "destLat",
+                ST_Y(destination) as "destLng",
+                distance as "distanceKm",
+                duration as "durationMin",
+                fare,
+                driver_earnings as "driverEarnings",
+                status,
+                ride_type as "rideType",
+                (SELECT full_name FROM passengers WHERE id = rides.passenger_id) as "passengerName",
+                (SELECT profile_photo_url FROM passengers WHERE id = rides.passenger_id) as "passengerPhotoUrl"
+            FROM rides
+            WHERE driver_id = $1
+              AND status IN ('accepted', 'started')
+            ORDER BY requested_at DESC
+            LIMIT 1
+            `,
             [driverId]
         );
 
@@ -588,7 +653,6 @@ router.get('/drivers/:uid/current-request', verifyFirebaseToken, async (req: Aut
         }
 
         const ride = rideResult.rows[0];
-        // Add default rating and rides count if needed
         return res.status(200).json({
             success: true,
             ride: {
@@ -597,7 +661,7 @@ router.get('/drivers/:uid/current-request', verifyFirebaseToken, async (req: Aut
                 passengerRides: '0',
             },
         });
-    } catch (error) {
+    } catch (error: unknown) {
         console.error('❌ Error fetching current request:', error);
         return res.status(500).json({
             success: false,
@@ -632,7 +696,7 @@ router.post('/driver/update-fcm-token', verifyFirebaseToken, async (req: Authent
             success: true,
             message: 'FCM token updated.',
         });
-    } catch (error) {
+    } catch (error: unknown) {
         console.error('❌ FCM token update error:', error);
         return res.status(500).json({
             success: false,
@@ -642,24 +706,25 @@ router.post('/driver/update-fcm-token', verifyFirebaseToken, async (req: Authent
 });
 
 // -------------------------------------------------------------------
-// 12. (Optional) GET /rides/:rideId/status – For polling status
+// 12. GET /rides/:rideId/status – For polling status
 // -------------------------------------------------------------------
 router.get('/rides/:rideId/status', verifyFirebaseToken, async (req: AuthenticatedRequest, res: Response) => {
     const { rideId } = req.params;
     try {
         const result = await pool.query(
             `
-      SELECT id, status, driver_id, passenger_id, fare, payment_status
-      FROM rides
-      WHERE id = $1
-      `,
+            SELECT id, status, driver_id, passenger_id, fare, payment_status
+            FROM rides
+            WHERE id = $1
+            `,
             [rideId]
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ success: false, message: 'Ride not found.' });
         }
         return res.status(200).json({ success: true, ride: result.rows[0] });
-    } catch (error) {
+    } catch (error: unknown) {
+        console.error('❌ Status fetch error:', error);
         return res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
@@ -672,20 +737,25 @@ router.post('/rides/:rideId/start', verifyFirebaseToken, async (req: Authenticat
     const uid = getAuthenticatedUid(req);
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
-    // Verify driver owns this ride
-    const check = await pool.query(
-        `SELECT id FROM rides WHERE id = $1 AND driver_id = (SELECT id FROM drivers WHERE uid = $2) AND status = 'accepted'`,
-        [rideId, uid]
-    );
-    if (check.rows.length === 0) {
-        return res.status(403).json({
-            success: false,
-            message: 'Ride not found or not in accepted state.',
-        });
-    }
+    try {
+        // Verify driver owns this ride
+        const check = await pool.query(
+            `SELECT id FROM rides WHERE id = $1 AND driver_id = (SELECT id FROM drivers WHERE uid = $2) AND status = 'accepted'`,
+            [rideId, uid]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Ride not found or not in accepted state.',
+            });
+        }
 
-    await pool.query(`UPDATE rides SET status = 'started' WHERE id = $1`, [rideId]);
-    return res.status(200).json({ success: true, message: 'Ride started.' });
+        await pool.query(`UPDATE rides SET status = 'started' WHERE id = $1`, [rideId]);
+        return res.status(200).json({ success: true, message: 'Ride started.' });
+    } catch (error: unknown) {
+        console.error('❌ Start ride error:', error);
+        return res.status(500).json({ success: false, message: 'Server error.' });
+    }
 });
 
 // -------------------------------------------------------------------
@@ -696,22 +766,27 @@ router.post('/rides/:rideId/complete', verifyFirebaseToken, async (req: Authenti
     const uid = getAuthenticatedUid(req);
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
-    const check = await pool.query(
-        `SELECT id FROM rides WHERE id = $1 AND driver_id = (SELECT id FROM drivers WHERE uid = $2) AND status = 'started'`,
-        [rideId, uid]
-    );
-    if (check.rows.length === 0) {
-        return res.status(403).json({
-            success: false,
-            message: 'Ride not found or not in started state.',
-        });
-    }
+    try {
+        const check = await pool.query(
+            `SELECT id FROM rides WHERE id = $1 AND driver_id = (SELECT id FROM drivers WHERE uid = $2) AND status = 'started'`,
+            [rideId, uid]
+        );
+        if (check.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Ride not found or not in started state.',
+            });
+        }
 
-    await pool.query(
-        `UPDATE rides SET status = 'completed', completed_at = NOW() WHERE id = $1`,
-        [rideId]
-    );
-    return res.status(200).json({ success: true, message: 'Ride completed.' });
+        await pool.query(
+            `UPDATE rides SET status = 'completed', completed_at = NOW() WHERE id = $1`,
+            [rideId]
+        );
+        return res.status(200).json({ success: true, message: 'Ride completed.' });
+    } catch (error: unknown) {
+        console.error('❌ Complete ride error:', error);
+        return res.status(500).json({ success: false, message: 'Server error.' });
+    }
 });
 
 // -------------------------------------------------------------------
@@ -723,31 +798,36 @@ router.post('/rides/:rideId/cancel', verifyFirebaseToken, async (req: Authentica
     const uid = getAuthenticatedUid(req);
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
-    // Check if the user is either the passenger or the driver of this ride
-    const rideCheck = await pool.query(
-        `
-    SELECT id FROM rides
-    WHERE id = $1
-      AND (
-        passenger_id = (SELECT id FROM passengers WHERE firebase_uid = $2)
-        OR driver_id = (SELECT id FROM drivers WHERE uid = $2)
-      )
-      AND status NOT IN ('completed', 'cancelled')
-    `,
-        [rideId, uid]
-    );
-    if (rideCheck.rows.length === 0) {
-        return res.status(403).json({
-            success: false,
-            message: 'Ride not found or cannot be cancelled.',
-        });
-    }
+    try {
+        // Check if the user is either the passenger or the driver of this ride
+        const rideCheck = await pool.query(
+            `
+            SELECT id FROM rides
+            WHERE id = $1
+              AND (
+                passenger_id = (SELECT id FROM passengers WHERE firebase_uid = $2)
+                OR driver_id = (SELECT id FROM drivers WHERE uid = $2)
+              )
+              AND status NOT IN ('completed', 'cancelled')
+            `,
+            [rideId, uid]
+        );
+        if (rideCheck.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Ride not found or cannot be cancelled.',
+            });
+        }
 
-    await pool.query(
-        `UPDATE rides SET status = 'cancelled' WHERE id = $1`,
-        [rideId]
-    );
-    return res.status(200).json({ success: true, message: 'Ride cancelled.' });
+        await pool.query(
+            `UPDATE rides SET status = 'cancelled' WHERE id = $1`,
+            [rideId]
+        );
+        return res.status(200).json({ success: true, message: 'Ride cancelled.' });
+    } catch (error: unknown) {
+        console.error('❌ Cancel ride error:', error);
+        return res.status(500).json({ success: false, message: 'Server error.' });
+    }
 });
 
 // -------------------------------------------------------------------
