@@ -22,6 +22,9 @@ import adminAuth from './middleware/firebaseAdmin';
 import passengerRoutes from './routes/passengerRoutes';
 import driverRoutes from './routes/driverRoutes';
 
+// ====== ADD THIS IMPORT ======
+import mapRoutes from './routes/mapRoutes';
+
 /*
 |--------------------------------------------------------------------------
 | Types
@@ -453,6 +456,9 @@ app.use(
     '/api/drivers',
     driverRoutes,
 );
+
+// ====== ADD THIS LINE ======
+app.use('/api/maps', mapRoutes);
 
 /*
 |--------------------------------------------------------------------------
