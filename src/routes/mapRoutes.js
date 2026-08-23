@@ -6,7 +6,7 @@ const {
     searchPlaces,
     getPlaceDetails,
     getRoute
-} = require('../controllers/mapController');
+} = require('../controller/mapController');
 
 
 router.get('/places', searchPlaces);
