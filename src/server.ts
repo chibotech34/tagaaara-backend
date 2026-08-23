@@ -1,6 +1,5 @@
 import dotenv from 'dotenv';
 
-// Load environment variables BEFORE importing application modules
 dotenv.config();
 
 import express, {
@@ -14,14 +13,13 @@ import cors from 'cors';
 import pool from './config/database';
 
 // Initialize Firebase ONCE.
-// This import executes config/firebase.ts.
 import './config/firebase';
 
 import adminAuth from './middleware/firebaseAdmin';
 
-import rideRoutes from './routes/rideRoutes';
 import passengerRoutes from './routes/passengerRoutes';
 import driverRoutes from './routes/driverRoutes';
+import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 
 /*
@@ -86,14 +84,14 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| BODY PARSERS
+| IMPORTANT
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-| These MUST come BEFORE rideRoutes, passengerRoutes,
-| driverRoutes, mapRoutes, etc.
+| Body parsers MUST be registered BEFORE routes.
 |
-| Otherwise req.body will be undefined.
+| Previously rideRoutes was registered before express.json(),
+| which caused req.body to be undefined.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -112,11 +110,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| Request Debugging
-|--------------------------------------------------------------------------
-|
-| This helps identify malformed requests during development.
-| It can be removed later.
+| Request logging
 |--------------------------------------------------------------------------
 */
 
@@ -129,22 +123,6 @@ app.use(
         console.log(
             `➡️ ${req.method} ${req.originalUrl}`,
         );
-
-        if (
-            req.method === 'POST' ||
-            req.method === 'PUT' ||
-            req.method === 'PATCH'
-        ) {
-            console.log(
-                '📦 Content-Type:',
-                req.headers['content-type'],
-            );
-
-            console.log(
-                '📦 Request body:',
-                req.body,
-            );
-        }
 
         next();
     },
@@ -164,10 +142,12 @@ app.get(
 
             return res.status(200).json({
                 success: true,
-                message: 'Tegaara backend is running',
+                message:
+                    'Tegaara backend is running',
                 database: 'connected',
                 firebase: 'configured',
-                timestamp: new Date().toISOString(),
+                timestamp:
+                    new Date().toISOString(),
             });
         } catch (error: unknown) {
             console.error(
@@ -181,7 +161,8 @@ app.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Database connection failed',
+                message:
+                    'Database connection failed',
                 database: 'disconnected',
                 firebase: 'configured',
                 error: dbError.message,
@@ -192,7 +173,7 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| DATABASE CONNECTION TEST
+| Database Connection Test
 |--------------------------------------------------------------------------
 */
 
@@ -219,10 +200,8 @@ pool.query('SELECT NOW()')
 | RIDE ROUTES
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-| Body parsers are already registered above.
+| MUST come after express.json()
 |
-| Therefore req.body is available inside rideRoutes.
 |--------------------------------------------------------------------------
 */
 
@@ -233,7 +212,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| PUBLIC PASSENGER ROUTES
+| Passenger Routes
 |--------------------------------------------------------------------------
 */
 
@@ -244,7 +223,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| PUBLIC DRIVER ROUTES
+| Driver Routes
 |--------------------------------------------------------------------------
 */
 
@@ -255,7 +234,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| MAP ROUTES
+| Map Routes
 |--------------------------------------------------------------------------
 */
 
@@ -267,9 +246,6 @@ app.use(
 /*
 |--------------------------------------------------------------------------
 | PUBLIC ADMIN ROUTES
-|--------------------------------------------------------------------------
-|
-| These routes do not require an existing admin login.
 |--------------------------------------------------------------------------
 */
 
@@ -329,7 +305,7 @@ app.post(
             username,
             profilePhoto,
             accountStatus,
-        } = req.body;
+        } = req.body ?? {};
 
         if (
             !email ||
@@ -417,15 +393,17 @@ app.post(
 
             /*
             |--------------------------------------------------------------------------
-            | Create Firebase User
+            | Create Firebase user
             |--------------------------------------------------------------------------
             */
 
             const userRecord =
                 await firebaseAuth.createUser({
-                    email: normalizedEmail,
+                    email:
+                        normalizedEmail,
                     password,
-                    displayName: fullName,
+                    displayName:
+                        fullName,
                 });
 
             const firebaseUid =
@@ -438,7 +416,7 @@ app.post(
 
             /*
             |--------------------------------------------------------------------------
-            | Insert PostgreSQL Admin
+            | Insert PostgreSQL admin
             |--------------------------------------------------------------------------
             */
 
@@ -473,9 +451,12 @@ app.post(
                         firebaseUid,
                         normalizedEmail,
                         fullName,
-                        phoneNumber || null,
-                        username || null,
-                        profilePhoto || null,
+                        phoneNumber ||
+                        null,
+                        username ||
+                        null,
+                        profilePhoto ||
+                        null,
                         accountStatus ||
                         'active',
                         'admin',
@@ -484,7 +465,7 @@ app.post(
 
             /*
             |--------------------------------------------------------------------------
-            | Save Admin In Firebase Realtime Database
+            | Save admin in Firebase Realtime Database
             |--------------------------------------------------------------------------
             */
 
@@ -494,7 +475,8 @@ app.post(
                 )
                 .set({
                     firebaseUid,
-                    email: normalizedEmail,
+                    email:
+                        normalizedEmail,
                     fullName,
                     phoneNumber:
                         phoneNumber || '',
@@ -569,8 +551,8 @@ app.post(
 | ADMIN AUTHENTICATION
 |--------------------------------------------------------------------------
 |
-| Everything below this middleware requires
-| a valid Firebase admin token.
+| Everything below this middleware requires admin authentication.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -591,7 +573,8 @@ app.get(
         if (!req.adminUser) {
             return res.status(404).json({
                 success: false,
-                error: 'Admin not found',
+                error:
+                    'Admin not found',
             });
         }
 
@@ -641,7 +624,8 @@ app.get(
             const passengers =
                 await pool.query(
                     `
-                    SELECT COUNT(*)::int AS count
+                    SELECT
+                        COUNT(*)::int AS count
                     FROM public.passengers
                     `,
                 );
@@ -649,7 +633,8 @@ app.get(
             const drivers =
                 await pool.query(
                     `
-                    SELECT COUNT(*)::int AS count
+                    SELECT
+                        COUNT(*)::int AS count
                     FROM public.drivers
                     WHERE is_online = true
                     `,
@@ -745,7 +730,8 @@ app.get(
                 Math.min(
                     Math.max(
                         Number(
-                            req.query.limit,
+                            req.query
+                                .limit,
                         ) || 10,
                         1,
                     ),
@@ -753,12 +739,13 @@ app.get(
                 );
 
             const offset =
-                (page - 1) * limit;
+                (page - 1) *
+                limit;
 
             const search =
                 String(
-                    req.query.search ||
-                    '',
+                    req.query
+                        .search || '',
                 ).trim();
 
             const status =
@@ -793,16 +780,11 @@ app.get(
                 parameterIndex++;
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Count
-            |--------------------------------------------------------------------------
-            */
-
             const countResult =
                 await pool.query(
                     `
-                    SELECT COUNT(*)::int AS total
+                    SELECT
+                        COUNT(*)::int AS total
                     FROM public.drivers d
                     ${whereClause}
                     `,
@@ -812,12 +794,6 @@ app.get(
             const total =
                 countResult.rows[0]
                     ?.total || 0;
-
-            /*
-            |--------------------------------------------------------------------------
-            | Data
-            |--------------------------------------------------------------------------
-            */
 
             const dataParams = [
                 ...params,
@@ -1010,8 +986,7 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0]
-                    .status;
+                check.rows[0].status;
 
             if (
                 ![
@@ -1167,8 +1142,7 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0]
-                    .status;
+                check.rows[0].status;
 
             if (
                 [
@@ -1329,8 +1303,7 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0]
-                    .status;
+                check.rows[0].status;
 
             if (
                 [
@@ -1495,24 +1468,20 @@ app.get(
 
 app.use(
     (
-        req: Request,
+        _req: Request,
         res: Response,
     ) => {
-        console.error(
-            `❌ 404 - ${req.method} ${req.originalUrl}`,
-        );
-
         return res.status(404).json({
             success: false,
-            error: 'Route not found',
-            path: req.originalUrl,
+            error:
+                'Route not found',
         });
     },
 );
 
 /*
 |--------------------------------------------------------------------------
-| GLOBAL ERROR HANDLER
+| Global Error Handler
 |--------------------------------------------------------------------------
 */
 
@@ -1531,12 +1500,7 @@ app.use(
         const serverError =
             error as {
                 message?: string;
-                stack?: string;
             };
-
-        console.error(
-            serverError.stack,
-        );
 
         return res.status(500).json({
             success: false,
@@ -1549,7 +1513,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| START SERVER
+| Start Server
 |--------------------------------------------------------------------------
 */
 
@@ -1567,10 +1531,6 @@ app.listen(
 
         console.log(
             `   http://localhost:${PORT}`,
-        );
-
-        console.log(
-            `   API: http://localhost:${PORT}/api`,
         );
 
         console.log(
