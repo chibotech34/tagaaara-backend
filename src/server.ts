@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
-import rideRoutes from './routes/rideRoutes';
+
+// Load environment variables BEFORE importing application modules
 dotenv.config();
 
 import express, {
@@ -15,14 +16,12 @@ import pool from './config/database';
 // Initialize Firebase ONCE.
 // This import executes config/firebase.ts.
 import './config/firebase';
-import { getAuth } from 'firebase-admin/auth';
 
 import adminAuth from './middleware/firebaseAdmin';
 
+import rideRoutes from './routes/rideRoutes';
 import passengerRoutes from './routes/passengerRoutes';
 import driverRoutes from './routes/driverRoutes';
-
-// ====== ADD THIS IMPORT ======
 import mapRoutes from './routes/mapRoutes';
 
 /*
@@ -74,7 +73,7 @@ if (!process.env.FIREBASE_DATABASE_URL) {
 
 /*
 |--------------------------------------------------------------------------
-| Middleware
+| CORS
 |--------------------------------------------------------------------------
 */
 
@@ -84,7 +83,19 @@ app.use(
         credentials: true,
     }),
 );
-app.use('/api', rideRoutes);
+
+/*
+|--------------------------------------------------------------------------
+| BODY PARSERS
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| These MUST come BEFORE rideRoutes, passengerRoutes,
+| driverRoutes, mapRoutes, etc.
+|
+| Otherwise req.body will be undefined.
+|--------------------------------------------------------------------------
+*/
 
 app.use(
     express.json({
@@ -97,6 +108,46 @@ app.use(
         extended: true,
         limit: '10mb',
     }),
+);
+
+/*
+|--------------------------------------------------------------------------
+| Request Debugging
+|--------------------------------------------------------------------------
+|
+| This helps identify malformed requests during development.
+| It can be removed later.
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    (
+        req: Request,
+        _res: Response,
+        next: NextFunction,
+    ) => {
+        console.log(
+            `➡️ ${req.method} ${req.originalUrl}`,
+        );
+
+        if (
+            req.method === 'POST' ||
+            req.method === 'PUT' ||
+            req.method === 'PATCH'
+        ) {
+            console.log(
+                '📦 Content-Type:',
+                req.headers['content-type'],
+            );
+
+            console.log(
+                '📦 Request body:',
+                req.body,
+            );
+        }
+
+        next();
+    },
 );
 
 /*
@@ -141,13 +192,16 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| Database Connection Test
+| DATABASE CONNECTION TEST
 |--------------------------------------------------------------------------
 */
 
 pool.query('SELECT NOW()')
     .then((result) => {
-        console.log('✅ PostgreSQL connected successfully');
+        console.log(
+            '✅ PostgreSQL connected successfully',
+        );
+
         console.log(
             '   Server time:',
             result.rows[0].now,
@@ -162,11 +216,60 @@ pool.query('SELECT NOW()')
 
 /*
 |--------------------------------------------------------------------------
+| RIDE ROUTES
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+| Body parsers are already registered above.
+|
+| Therefore req.body is available inside rideRoutes.
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api',
+    rideRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| PUBLIC PASSENGER ROUTES
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/passengers',
+    passengerRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| PUBLIC DRIVER ROUTES
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/drivers',
+    driverRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| MAP ROUTES
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/maps',
+    mapRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
 | PUBLIC ADMIN ROUTES
 |--------------------------------------------------------------------------
 |
 | These routes do not require an existing admin login.
-|
 |--------------------------------------------------------------------------
 */
 
@@ -181,13 +284,16 @@ app.get(
     async (_req: Request, res: Response) => {
         try {
             const result = await pool.query(
-                `SELECT id
-                 FROM public.admins
-                 LIMIT 1`,
+                `
+                SELECT id
+                FROM public.admins
+                LIMIT 1
+                `,
             );
 
             return res.status(200).json({
-                exists: result.rows.length > 0,
+                exists:
+                    result.rows.length > 0,
             });
         } catch (error: unknown) {
             console.error(
@@ -205,17 +311,16 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| Create admin
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-| Firebase Auth creation is handled by the Firebase configuration.
+| Create Admin
 |--------------------------------------------------------------------------
 */
 
 app.post(
     '/api/admin/create',
-    async (req: Request, res: Response) => {
+    async (
+        req: Request,
+        res: Response,
+    ) => {
         const {
             email,
             password,
@@ -226,7 +331,11 @@ app.post(
             accountStatus,
         } = req.body;
 
-        if (!email || !password || !fullName) {
+        if (
+            !email ||
+            !password ||
+            !fullName
+        ) {
             return res.status(400).json({
                 success: false,
                 error:
@@ -238,11 +347,14 @@ app.post(
             const {
                 firebaseAuth,
                 realtimeDb,
-            } = await import('./config/firebase');
+            } = await import(
+                './config/firebase'
+            );
 
-            const normalizedEmail = String(email)
-                .trim()
-                .toLowerCase();
+            const normalizedEmail =
+                String(email)
+                    .trim()
+                    .toLowerCase();
 
             /*
             |--------------------------------------------------------------------------
@@ -250,15 +362,20 @@ app.post(
             |--------------------------------------------------------------------------
             */
 
-            const existingAdmin = await pool.query(
-                `SELECT id
-                 FROM public.admins
-                 WHERE LOWER(email) = $1
-                 LIMIT 1`,
-                [normalizedEmail],
-            );
+            const existingAdmin =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM public.admins
+                    WHERE LOWER(email) = $1
+                    LIMIT 1
+                    `,
+                    [normalizedEmail],
+                );
 
-            if (existingAdmin.rows.length > 0) {
+            if (
+                existingAdmin.rows.length > 0
+            ) {
                 return res.status(409).json({
                     success: false,
                     error:
@@ -278,14 +395,18 @@ app.post(
                         normalizedEmail,
                     );
 
-                if (existingFirebaseUser) {
+                if (
+                    existingFirebaseUser
+                ) {
                     return res.status(409).json({
                         success: false,
                         error:
                             'A Firebase user with this email already exists',
                     });
                 }
-            } catch (firebaseError: any) {
+            } catch (
+            firebaseError: any
+            ) {
                 if (
                     firebaseError.code !==
                     'auth/user-not-found'
@@ -296,7 +417,7 @@ app.post(
 
             /*
             |--------------------------------------------------------------------------
-            | Create Firebase user
+            | Create Firebase User
             |--------------------------------------------------------------------------
             */
 
@@ -307,7 +428,8 @@ app.post(
                     displayName: fullName,
                 });
 
-            const firebaseUid = userRecord.uid;
+            const firebaseUid =
+                userRecord.uid;
 
             console.log(
                 '✅ Created Firebase admin UID:',
@@ -316,56 +438,60 @@ app.post(
 
             /*
             |--------------------------------------------------------------------------
-            | Insert PostgreSQL admin
+            | Insert PostgreSQL Admin
             |--------------------------------------------------------------------------
             */
 
-            const result = await pool.query(
-                `
-                INSERT INTO public.admins
-                (
-                    firebase_uid,
-                    email,
-                    full_name,
-                    phone_number,
-                    username,
-                    profile_photo_url,
-                    account_status,
-                    role
-                )
-                VALUES
-                (
-                    $1,
-                    $2,
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    $8
-                )
-                RETURNING *
-                `,
-                [
-                    firebaseUid,
-                    normalizedEmail,
-                    fullName,
-                    phoneNumber || null,
-                    username || null,
-                    profilePhoto || null,
-                    accountStatus || 'active',
-                    'admin',
-                ],
-            );
+            const result =
+                await pool.query(
+                    `
+                    INSERT INTO public.admins
+                    (
+                        firebase_uid,
+                        email,
+                        full_name,
+                        phone_number,
+                        username,
+                        profile_photo_url,
+                        account_status,
+                        role
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8
+                    )
+                    RETURNING *
+                    `,
+                    [
+                        firebaseUid,
+                        normalizedEmail,
+                        fullName,
+                        phoneNumber || null,
+                        username || null,
+                        profilePhoto || null,
+                        accountStatus ||
+                        'active',
+                        'admin',
+                    ],
+                );
 
             /*
             |--------------------------------------------------------------------------
-            | Save admin in Firebase Realtime Database
+            | Save Admin In Firebase Realtime Database
             |--------------------------------------------------------------------------
             */
 
             await realtimeDb
-                .ref(`admins/${firebaseUid}`)
+                .ref(
+                    `admins/${firebaseUid}`,
+                )
                 .set({
                     firebaseUid,
                     email: normalizedEmail,
@@ -377,13 +503,15 @@ app.post(
                     profilePhoto:
                         profilePhoto || '',
                     accountStatus:
-                        accountStatus || 'active',
+                        accountStatus ||
+                        'active',
                     role: 'admin',
                     createdAt:
                         new Date().toISOString(),
                 });
 
-            const admin = result.rows[0];
+            const admin =
+                result.rows[0];
 
             return res.status(201).json({
                 success: true,
@@ -417,10 +545,11 @@ app.post(
                 error,
             );
 
-            const firebaseError = error as {
-                code?: string;
-                message?: string;
-            };
+            const firebaseError =
+                error as {
+                    code?: string;
+                    message?: string;
+                };
 
             return res.status(500).json({
                 success: false,
@@ -437,36 +566,11 @@ app.post(
 
 /*
 |--------------------------------------------------------------------------
-| Passenger Routes
-|--------------------------------------------------------------------------
-*/
-
-app.use(
-    '/api/passengers',
-    passengerRoutes,
-);
-
-/*
-|--------------------------------------------------------------------------
-| Driver Routes
-|--------------------------------------------------------------------------
-*/
-
-app.use(
-    '/api/drivers',
-    driverRoutes,
-);
-
-// ====== ADD THIS LINE ======
-app.use('/api/maps', mapRoutes);
-
-/*
-|--------------------------------------------------------------------------
 | ADMIN AUTHENTICATION
 |--------------------------------------------------------------------------
 |
-| All routes below this middleware are protected and require admin rights.
-|
+| Everything below this middleware requires
+| a valid Firebase admin token.
 |--------------------------------------------------------------------------
 */
 
@@ -491,7 +595,8 @@ app.get(
             });
         }
 
-        const admin = req.adminUser;
+        const admin =
+            req.adminUser;
 
         return res.status(200).json({
             success: true,
@@ -511,7 +616,8 @@ app.get(
                 accountStatus:
                     admin.account_status,
                 role:
-                    admin.role || 'admin',
+                    admin.role ||
+                    'admin',
                 createdAt:
                     admin.created_at,
             },
@@ -527,27 +633,36 @@ app.get(
 
 app.get(
     '/api/stats',
-    async (_req: AuthRequest, res: Response) => {
+    async (
+        _req: AuthRequest,
+        res: Response,
+    ) => {
         try {
             const passengers =
                 await pool.query(
-                    `SELECT COUNT(*)::int AS count
-                     FROM public.passengers`,
+                    `
+                    SELECT COUNT(*)::int AS count
+                    FROM public.passengers
+                    `,
                 );
 
             const drivers =
                 await pool.query(
-                    `SELECT COUNT(*)::int AS count
-                     FROM public.drivers
-                     WHERE is_online = true`,
+                    `
+                    SELECT COUNT(*)::int AS count
+                    FROM public.drivers
+                    WHERE is_online = true
+                    `,
                 );
 
             return res.status(200).json({
                 success: true,
                 totalPassengers:
-                    passengers.rows[0]?.count || 0,
+                    passengers.rows[0]
+                        ?.count || 0,
                 activeDrivers:
-                    drivers.rows[0]?.count || 0,
+                    drivers.rows[0]
+                        ?.count || 0,
             });
         } catch (error: unknown) {
             console.error(
@@ -557,7 +672,8 @@ app.get(
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to load statistics',
+                error:
+                    'Failed to load statistics',
             });
         }
     },
@@ -576,17 +692,19 @@ app.get(
         res: Response,
     ) => {
         try {
-            const result = await pool.query(
-                `
-                SELECT *
-                FROM public.drivers
-                ORDER BY created_at DESC
-                `,
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT *
+                    FROM public.drivers
+                    ORDER BY created_at DESC
+                    `,
+                );
 
             return res.status(200).json({
                 success: true,
-                drivers: result.rows,
+                drivers:
+                    result.rows,
             });
         } catch (error: unknown) {
             console.error(
@@ -596,7 +714,8 @@ app.get(
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to fetch drivers',
+                error:
+                    'Failed to fetch drivers',
             });
         }
     },
@@ -616,24 +735,30 @@ app.get(
     ) => {
         try {
             const page = Math.max(
-                Number(req.query.page) || 1,
+                Number(
+                    req.query.page,
+                ) || 1,
                 1,
             );
 
-            const limit = Math.min(
-                Math.max(
-                    Number(req.query.limit) || 10,
-                    1,
-                ),
-                100,
-            );
+            const limit =
+                Math.min(
+                    Math.max(
+                        Number(
+                            req.query.limit,
+                        ) || 10,
+                        1,
+                    ),
+                    100,
+                );
 
             const offset =
                 (page - 1) * limit;
 
             const search =
                 String(
-                    req.query.search || '',
+                    req.query.search ||
+                    '',
                 ).trim();
 
             const status =
@@ -642,7 +767,9 @@ app.get(
                     'pending',
                 ).trim();
 
-            const params: any[] = [status];
+            const params: any[] = [
+                status,
+            ];
 
             let whereClause =
                 `WHERE d.status = $1`;
@@ -683,8 +810,8 @@ app.get(
                 );
 
             const total =
-                countResult.rows[0]?.total ||
-                0;
+                countResult.rows[0]
+                    ?.total || 0;
 
             /*
             |--------------------------------------------------------------------------
@@ -726,7 +853,8 @@ app.get(
                     total,
                     totalPages:
                         Math.ceil(
-                            total / limit,
+                            total /
+                            limit,
                         ),
                 },
             });
@@ -736,9 +864,10 @@ app.get(
                 error,
             );
 
-            const dbError = error as {
-                message?: string;
-            };
+            const dbError =
+                error as {
+                    message?: string;
+                };
 
             return res.status(500).json({
                 success: false,
@@ -762,9 +891,8 @@ app.get(
         req: AuthRequest,
         res: Response,
     ) => {
-        const driverId = Number(
-            req.params.id,
-        );
+        const driverId =
+            Number(req.params.id);
 
         if (
             !Number.isInteger(
@@ -794,7 +922,8 @@ app.get(
                 );
 
             if (
-                result.rows.length === 0
+                result.rows.length ===
+                0
             ) {
                 return res.status(404).json({
                     success: false,
@@ -835,9 +964,8 @@ app.post(
         req: AuthRequest,
         res: Response,
     ) => {
-        const driverId = Number(
-            req.params.id,
-        );
+        const driverId =
+            Number(req.params.id);
 
         if (
             !Number.isInteger(
@@ -871,7 +999,8 @@ app.post(
                 );
 
             if (
-                check.rows.length === 0
+                check.rows.length ===
+                0
             ) {
                 return res.status(404).json({
                     success: false,
@@ -881,7 +1010,8 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0].status;
+                check.rows[0]
+                    .status;
 
             if (
                 ![
@@ -904,10 +1034,12 @@ app.post(
                 UPDATE public.drivers
                 SET
                     status = 'approved',
-                    updated_at = CURRENT_TIMESTAMP,
+                    updated_at =
+                        CURRENT_TIMESTAMP,
                     verification_checked_at =
                         CURRENT_TIMESTAMP,
-                    verification_checked_by = $1
+                    verification_checked_by =
+                        $1
                 WHERE id = $2
                 `,
                 [
@@ -975,13 +1107,13 @@ app.post(
         req: AuthRequest,
         res: Response,
     ) => {
-        const driverId = Number(
-            req.params.id,
-        );
+        const driverId =
+            Number(req.params.id);
 
         const reason =
             String(
-                req.body?.reason || '',
+                req.body?.reason ||
+                '',
             ).trim();
 
         if (
@@ -1024,7 +1156,8 @@ app.post(
                 );
 
             if (
-                check.rows.length === 0
+                check.rows.length ===
+                0
             ) {
                 return res.status(404).json({
                     success: false,
@@ -1034,7 +1167,8 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0].status;
+                check.rows[0]
+                    .status;
 
             if (
                 [
@@ -1060,8 +1194,10 @@ app.post(
                         CURRENT_TIMESTAMP,
                     verification_checked_at =
                         CURRENT_TIMESTAMP,
-                    verification_checked_by = $1,
-                    reviewer_comment = $2
+                    verification_checked_by =
+                        $1,
+                    reviewer_comment =
+                        $2
                 WHERE id = $3
                 `,
                 [
@@ -1133,13 +1269,13 @@ app.post(
         req: AuthRequest,
         res: Response,
     ) => {
-        const driverId = Number(
-            req.params.id,
-        );
+        const driverId =
+            Number(req.params.id);
 
         const message =
             String(
-                req.body?.message || '',
+                req.body?.message ||
+                '',
             ).trim();
 
         if (
@@ -1182,7 +1318,8 @@ app.post(
                 );
 
             if (
-                check.rows.length === 0
+                check.rows.length ===
+                0
             ) {
                 return res.status(404).json({
                     success: false,
@@ -1192,7 +1329,8 @@ app.post(
             }
 
             const currentStatus =
-                check.rows[0].status;
+                check.rows[0]
+                    .status;
 
             if (
                 [
@@ -1294,9 +1432,8 @@ app.get(
         req: AuthRequest,
         res: Response,
     ) => {
-        const driverId = Number(
-            req.params.id,
-        );
+        const driverId =
+            Number(req.params.id);
 
         if (
             !Number.isInteger(
@@ -1358,19 +1495,24 @@ app.get(
 
 app.use(
     (
-        _req: Request,
+        req: Request,
         res: Response,
     ) => {
+        console.error(
+            `❌ 404 - ${req.method} ${req.originalUrl}`,
+        );
+
         return res.status(404).json({
             success: false,
             error: 'Route not found',
+            path: req.originalUrl,
         });
     },
 );
 
 /*
 |--------------------------------------------------------------------------
-| Global Error Handler
+| GLOBAL ERROR HANDLER
 |--------------------------------------------------------------------------
 */
 
@@ -1386,9 +1528,15 @@ app.use(
             error,
         );
 
-        const serverError = error as {
-            message?: string;
-        };
+        const serverError =
+            error as {
+                message?: string;
+                stack?: string;
+            };
+
+        console.error(
+            serverError.stack,
+        );
 
         return res.status(500).json({
             success: false,
@@ -1401,7 +1549,7 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| Start Server
+| START SERVER
 |--------------------------------------------------------------------------
 */
 
@@ -1419,6 +1567,10 @@ app.listen(
 
         console.log(
             `   http://localhost:${PORT}`,
+        );
+
+        console.log(
+            `   API: http://localhost:${PORT}/api`,
         );
 
         console.log(
