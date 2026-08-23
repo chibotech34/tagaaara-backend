@@ -43,7 +43,9 @@ const verifyFirebaseToken = async (
         return;
     }
 
-    const token = authHeader.substring('Bearer '.length).trim();
+    const token = authHeader
+        .substring('Bearer '.length)
+        .trim();
 
     if (!token) {
         res.status(401).json({
@@ -55,7 +57,8 @@ const verifyFirebaseToken = async (
     }
 
     try {
-        const decodedToken = await firebaseAuth.verifyIdToken(token);
+        const decodedToken =
+            await firebaseAuth.verifyIdToken(token);
 
         req.decodedToken = {
             uid: decodedToken.uid,
@@ -65,7 +68,10 @@ const verifyFirebaseToken = async (
 
         next();
     } catch (error: unknown) {
-        console.error('❌ Firebase token verification failed:', error);
+        console.error(
+            '❌ Firebase token verification failed:',
+            error,
+        );
 
         const firebaseError = error as {
             code?: string;
@@ -75,7 +81,8 @@ const verifyFirebaseToken = async (
         if (firebaseError.code === 'auth/id-token-expired') {
             res.status(401).json({
                 success: false,
-                message: 'Firebase ID token expired. Refresh authentication.',
+                message:
+                    'Firebase ID token expired. Refresh authentication.',
                 code: 'AUTH_TOKEN_EXPIRED',
             });
             return;
@@ -84,7 +91,8 @@ const verifyFirebaseToken = async (
         if (firebaseError.code === 'auth/id-token-revoked') {
             res.status(401).json({
                 success: false,
-                message: 'Firebase ID token revoked. Sign in again.',
+                message:
+                    'Firebase ID token revoked. Sign in again.',
                 code: 'AUTH_TOKEN_REVOKED',
             });
             return;
@@ -108,12 +116,15 @@ function getAuthenticatedUid(
     return req.decodedToken?.uid ?? null;
 }
 
-function isValidLocation(value: unknown): value is LocationPoint {
+function isValidLocation(
+    value: unknown,
+): value is LocationPoint {
     if (!value || typeof value !== 'object') {
         return false;
     }
 
-    const location = value as Record<string, unknown>;
+    const location =
+        value as Record<string, unknown>;
 
     const lat = Number(location.lat);
     const lng = Number(location.lng);
@@ -132,13 +143,19 @@ function toNumber(
     value: unknown,
     fallback: number | null = null,
 ): number | null {
-    if (value === null || value === undefined || value === '') {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ''
+    ) {
         return fallback;
     }
 
     const number = Number(value);
 
-    return Number.isFinite(number) ? number : fallback;
+    return Number.isFinite(number)
+        ? number
+        : fallback;
 }
 
 /* ============================================================
@@ -221,7 +238,8 @@ async function sendRideNotificationToDriver(
 
             notification: {
                 title: 'New Ride Request',
-                body: `${passengerName} wants a ride (${rideType})`,
+                body:
+                    `${passengerName} wants a ride (${rideType})`,
             },
 
             data: rideData,
@@ -244,22 +262,26 @@ async function sendRideNotificationToDriver(
         });
 
         console.log(
-            `✅ Ride notification sent to driver: ${driverFcmToken.substring(
-                0,
-                10,
-            )}...`,
+            `✅ Ride notification sent to driver: ` +
+            `${driverFcmToken.substring(0, 10)}...`,
         );
     } catch (error) {
         console.error(
             '❌ FCM ride notification failed:',
             error,
         );
+
+        /*
+         * Notification failure must NOT cause the ride
+         * creation request to fail.
+         */
     }
 }
 
 /* ============================================================
    1. GET /rides/nearby
-   Driver app uses this to find passenger ride requests.
+
+   Driver uses this to find requested rides nearby.
 ============================================================ */
 
 router.get(
@@ -275,20 +297,28 @@ router.get(
 
             let radius = Number(req.query.radius);
 
-            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            if (
+                !Number.isFinite(lat) ||
+                !Number.isFinite(lng)
+            ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Valid lat and lng are required.',
+                    message:
+                        'Valid lat and lng are required.',
                 });
             }
 
-            if (!Number.isFinite(radius) || radius <= 0) {
+            if (
+                !Number.isFinite(radius) ||
+                radius <= 0
+            ) {
                 radius = 5000;
             }
 
             radius = Math.min(radius, 50000);
 
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
@@ -297,47 +327,49 @@ router.get(
                 });
             }
 
-            /*
-             * Make sure this Firebase user is actually a driver.
-             */
-            const driverResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    status,
-                    is_online,
-                    is_available
-                FROM public.drivers
-                WHERE uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const driverResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        status,
+                        is_online,
+                        is_available
+                    FROM public.drivers
+                    WHERE uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-            if (driverResult.rows.length === 0) {
+            if (
+                driverResult.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Driver profile not found.',
+                    message:
+                        'Driver profile not found.',
                 });
             }
 
-            const driver = driverResult.rows[0];
+            const driver =
+                driverResult.rows[0];
 
             if (driver.status !== 'approved') {
                 return res.status(403).json({
                     success: false,
-                    message: 'Driver account is not approved.',
+                    message:
+                        'Driver account is not approved.',
                 });
             }
 
-            if (!driver.is_online || !driver.is_available) {
+            if (
+                !driver.is_online ||
+                !driver.is_available
+            ) {
                 return res.status(200).json([]);
             }
 
-            /*
-             * IMPORTANT:
-             * Only rides waiting for a driver are returned here.
-             */
             const query = `
                 SELECT
                     r.id,
@@ -408,7 +440,9 @@ router.get(
                 [lat, lng, radius],
             );
 
-            return res.status(200).json(result.rows);
+            return res.status(200).json(
+                result.rows,
+            );
         } catch (error: unknown) {
             console.error(
                 '❌ Nearby rides error:',
@@ -417,7 +451,8 @@ router.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Server error while finding nearby rides.',
+                message:
+                    'Server error while finding nearby rides.',
             });
         }
     },
@@ -425,11 +460,10 @@ router.get(
 
 /* ============================================================
    2. POST /rides
-   Passenger books a specific driver.
 
-   IMPORTANT:
-   This is the endpoint your Flutter ApiService.bookRide()
-   currently calls.
+   Passenger can book a specific driver directly.
+
+   This endpoint remains available for compatibility.
 ============================================================ */
 
 router.post(
@@ -455,10 +489,11 @@ router.post(
             } = req.body;
 
             /* ------------------------------------------------
-               Validate passenger
+               Passenger
             ------------------------------------------------ */
 
-            const passengerId = Number(passenger_id);
+            const passengerId =
+                Number(passenger_id);
 
             if (
                 !Number.isInteger(passengerId) ||
@@ -466,12 +501,13 @@ router.post(
             ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'A valid passenger_id is required.',
+                    message:
+                        'A valid passenger_id is required.',
                 });
             }
 
             /* ------------------------------------------------
-               Validate locations
+               Locations
             ------------------------------------------------ */
 
             if (!isValidLocation(pickup)) {
@@ -490,21 +526,24 @@ router.post(
                 });
             }
 
+            const pickupLat =
+                Number(pickup.lat);
+
+            const pickupLng =
+                Number(pickup.lng);
+
+            const destinationLat =
+                Number(destination.lat);
+
+            const destinationLng =
+                Number(destination.lng);
+
             /* ------------------------------------------------
-               Validate coordinates
+               Authentication
             ------------------------------------------------ */
 
-            const pickupLat = Number(pickup.lat);
-            const pickupLng = Number(pickup.lng);
-
-            const destinationLat = Number(destination.lat);
-            const destinationLng = Number(destination.lng);
-
-            /* ------------------------------------------------
-               Validate Firebase user
-            ------------------------------------------------ */
-
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
@@ -514,24 +553,27 @@ router.post(
             }
 
             /* ------------------------------------------------
-               Verify passenger belongs to Firebase user
+               Verify passenger
             ------------------------------------------------ */
 
-            const passengerResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    firebase_uid,
-                    full_name
-                FROM public.passengers
-                WHERE id = $1
-                  AND firebase_uid = $2
-                LIMIT 1
-                `,
-                [passengerId, uid],
-            );
+            const passengerResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        firebase_uid,
+                        full_name
+                    FROM public.passengers
+                    WHERE id = $1
+                      AND firebase_uid = $2
+                    LIMIT 1
+                    `,
+                    [passengerId, uid],
+                );
 
-            if (passengerResult.rows.length === 0) {
+            if (
+                passengerResult.rows.length === 0
+            ) {
                 return res.status(403).json({
                     success: false,
                     message:
@@ -543,7 +585,7 @@ router.post(
                 passengerResult.rows[0];
 
             /* ------------------------------------------------
-               Validate driver if supplied
+               Driver
             ------------------------------------------------ */
 
             let driver:
@@ -555,8 +597,12 @@ router.post(
                 }
                 | null = null;
 
-            if (driver_id !== null && driver_id !== undefined) {
-                const driverId = Number(driver_id);
+            if (
+                driver_id !== null &&
+                driver_id !== undefined
+            ) {
+                const driverId =
+                    Number(driver_id);
 
                 if (
                     !Number.isInteger(driverId) ||
@@ -564,28 +610,32 @@ router.post(
                 ) {
                     return res.status(400).json({
                         success: false,
-                        message: 'Invalid driver_id.',
+                        message:
+                            'Invalid driver_id.',
                     });
                 }
 
-                const driverResult = await pool.query(
-                    `
-                    SELECT
-                        id,
-                        uid,
-                        full_name,
-                        fcm_token
-                    FROM public.drivers
-                    WHERE id = $1
-                      AND status = 'approved'
-                      AND is_online = true
-                      AND is_available = true
-                    LIMIT 1
-                    `,
-                    [driverId],
-                );
+                const driverResult =
+                    await pool.query(
+                        `
+                        SELECT
+                            id,
+                            uid,
+                            full_name,
+                            fcm_token
+                        FROM public.drivers
+                        WHERE id = $1
+                          AND status = 'approved'
+                          AND is_online = true
+                          AND is_available = true
+                        LIMIT 1
+                        `,
+                        [driverId],
+                    );
 
-                if (driverResult.rows.length === 0) {
+                if (
+                    driverResult.rows.length === 0
+                ) {
                     return res.status(409).json({
                         success: false,
                         message:
@@ -593,41 +643,49 @@ router.post(
                     });
                 }
 
-                driver = driverResult.rows[0];
+                driver =
+                    driverResult.rows[0];
             }
 
             /* ------------------------------------------------
-               Prevent duplicate active rides
+               Duplicate active ride
             ------------------------------------------------ */
 
-            const activeRideResult = await pool.query(
-                `
-                SELECT id
-                FROM public.rides
-                WHERE passenger_id = $1
-                  AND status IN (
-                      'requested',
-                      'accepted',
-                      'started'
-                  )
-                ORDER BY requested_at DESC
-                LIMIT 1
-                `,
-                [passengerId],
-            );
+            const activeRideResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        status
+                    FROM public.rides
+                    WHERE passenger_id = $1
+                      AND status IN (
+                          'requested',
+                          'accepted',
+                          'started'
+                      )
+                    ORDER BY requested_at DESC
+                    LIMIT 1
+                    `,
+                    [passengerId],
+                );
 
-            if (activeRideResult.rows.length > 0) {
+            if (
+                activeRideResult.rows.length > 0
+            ) {
                 return res.status(409).json({
                     success: false,
                     message:
                         'You already have an active ride.',
                     rideId:
                         activeRideResult.rows[0].id,
+                    status:
+                        activeRideResult.rows[0].status,
                 });
             }
 
             /* ------------------------------------------------
-               Clean numeric values
+               Numeric values
             ------------------------------------------------ */
 
             const rideDistance =
@@ -642,7 +700,8 @@ router.post(
             if (rideFare < 0) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Fare cannot be negative.',
+                    message:
+                        'Fare cannot be negative.',
                 });
             }
 
@@ -658,133 +717,133 @@ router.post(
                     ? payment_method.trim()
                     : 'standard';
 
-            /*
-             * If a specific driver was selected:
-             * status = accepted
-             *
-             * Otherwise:
-             * status = requested
-             */
-
             const rideStatus =
                 driver !== null
                     ? 'accepted'
                     : 'requested';
 
             /* ------------------------------------------------
-               CREATE RIDE
-               
-               IMPORTANT:
-               No JavaScript // comments exist inside SQL.
-               
-               pickup/destination are geometry(Point,4326)
-               in your database.
+               INSERT RIDE
             ------------------------------------------------ */
 
-            const insertResult = await pool.query(
-                `
-                INSERT INTO public.rides (
-                    passenger_id,
-                    driver_id,
-                    pickup,
-                    destination,
-                    distance,
-                    duration,
-                    fare,
-                    payment_method,
-                    payment_status,
-                    status,
-                    ride_type,
-                    pickup_address,
-                    destination_address,
-                    driver_earnings,
-                    tegaara_commission,
-                    requested_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    ST_SetSRID(
-                        ST_MakePoint($3, $4),
-                        4326
-                    ),
-                    ST_SetSRID(
-                        ST_MakePoint($5, $6),
-                        4326
-                    ),
-                    $7,
-                    $8,
-                    $9,
-                    $10,
-                    'pending',
-                    $11,
-                    $12,
-                    $13,
-                    $14,
-                    CASE
-                        WHEN $2 IS NOT NULL
-                        THEN ROUND(($9 * 0.80)::numeric, 2)
-                        ELSE NULL
-                    END,
-                    CASE
-                        WHEN $2 IS NOT NULL
-                        THEN ROUND(($9 * 0.20)::numeric, 2)
-                        ELSE NULL
-                    END,
-                    NOW()
-                )
-                RETURNING
-                    id,
-                    passenger_id,
-                    driver_id,
-                    distance,
-                    duration,
-                    fare,
-                    payment_method,
-                    payment_status,
-                    status,
-                    ride_type,
-                    pickup_address,
-                    destination_address,
-                    driver_earnings,
-                    tegaara_commission,
-                    requested_at
-                `,
-                [
-                    passengerId,
-                    driver?.id ?? null,
+            const insertResult =
+                await pool.query(
+                    `
+                    INSERT INTO public.rides (
+                        passenger_id,
+                        driver_id,
+                        pickup,
+                        destination,
+                        distance,
+                        duration,
+                        fare,
+                        payment_method,
+                        payment_status,
+                        status,
+                        ride_type,
+                        pickup_address,
+                        destination_address,
+                        driver_earnings,
+                        tegaara_commission,
+                        requested_at
+                    )
+                    VALUES (
+                        $1,
+                        $2,
 
-                    pickupLng,
-                    pickupLat,
+                        ST_SetSRID(
+                            ST_MakePoint($3, $4),
+                            4326
+                        ),
 
-                    destinationLng,
-                    destinationLat,
+                        ST_SetSRID(
+                            ST_MakePoint($5, $6),
+                            4326
+                        ),
 
-                    rideDistance,
-                    rideDuration,
-                    rideFare,
+                        $7,
+                        $8,
+                        $9,
+                        $10,
+                        'pending',
+                        $11,
+                        $12,
+                        $13,
+                        $14,
 
-                    paymentMethod,
-                    rideStatus,
-                    rideType,
+                        CASE
+                            WHEN $2 IS NOT NULL
+                            THEN ROUND(
+                                ($9 * 0.80)::numeric,
+                                2
+                            )
+                            ELSE NULL
+                        END,
 
-                    pickup_address ?? null,
-                    destination_address ?? null,
-                ],
-            );
+                        CASE
+                            WHEN $2 IS NOT NULL
+                            THEN ROUND(
+                                ($9 * 0.20)::numeric,
+                                2
+                            )
+                            ELSE NULL
+                        END,
 
-            if (insertResult.rows.length === 0) {
+                        NOW()
+                    )
+                    RETURNING
+                        id,
+                        passenger_id,
+                        driver_id,
+                        distance,
+                        duration,
+                        fare,
+                        payment_method,
+                        payment_status,
+                        status,
+                        ride_type,
+                        pickup_address,
+                        destination_address,
+                        driver_earnings,
+                        tegaara_commission,
+                        requested_at
+                    `,
+                    [
+                        passengerId,
+                        driver?.id ?? null,
+
+                        pickupLng,
+                        pickupLat,
+
+                        destinationLng,
+                        destinationLat,
+
+                        rideDistance,
+                        rideDuration,
+                        rideFare,
+
+                        paymentMethod,
+                        rideStatus,
+                        rideType,
+
+                        pickup_address ?? null,
+                        destination_address ?? null,
+                    ],
+                );
+
+            if (
+                insertResult.rows.length === 0
+            ) {
                 throw new Error(
                     'Ride was not inserted.',
                 );
             }
 
-            const ride = insertResult.rows[0];
-
-            const rideId = ride.id;
+            const ride =
+                insertResult.rows[0];
 
             console.log(
-                `✅ Ride ${rideId} created successfully.`,
+                `✅ Ride ${ride.id} created successfully.`,
             );
 
             /* ------------------------------------------------
@@ -795,75 +854,72 @@ router.post(
                 driver &&
                 driver.fcm_token
             ) {
-                const notificationPayload = {
-                    rideId: String(rideId),
-
-                    passengerId:
-                        String(passengerId),
-
-                    passengerName:
-                        passenger.full_name ||
-                        'Passenger',
-
-                    pickupAddress:
-                        pickup_address ||
-                        'Pickup location',
-
-                    pickupLat:
-                        String(pickupLat),
-
-                    pickupLng:
-                        String(pickupLng),
-
-                    destinationAddress:
-                        destination_address ||
-                        'Destination',
-
-                    destLat:
-                        String(destinationLat),
-
-                    destLng:
-                        String(destinationLng),
-
-                    rideType:
-                        rideType,
-
-                    distanceKm:
-                        String(
-                            rideDistance ?? 0,
-                        ),
-
-                    durationMin:
-                        String(
-                            rideDuration ?? 0,
-                        ),
-
-                    fare:
-                        String(rideFare),
-
-                    driverEarnings:
-                        (
-                            rideFare * 0.8
-                        ).toFixed(2),
-                };
-
                 await sendRideNotificationToDriver(
                     driver.fcm_token,
-                    notificationPayload,
+
+                    {
+                        rideId:
+                            String(ride.id),
+
+                        passengerId:
+                            String(passengerId),
+
+                        passengerName:
+                            passenger.full_name ||
+                            'Passenger',
+
+                        pickupAddress:
+                            pickup_address ||
+                            'Pickup location',
+
+                        pickupLat:
+                            String(pickupLat),
+
+                        pickupLng:
+                            String(pickupLng),
+
+                        destinationAddress:
+                            destination_address ||
+                            'Destination',
+
+                        destLat:
+                            String(destinationLat),
+
+                        destLng:
+                            String(destinationLng),
+
+                        rideType,
+
+                        distanceKm:
+                            String(
+                                rideDistance ?? 0,
+                            ),
+
+                        durationMin:
+                            String(
+                                rideDuration ?? 0,
+                            ),
+
+                        fare:
+                            String(rideFare),
+
+                        driverEarnings:
+                            (
+                                rideFare * 0.8
+                            ).toFixed(2),
+                    },
+
                     passenger.full_name ||
                     'Passenger',
+
                     rideType,
                 );
             }
 
-            /* ------------------------------------------------
-               Response
-            ------------------------------------------------ */
-
             return res.status(201).json({
                 success: true,
 
-                rideId: rideId,
+                rideId: ride.id,
 
                 ride: {
                     ...ride,
@@ -922,11 +978,16 @@ router.post(
                 success: false,
                 message:
                     'Server error while creating ride.',
+                code:
+                    dbError.code ||
+                    'RIDE_CREATION_ERROR',
                 error:
-                    process.env.NODE_ENV ===
-                        'development'
-                        ? dbError.message
-                        : undefined,
+                    dbError.message ||
+                    'Unknown database error.',
+                detail:
+                    dbError.detail || null,
+                hint:
+                    dbError.hint || null,
             });
         }
     },
@@ -934,7 +995,17 @@ router.post(
 
 /* ============================================================
    3. POST /rides/request
-   Alternative endpoint used by older Flutter booking code.
+
+   MAIN PASSENGER REQUEST ENDPOINT
+
+   Creates:
+
+       driver_id = NULL
+       status = requested
+
+   Driver later accepts through:
+
+       POST /rides/:rideId/accept
 ============================================================ */
 
 router.post(
@@ -946,36 +1017,41 @@ router.post(
     ) => {
         try {
             const {
-                driver_id,
                 pickup,
                 destination,
                 ride_type,
                 estimated_fare,
+                distance,
+                duration,
+                payment_method,
                 pickup_address,
                 destination_address,
             } = req.body;
 
-            if (!driver_id) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        'driver_id is required.',
-                });
-            }
+            console.log(
+                '========================================',
+            );
 
-            if (!isValidLocation(pickup)) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid pickup.',
-                });
-            }
+            console.log(
+                '🚕 NEW RIDE REQUEST',
+            );
 
-            if (!isValidLocation(destination)) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid destination.',
-                });
-            }
+            console.log(
+                'Body:',
+                JSON.stringify(
+                    req.body,
+                    null,
+                    2,
+                ),
+            );
+
+            console.log(
+                '========================================',
+            );
+
+            /* =================================================
+               AUTH
+            ================================================= */
 
             const uid =
                 getAuthenticatedUid(req);
@@ -983,19 +1059,82 @@ router.post(
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Unauthenticated.',
+                    message:
+                        'Unauthenticated.',
+                    code:
+                        'UNAUTHENTICATED',
                 });
             }
 
-            /* --------------------------------------------
-               Find passenger from Firebase UID
-            -------------------------------------------- */
+            /* =================================================
+               PICKUP
+            ================================================= */
+
+            if (!isValidLocation(pickup)) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid pickup. Expected { lat, lng }.',
+                    code:
+                        'INVALID_PICKUP',
+                });
+            }
+
+            /* =================================================
+               DESTINATION
+            ================================================= */
+
+            if (!isValidLocation(destination)) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid destination. Expected { lat, lng }.',
+                    code:
+                        'INVALID_DESTINATION',
+                });
+            }
+
+            const pickupLat =
+                Number(pickup.lat);
+
+            const pickupLng =
+                Number(pickup.lng);
+
+            const destinationLat =
+                Number(destination.lat);
+
+            const destinationLng =
+                Number(destination.lng);
+
+            /* =================================================
+               COORDINATES
+            ================================================= */
+
+            if (
+                !Number.isFinite(pickupLat) ||
+                !Number.isFinite(pickupLng) ||
+                !Number.isFinite(destinationLat) ||
+                !Number.isFinite(destinationLng)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid coordinates.',
+                    code:
+                        'INVALID_COORDINATES',
+                });
+            }
+
+            /* =================================================
+               PASSENGER
+            ================================================= */
 
             const passengerResult =
                 await pool.query(
                     `
                     SELECT
                         id,
+                        firebase_uid,
                         full_name
                     FROM public.passengers
                     WHERE firebase_uid = $1
@@ -1010,56 +1149,32 @@ router.post(
                 return res.status(404).json({
                     success: false,
                     message:
-                        'Passenger profile not found.',
+                        'Passenger profile not found for authenticated Firebase user.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             const passenger =
                 passengerResult.rows[0];
 
-            /* --------------------------------------------
-               Verify driver
-            -------------------------------------------- */
+            console.log(
+                `👤 Passenger found: ${passenger.id} ` +
+                `(${passenger.full_name})`,
+            );
 
-            const driverResult =
+            /* =================================================
+               ACTIVE RIDE CHECK
+            ================================================= */
+
+            const activeRideResult =
                 await pool.query(
                     `
                     SELECT
                         id,
-                        uid,
-                        full_name,
-                        fcm_token
-                    FROM public.drivers
-                    WHERE id = $1
-                      AND status = 'approved'
-                      AND is_online = true
-                      AND is_available = true
-                    LIMIT 1
-                    `,
-                    [Number(driver_id)],
-                );
-
-            if (
-                driverResult.rows.length === 0
-            ) {
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        'Driver is no longer available.',
-                });
-            }
-
-            const driver =
-                driverResult.rows[0];
-
-            /* --------------------------------------------
-               Prevent duplicate ride
-            -------------------------------------------- */
-
-            const activeRide =
-                await pool.query(
-                    `
-                    SELECT id
+                        driver_id,
+                        status,
+                        requested_at
                     FROM public.rides
                     WHERE passenger_id = $1
                       AND status IN (
@@ -1067,20 +1182,39 @@ router.post(
                           'accepted',
                           'started'
                       )
+                    ORDER BY requested_at DESC
                     LIMIT 1
                     `,
                     [passenger.id],
                 );
 
-            if (activeRide.rows.length > 0) {
+            if (
+                activeRideResult.rows.length > 0
+            ) {
+                const activeRide =
+                    activeRideResult.rows[0];
+
+                console.log(
+                    `⚠️ Passenger already has active ride ` +
+                    `${activeRide.id}`,
+                );
+
                 return res.status(409).json({
                     success: false,
                     message:
-                        'Passenger already has an active ride.',
+                        'You already have an active ride.',
+                    code:
+                        'ACTIVE_RIDE_EXISTS',
                     rideId:
-                        activeRide.rows[0].id,
+                        activeRide.id,
+                    status:
+                        activeRide.status,
                 });
             }
+
+            /* =================================================
+               RIDE VALUES
+            ================================================= */
 
             const fare =
                 toNumber(
@@ -1088,15 +1222,51 @@ router.post(
                     0,
                 ) ?? 0;
 
+            const rideDistance =
+                toNumber(
+                    distance,
+                    null,
+                );
+
+            const rideDuration =
+                toNumber(
+                    duration,
+                    null,
+                );
+
+            if (fare < 0) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Fare cannot be negative.',
+                    code:
+                        'INVALID_FARE',
+                });
+            }
+
             const rideType =
                 typeof ride_type === 'string' &&
-                    ride_type.trim()
+                    ride_type.trim().length > 0
                     ? ride_type.trim()
                     : 'standard';
 
-            /* --------------------------------------------
-               Insert
-            -------------------------------------------- */
+            const paymentMethod =
+                typeof payment_method === 'string' &&
+                    payment_method.trim().length > 0
+                    ? payment_method.trim()
+                    : 'standard';
+
+            /* =================================================
+               CREATE REQUESTED RIDE
+
+               IMPORTANT:
+
+               driver_id = NULL
+
+               status = requested
+
+               This allows nearby drivers to see the ride.
+            ================================================= */
 
             const result =
                 await pool.query(
@@ -1121,41 +1291,70 @@ router.post(
                     )
                     VALUES (
                         $1,
-                        $2,
+                        NULL,
+
                         ST_SetSRID(
-                            ST_MakePoint($3, $4),
+                            ST_MakePoint(
+                                $2,
+                                $3
+                            ),
                             4326
                         ),
+
                         ST_SetSRID(
-                            ST_MakePoint($5, $6),
+                            ST_MakePoint(
+                                $4,
+                                $5
+                            ),
                             4326
                         ),
-                        NULL,
-                        NULL,
+
+                        $6,
                         $7,
-                        'standard',
-                        'pending',
-                        'accepted',
                         $8,
                         $9,
+                        'pending',
+                        'requested',
                         $10,
-                        ROUND(($7 * 0.80)::numeric, 2),
-                        ROUND(($7 * 0.20)::numeric, 2),
+                        $11,
+                        $12,
+                        NULL,
+                        NULL,
                         NOW()
                     )
-                    RETURNING id
+                    RETURNING
+                        id,
+                        passenger_id,
+                        driver_id,
+                        distance,
+                        duration,
+                        fare,
+                        payment_method,
+                        payment_status,
+                        status,
+                        ride_type,
+                        pickup_address,
+                        destination_address,
+                        driver_earnings,
+                        tegaara_commission,
+                        requested_at
                     `,
                     [
                         passenger.id,
-                        driver.id,
 
-                        pickup.lng,
-                        pickup.lat,
+                        pickupLng,
+                        pickupLat,
 
-                        destination.lng,
-                        destination.lat,
+                        destinationLng,
+                        destinationLat,
+
+                        rideDistance,
+                        rideDuration,
 
                         fare,
+
+                        paymentMethod,
+
                         rideType,
 
                         pickup_address ??
@@ -1166,125 +1365,268 @@ router.post(
                     ],
                 );
 
-            const rideId =
-                result.rows[0].id;
-
-            /* --------------------------------------------
-               Notify driver
-            -------------------------------------------- */
-
-            if (driver.fcm_token) {
-                await sendRideNotificationToDriver(
-                    driver.fcm_token,
-                    {
-                        rideId:
-                            String(rideId),
-
-                        passengerId:
-                            String(passenger.id),
-
-                        passengerName:
-                            passenger.full_name ||
-                            'Passenger',
-
-                        pickupAddress:
-                            pickup_address ||
-                            'Pickup location',
-
-                        pickupLat:
-                            String(
-                                pickup.lat,
-                            ),
-
-                        pickupLng:
-                            String(
-                                pickup.lng,
-                            ),
-
-                        destinationAddress:
-                            destination_address ||
-                            'Destination',
-
-                        destLat:
-                            String(
-                                destination.lat,
-                            ),
-
-                        destLng:
-                            String(
-                                destination.lng,
-                            ),
-
-                        rideType,
-
-                        distanceKm: '0',
-
-                        durationMin: '0',
-
-                        fare:
-                            String(fare),
-
-                        driverEarnings:
-                            (
-                                fare * 0.8
-                            ).toFixed(2),
-                    },
-
-                    passenger.full_name ||
-                    'Passenger',
-
-                    rideType,
+            if (
+                result.rows.length === 0
+            ) {
+                throw new Error(
+                    'Ride INSERT returned no rows.',
                 );
             }
 
-            return res.status(201).json({
-                success: true,
-                rideId,
-                message:
-                    'Ride requested successfully.',
-            });
-        } catch (error: unknown) {
-            console.error(
-                '❌ /rides/request error:',
-                error,
+            const ride =
+                result.rows[0];
+
+            console.log(
+                `✅ Ride ${ride.id} created successfully.`,
             );
 
-            const dbError = error as {
-                code?: string;
-                message?: string;
-                detail?: string;
+            /* =================================================
+               FIND NEARBY DRIVERS
+            ================================================= */
+
+            let nearbyDrivers: any[] = [];
+
+            try {
+                nearbyDrivers =
+                    await getNearbyDrivers(
+                        pickupLat,
+                        pickupLng,
+                        15000,
+                    );
+
+                console.log(
+                    `🚗 Found ${nearbyDrivers.length} ` +
+                    `nearby drivers.`,
+                );
+            } catch (
+            driverSearchError
+            ) {
+                console.error(
+                    '⚠️ Failed to find nearby drivers:',
+                    driverSearchError,
+                );
+            }
+
+            /* =================================================
+               NOTIFICATION DATA
+            ================================================= */
+
+            const notificationPayload: Record<
+                string,
+                string
+            > = {
+                rideId:
+                    String(ride.id),
+
+                passengerId:
+                    String(passenger.id),
+
+                passengerName:
+                    passenger.full_name ||
+                    'Passenger',
+
+                pickupAddress:
+                    pickup_address ||
+                    'Pickup location',
+
+                pickupLat:
+                    String(pickupLat),
+
+                pickupLng:
+                    String(pickupLng),
+
+                destinationAddress:
+                    destination_address ||
+                    'Destination',
+
+                destLat:
+                    String(destinationLat),
+
+                destLng:
+                    String(destinationLng),
+
+                rideType,
+
+                distanceKm:
+                    String(
+                        rideDistance ?? 0,
+                    ),
+
+                durationMin:
+                    String(
+                        rideDuration ?? 0,
+                    ),
+
+                fare:
+                    String(fare),
             };
 
+            /* =================================================
+               NOTIFY NEARBY DRIVERS
+
+               Failure here DOES NOT cancel the ride.
+            ================================================= */
+
+            let notificationsSent = 0;
+
+            for (
+                const driver of nearbyDrivers
+            ) {
+                if (
+                    !driver.fcm_token
+                ) {
+                    continue;
+                }
+
+                try {
+                    await sendRideNotificationToDriver(
+                        driver.fcm_token,
+
+                        notificationPayload,
+
+                        passenger.full_name ||
+                        'Passenger',
+
+                        rideType,
+                    );
+
+                    notificationsSent++;
+                } catch (
+                notificationError
+                ) {
+                    console.error(
+                        `⚠️ Notification failed for driver ` +
+                        `${driver.id}:`,
+                        notificationError,
+                    );
+                }
+            }
+
+            /* =================================================
+               RESPONSE
+            ================================================= */
+
+            return res.status(201).json({
+                success: true,
+
+                rideId:
+                    ride.id,
+
+                ride: {
+                    ...ride,
+
+                    pickup: {
+                        lat:
+                            pickupLat,
+                        lng:
+                            pickupLng,
+                    },
+
+                    destination: {
+                        lat:
+                            destinationLat,
+                        lng:
+                            destinationLng,
+                    },
+                },
+
+                nearbyDrivers:
+                    nearbyDrivers.length,
+
+                notificationsSent,
+
+                message:
+                    nearbyDrivers.length > 0
+                        ? 'Ride request created and nearby drivers have been notified.'
+                        : 'Ride request created. No nearby drivers are currently available.',
+            });
+        } catch (
+        error: unknown
+        ) {
             console.error(
-                'DB code:',
+                '========================================',
+            );
+
+            console.error(
+                '❌ RIDE REQUEST DATABASE ERROR',
+            );
+
+            console.error(
+                '========================================',
+            );
+
+            console.error(error);
+
+            const dbError =
+                error as {
+                    code?: string;
+                    detail?: string;
+                    hint?: string;
+                    position?: string;
+                    where?: string;
+                    message?: string;
+                };
+
+            console.error(
+                'Database code:',
                 dbError.code,
             );
 
             console.error(
-                'DB message:',
+                'Database message:',
                 dbError.message,
             );
 
             console.error(
-                'DB detail:',
+                'Database detail:',
                 dbError.detail,
+            );
+
+            console.error(
+                'Database hint:',
+                dbError.hint,
+            );
+
+            console.error(
+                'Database position:',
+                dbError.position,
+            );
+
+            console.error(
+                'Database where:',
+                dbError.where,
             );
 
             return res.status(500).json({
                 success: false,
+
                 message:
-                    'Server error while requesting ride.',
+                    'Server error while creating ride.',
+
+                code:
+                    dbError.code ||
+                    'RIDE_CREATION_ERROR',
+
+                error:
+                    dbError.message ||
+                    'Unknown database error.',
+
+                detail:
+                    dbError.detail ||
+                    null,
+
+                hint:
+                    dbError.hint ||
+                    null,
             });
         }
     },
 );
 
 /* ============================================================
-   4. DRIVER ACCEPTS A BROADCASTED RIDE
-   POST /rides/:rideId/accept
+   4. DRIVER ACCEPTS REQUESTED RIDE
 
-   This version gets the driver ID from Firebase UID.
-   Flutter does NOT need to send driver_id.
+   POST /rides/:rideId/accept
 ============================================================ */
 
 router.post(
@@ -1320,9 +1662,9 @@ router.post(
                 });
             }
 
-            /* --------------------------------------------
-               Get driver from Firebase UID
-            -------------------------------------------- */
+            /* ------------------------------------------------
+               Driver
+            ------------------------------------------------ */
 
             const driverResult =
                 await pool.query(
@@ -1351,9 +1693,50 @@ router.post(
             const driver =
                 driverResult.rows[0];
 
-            /* --------------------------------------------
+            /* ------------------------------------------------
+               Check availability
+            ------------------------------------------------ */
+
+            const availabilityResult =
+                await pool.query(
+                    `
+                    SELECT
+                        is_online,
+                        is_available
+                    FROM public.drivers
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [driver.id],
+                );
+
+            if (
+                availabilityResult.rows.length === 0
+            ) {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Driver profile not found.',
+                });
+            }
+
+            const driverState =
+                availabilityResult.rows[0];
+
+            if (
+                !driverState.is_online ||
+                !driverState.is_available
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        'Driver is not currently available.',
+                });
+            }
+
+            /* ------------------------------------------------
                Atomically accept ride
-            -------------------------------------------- */
+            ------------------------------------------------ */
 
             const updateResult =
                 await pool.query(
@@ -1400,14 +1783,15 @@ router.post(
                 });
             }
 
-            /* --------------------------------------------
+            /* ------------------------------------------------
                Driver becomes unavailable
-            -------------------------------------------- */
+            ------------------------------------------------ */
 
             await pool.query(
                 `
                 UPDATE public.drivers
-                SET is_available = false
+                SET
+                    is_available = false
                 WHERE id = $1
                 `,
                 [driver.id],
@@ -1426,7 +1810,7 @@ router.post(
                 message:
                     'Ride accepted successfully.',
             });
-        } catch (error: unknown) {
+        } catch (error) {
             console.error(
                 '❌ Accept ride error:',
                 error,
@@ -1442,8 +1826,9 @@ router.post(
 );
 
 /* ============================================================
-   5. POST /driver/accept-ride
-   Compatibility endpoint.
+   5. DRIVER ACCEPT-RIDE COMPATIBILITY ENDPOINT
+
+   POST /driver/accept-ride
 ============================================================ */
 
 router.post(
@@ -1488,7 +1873,10 @@ router.post(
 
             let actualDriverId: number;
 
-            if (driverId) {
+            if (
+                driverId !== null &&
+                driverId !== undefined
+            ) {
                 actualDriverId =
                     Number(driverId);
             } else {
@@ -1515,10 +1903,27 @@ router.post(
                 }
 
                 actualDriverId =
-                    driverResult.rows[0].id;
+                    Number(
+                        driverResult.rows[0].id,
+                    );
             }
 
-            /* Verify driver belongs to user */
+            if (
+                !Number.isInteger(
+                    actualDriverId,
+                ) ||
+                actualDriverId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid driverId.',
+                });
+            }
+
+            /* ------------------------------------------------
+               Ownership
+            ------------------------------------------------ */
 
             const ownershipResult =
                 await pool.query(
@@ -1546,6 +1951,10 @@ router.post(
                 });
             }
 
+            /* ------------------------------------------------
+               Accept
+            ------------------------------------------------ */
+
             const result =
                 await pool.query(
                     `
@@ -1570,7 +1979,10 @@ router.post(
                         id,
                         passenger_id,
                         driver_id,
-                        status
+                        status,
+                        fare,
+                        driver_earnings,
+                        tegaara_commission
                     `,
                     [
                         actualDriverId,
@@ -1578,7 +1990,9 @@ router.post(
                     ],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(409).json({
                     success: false,
                     message:
@@ -1589,7 +2003,8 @@ router.post(
             await pool.query(
                 `
                 UPDATE public.drivers
-                SET is_available = false
+                SET
+                    is_available = false
                 WHERE id = $1
                 `,
                 [actualDriverId],
@@ -1597,7 +2012,8 @@ router.post(
 
             return res.status(200).json({
                 success: true,
-                ride: result.rows[0],
+                ride:
+                    result.rows[0],
                 message:
                     'Ride accepted successfully.',
             });
@@ -1636,6 +2052,7 @@ router.post(
 
 /* ============================================================
    7. DRIVER CURRENT ACTIVE RIDE
+
    GET /drivers/:uid/current-request
 ============================================================ */
 
@@ -1658,17 +2075,15 @@ router.get(
                 });
             }
 
-            if (req.params.uid !== uid) {
+            if (
+                req.params.uid !== uid
+            ) {
                 return res.status(403).json({
                     success: false,
                     message:
                         'UID mismatch.',
                 });
             }
-
-            /* --------------------------------------------
-               Find driver
-            -------------------------------------------- */
 
             const driverResult =
                 await pool.query(
@@ -1695,10 +2110,6 @@ router.get(
 
             const driverId =
                 driverResult.rows[0].id;
-
-            /* --------------------------------------------
-               Find active ride
-            -------------------------------------------- */
 
             const rideResult =
                 await pool.query(
@@ -1755,7 +2166,8 @@ router.get(
                           'started'
                       )
 
-                    ORDER BY r.requested_at DESC
+                    ORDER BY
+                        r.requested_at DESC
 
                     LIMIT 1
                     `,
@@ -1780,9 +2192,11 @@ router.get(
                 ride: {
                     ...ride,
 
-                    passengerRating: 5.0,
+                    passengerRating:
+                        5.0,
 
-                    passengerRides: 0,
+                    passengerRides:
+                        0,
                 },
             });
         } catch (error) {
@@ -1853,7 +2267,9 @@ router.post(
                     ],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
                     message:
@@ -1928,7 +2344,9 @@ router.get(
                     [rideId],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
                     message:
@@ -1938,7 +2356,8 @@ router.get(
 
             return res.status(200).json({
                 success: true,
-                ride: result.rows[0],
+                ride:
+                    result.rows[0],
             });
         } catch (error) {
             console.error(
@@ -1969,6 +2388,17 @@ router.post(
         try {
             const rideId =
                 Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid ride ID.',
+                });
+            }
 
             const uid =
                 getAuthenticatedUid(req);
@@ -2002,7 +2432,9 @@ router.post(
                     ],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(409).json({
                     success: false,
                     message:
@@ -2012,7 +2444,8 @@ router.post(
 
             return res.status(200).json({
                 success: true,
-                ride: result.rows[0],
+                ride:
+                    result.rows[0],
                 message:
                     'Ride started successfully.',
             });
@@ -2045,6 +2478,17 @@ router.post(
         try {
             const rideId =
                 Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid ride ID.',
+                });
+            }
 
             const uid =
                 getAuthenticatedUid(req);
@@ -2080,15 +2524,15 @@ router.post(
                     ],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(409).json({
                     success: false,
                     message:
                         'Ride not found or cannot be completed.',
                 });
             }
-
-            /* Driver is available again */
 
             await pool.query(
                 `
@@ -2102,7 +2546,8 @@ router.post(
 
             return res.status(200).json({
                 success: true,
-                ride: result.rows[0],
+                ride:
+                    result.rows[0],
                 message:
                     'Ride completed successfully.',
             });
@@ -2135,6 +2580,17 @@ router.post(
         try {
             const rideId =
                 Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid ride ID.',
+                });
+            }
 
             const {
                 reason,
@@ -2188,7 +2644,9 @@ router.post(
                     ],
                 );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(403).json({
                     success: false,
                     message:
@@ -2196,14 +2654,12 @@ router.post(
                 });
             }
 
-            /* --------------------------------------------
-               If driver cancelled, make driver available
-            -------------------------------------------- */
-
             const cancelledRide =
                 result.rows[0];
 
-            if (cancelledRide.driver_id) {
+            if (
+                cancelledRide.driver_id
+            ) {
                 await pool.query(
                     `
                     UPDATE public.drivers
@@ -2218,13 +2674,16 @@ router.post(
             }
 
             console.log(
-                `Ride ${rideId} cancelled. Reason: ${reason || 'Not specified'
+                `Ride ${rideId} cancelled. ` +
+                `Reason: ${reason ||
+                'Not specified'
                 }`,
             );
 
             return res.status(200).json({
                 success: true,
-                ride: cancelledRide,
+                ride:
+                    cancelledRide,
                 message:
                     'Ride cancelled successfully.',
             });
