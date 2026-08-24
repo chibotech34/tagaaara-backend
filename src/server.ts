@@ -15,12 +15,15 @@ import pool from './config/database';
 // Initialize Firebase ONCE.
 import './config/firebase';
 
-import adminAuth from './middleware/firebaseAdmin';
+import {
+    verifyFirebaseToken as adminAuth,
+} from './middleware/firebaseAdmin';
 
 import passengerRoutes from './routes/passengerRoutes';
 import driverRoutes from './routes/driverRoutes';
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
+import notificationRoutes from './routes/notificationRoutes';
 
 /*
 |--------------------------------------------------------------------------
@@ -84,13 +87,10 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| IMPORTANT
+| BODY PARSERS
 |--------------------------------------------------------------------------
 |
-| Body parsers MUST be registered BEFORE routes.
-|
-| Previously rideRoutes was registered before express.json(),
-| which caused req.body to be undefined.
+| These MUST come before notificationRoutes, rideRoutes, etc.
 |
 |--------------------------------------------------------------------------
 */
@@ -126,6 +126,25 @@ app.use(
 
         next();
     },
+);
+
+/*
+|--------------------------------------------------------------------------
+| Notification Routes
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| These routes use verifyFirebaseToken internally.
+|
+| They MUST be registered before adminAuth.
+|
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/notifications',
+    notificationRoutes,
 );
 
 /*
@@ -198,10 +217,6 @@ pool.query('SELECT NOW()')
 /*
 |--------------------------------------------------------------------------
 | RIDE ROUTES
-|--------------------------------------------------------------------------
-|
-| MUST come after express.json()
-|
 |--------------------------------------------------------------------------
 */
 
@@ -332,12 +347,6 @@ app.post(
                     .trim()
                     .toLowerCase();
 
-            /*
-            |--------------------------------------------------------------------------
-            | Check PostgreSQL
-            |--------------------------------------------------------------------------
-            */
-
             const existingAdmin =
                 await pool.query(
                     `
@@ -358,12 +367,6 @@ app.post(
                         'An admin with this email already exists',
                 });
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Check Firebase
-            |--------------------------------------------------------------------------
-            */
 
             try {
                 const existingFirebaseUser =
@@ -391,12 +394,6 @@ app.post(
                 }
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Create Firebase user
-            |--------------------------------------------------------------------------
-            */
-
             const userRecord =
                 await firebaseAuth.createUser({
                     email:
@@ -413,12 +410,6 @@ app.post(
                 '✅ Created Firebase admin UID:',
                 firebaseUid,
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Insert PostgreSQL admin
-            |--------------------------------------------------------------------------
-            */
 
             const result =
                 await pool.query(
@@ -462,12 +453,6 @@ app.post(
                         'admin',
                     ],
                 );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Save admin in Firebase Realtime Database
-            |--------------------------------------------------------------------------
-            */
 
             await realtimeDb
                 .ref(
@@ -551,7 +536,8 @@ app.post(
 | ADMIN AUTHENTICATION
 |--------------------------------------------------------------------------
 |
-| Everything below this middleware requires admin authentication.
+| Everything below this middleware requires
+| Firebase authentication + admin lookup.
 |
 |--------------------------------------------------------------------------
 */

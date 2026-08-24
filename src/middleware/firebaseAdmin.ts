@@ -1,224 +1,74 @@
-import {
-    Request,
-    Response,
-    NextFunction,
-} from 'express';
+import { Request, Response, NextFunction } from 'express';
+import { firebaseAuth } from '../config/firebase';
 
-import {
-    getAuth,
-} from 'firebase-admin/auth';
+export interface DecodedFirebaseToken {
+    uid: string;
+    email?: string;
+    name?: string;
+}
 
-import pool from '../config/database';
+export interface AuthenticatedRequest extends Request {
+    decodedToken?: DecodedFirebaseToken;
+}
 
-/*
-|--------------------------------------------------------------------------
-| Admin Authentication Middleware
-|--------------------------------------------------------------------------
-|
-| This middleware is ONLY for protected admin routes.
-|
-| It expects:
-|
-| Authorization: Bearer <Firebase ID Token>
-|
-| It is NOT used by:
-|
-| POST /api/admin/create
-|
-| because that endpoint creates the FIRST administrator.
-|
-*/
-
-export default async function adminAuth(
-    req: Request,
+export const verifyFirebaseToken = async (
+    req: AuthenticatedRequest,
     res: Response,
     next: NextFunction
-) {
+): Promise<void> => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({
+            success: false,
+            message: 'Missing or invalid Authorization header. Expected Bearer token.',
+            code: 'AUTH_HEADER_MISSING',
+        });
+        return;
+    }
+
+    const token = authHeader.substring(7).trim();
+
+    if (!token) {
+        res.status(401).json({
+            success: false,
+            message: 'Firebase ID token is missing.',
+            code: 'AUTH_TOKEN_MISSING',
+        });
+        return;
+    }
+
     try {
-        /*
-        |--------------------------------------------------------------------------
-        | Get Authorization header
-        |--------------------------------------------------------------------------
-        */
-
-        const authorization =
-            req.headers.authorization;
-
-        if (!authorization) {
-            return res.status(401).json({
-                error:
-                    'Authorization header is missing',
-            });
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check Bearer format
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            !authorization.startsWith(
-                'Bearer '
-            )
-        ) {
-            return res.status(401).json({
-                error:
-                    'Invalid authorization format. Expected Bearer token.',
-            });
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Extract Firebase ID token
-        |--------------------------------------------------------------------------
-        */
-
-        const token =
-            authorization.substring(7).trim();
-
-        if (!token) {
-            return res.status(401).json({
-                error:
-                    'Firebase token is missing',
-            });
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Verify Firebase ID token
-        |--------------------------------------------------------------------------
-        */
-
-        const decodedToken =
-            await getAuth().verifyIdToken(
-                token
-            );
-
-        console.log(
-            'Firebase UID:',
-            decodedToken.uid
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Find admin in PostgreSQL
-        |--------------------------------------------------------------------------
-        */
-
-        const result =
-            await pool.query(
-                `
-                SELECT
-                    id,
-                    firebase_uid,
-                    email,
-                    full_name,
-                    phone_number,
-                    username,
-                    profile_photo_url,
-                    account_status,
-                    role,
-                    created_at
-                FROM public.admins
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [decodedToken.uid]
-            );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Firebase user is not an admin
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            result.rows.length === 0
-        ) {
-            console.log(
-                'No admin found for Firebase UID:',
-                decodedToken.uid
-            );
-
-            return res.status(403).json({
-                error:
-                    'Not an admin',
-                firebase_uid:
-                    decodedToken.uid,
-            });
-        }
-
-        const adminUser =
-            result.rows[0];
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check account status
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            adminUser.account_status !==
-            'active'
-        ) {
-            return res.status(403).json({
-                error:
-                    'Admin account is not active',
-            });
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Check role
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            adminUser.role !==
-            'admin'
-        ) {
-            return res.status(403).json({
-                error:
-                    'User does not have administrator privileges',
-            });
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Attach admin to request
-        |--------------------------------------------------------------------------
-        */
-
-        (
-            req as any
-        ).adminUser = adminUser;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Continue
-        |--------------------------------------------------------------------------
-        */
-
+        const decodedToken = await firebaseAuth.verifyIdToken(token);
+        req.decodedToken = {
+            uid: decodedToken.uid,
+            email: decodedToken.email,
+            name: decodedToken.name,
+        };
         next();
-    } catch (error: any) {
-        console.error(
-            'Admin authentication error:',
-            error
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Firebase token errors
-        |--------------------------------------------------------------------------
-        */
-
-        return res.status(401).json({
-            error:
-                'Invalid authentication',
-            details:
-                error?.message ||
-                'Unable to verify Firebase token',
+    } catch (error: unknown) {
+        console.error('❌ Firebase token verification failed:', error);
+        const firebaseError = error as { code?: string; message?: string };
+        if (firebaseError.code === 'auth/id-token-expired') {
+            res.status(401).json({
+                success: false,
+                message: 'Firebase ID token expired.',
+                code: 'AUTH_TOKEN_EXPIRED',
+            });
+            return;
+        }
+        if (firebaseError.code === 'auth/id-token-revoked') {
+            res.status(401).json({
+                success: false,
+                message: 'Firebase ID token revoked.',
+                code: 'AUTH_TOKEN_REVOKED',
+            });
+            return;
+        }
+        res.status(401).json({
+            success: false,
+            message: 'Firebase authentication failed.',
+            code: 'AUTH_TOKEN_INVALID',
         });
     }
-}
+};
