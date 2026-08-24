@@ -61,9 +61,7 @@ const verifyFirebaseToken = async (
         return;
     }
 
-    const token = authHeader
-        .substring(7)
-        .trim();
+    const token = authHeader.substring(7).trim();
 
     if (!token) {
         res.status(401).json({
@@ -244,24 +242,12 @@ async function sendRideNotificationToDriver(
 
 /*
 |--------------------------------------------------------------------------
-| POST /rides
+| CREATE RIDE
 |--------------------------------------------------------------------------
 |
-| Flutter sends:
+| POST /rides
 |
-| {
-|   pickup: {lat, lng},
-|   destination: {lat, lng},
-|   distance,
-|   duration,
-|   fare,
-|   ride_type,
-|   payment_method,
-|   pickup_address,
-|   destination_address
-| }
-|
-| Passenger is identified by Firebase UID.
+| Passenger identity comes from Firebase UID.
 |
 |--------------------------------------------------------------------------
 */
@@ -306,7 +292,7 @@ router.post(
 
             /*
             |--------------------------------------------------------------------------
-            | AUTHENTICATED PASSENGER
+            | PASSENGER UID
             |--------------------------------------------------------------------------
             */
 
@@ -319,6 +305,12 @@ router.post(
                     message: 'Unauthenticated.',
                 });
             }
+
+            /*
+            |--------------------------------------------------------------------------
+            | FIND PASSENGER
+            |--------------------------------------------------------------------------
+            */
 
             const passengerResult =
                 await pool.query(
@@ -479,13 +471,19 @@ router.post(
 
             const paymentMethod =
                 typeof payment_method === 'string' &&
-                    payment_method.trim().length > 0
+                    payment_method.trim()
                     ? payment_method.trim()
                     : 'cash';
 
             /*
             |--------------------------------------------------------------------------
             | INSERT
+            |--------------------------------------------------------------------------
+            |
+            | driver_id is now TEXT.
+            |
+            | It starts NULL because no driver has accepted yet.
+            |
             |--------------------------------------------------------------------------
             */
 
@@ -512,8 +510,7 @@ router.post(
                     )
                     VALUES (
                         $1::integer,
-
-                        NULL::bigint,
+                        NULL::text,
 
                         ST_SetSRID(
                             ST_MakePoint(
@@ -532,27 +529,16 @@ router.post(
                         ),
 
                         $6::numeric,
-
                         $7::integer,
-
                         $8::numeric,
-
                         $9::varchar,
-
                         'pending'::varchar,
-
                         'requested'::varchar,
-
                         $10::varchar,
-
                         $11::text,
-
                         $12::text,
-
                         NULL::numeric,
-
                         NULL::numeric,
-
                         NOW()
                     )
                     RETURNING
@@ -593,34 +579,22 @@ router.post(
                     ],
                 );
 
-            if (
-                insertResult.rows.length === 0
-            ) {
+            const ride =
+                insertResult.rows[0];
+
+            if (!ride) {
                 throw new Error(
                     'Ride was not inserted.',
                 );
             }
 
-            const ride =
-                insertResult.rows[0];
-
-            const rideId =
-                ride.id;
-
             console.log(
-                `✅ Ride ${rideId} created successfully for passenger ${passenger.id}.`,
+                `✅ Ride ${ride.id} created for passenger ${passenger.id}`,
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | RESPONSE
-            |--------------------------------------------------------------------------
-            */
 
             return res.status(201).json({
                 success: true,
-
-                rideId,
+                rideId: ride.id,
 
                 ride: {
                     ...ride,
@@ -673,7 +647,13 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
+| GET NEARBY RIDES
+|--------------------------------------------------------------------------
+|
 | GET /rides/nearby
+|
+| Authenticated Firebase UID identifies the driver.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -732,7 +712,7 @@ router.get(
                 await pool.query(
                     `
                     SELECT
-                        id,
+                        uid,
                         status,
                         is_online,
                         is_available
@@ -779,6 +759,9 @@ router.get(
                     SELECT
                         r.id,
                         r.passenger_id,
+
+                        r.driver_id,
+
                         r.pickup_address,
                         r.destination_address,
 
@@ -819,6 +802,7 @@ router.get(
                         ON p.id = r.passenger_id
 
                     WHERE r.status = 'requested'
+
                       AND r.driver_id IS NULL
 
                       AND ST_DWithin(
@@ -866,13 +850,16 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
-| DRIVER ACCEPT RIDE
+| ACCEPT RIDE
 |--------------------------------------------------------------------------
 |
 | POST /rides/:rideId/accept
 |
-| Firebase UID is the REAL driver identity.
-| driverId from Flutter is NOT trusted.
+| IMPORTANT:
+|
+| rides.driver_id = Firebase UID
+|
+| We NEVER trust driverId from Flutter.
 |
 |--------------------------------------------------------------------------
 */
@@ -917,7 +904,7 @@ router.post(
 
             /*
             |--------------------------------------------------------------------------
-            | FIND AUTHENTICATED DRIVER
+            | FIND DRIVER BY FIREBASE UID
             |--------------------------------------------------------------------------
             */
 
@@ -925,12 +912,12 @@ router.post(
                 await client.query(
                     `
                     SELECT
-                        id,
                         uid,
                         full_name,
                         status,
                         is_online,
-                        is_available
+                        is_available,
+                        fcm_token
                     FROM public.drivers
                     WHERE uid = $1::text
                     LIMIT 1
@@ -982,6 +969,9 @@ router.post(
             |--------------------------------------------------------------------------
             | ATOMIC ACCEPT
             |--------------------------------------------------------------------------
+            |
+            | Store Firebase UID directly.
+            |
             */
 
             const updateResult =
@@ -989,7 +979,7 @@ router.post(
                     `
                     UPDATE public.rides
                     SET
-                        driver_id = $1::bigint,
+                        driver_id = $1::text,
 
                         status = 'accepted',
 
@@ -1021,7 +1011,7 @@ router.post(
                         tegaara_commission
                     `,
                     [
-                        driver.id,
+                        uid,
                         rideId,
                     ],
                 );
@@ -1048,9 +1038,9 @@ router.post(
                 `
                 UPDATE public.drivers
                 SET is_available = false
-                WHERE id = $1::bigint
+                WHERE uid = $1::text
                 `,
-                [driver.id],
+                [uid],
             );
 
             await client.query('COMMIT');
@@ -1059,12 +1049,14 @@ router.post(
                 updateResult.rows[0];
 
             console.log(
-                `✅ Driver ${driver.id} accepted ride ${rideId}`,
+                `✅ Driver UID ${uid} accepted ride ${rideId}`,
             );
 
             return res.status(200).json({
                 success: true,
+
                 ride,
+
                 message:
                     'Ride accepted successfully.',
             });
@@ -1089,12 +1081,12 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| COMPATIBILITY ACCEPT ENDPOINT
+| COMPATIBILITY ACCEPT RIDE
 |--------------------------------------------------------------------------
 |
-| Keeps older Flutter code working.
-|
 | POST /driver/accept-ride
+|
+| Older Flutter code can still call this.
 |
 |--------------------------------------------------------------------------
 */
@@ -1106,6 +1098,9 @@ router.post(
         req: AuthenticatedRequest,
         res: Response,
     ) => {
+        const client =
+            await pool.connect();
+
         try {
             const rideId =
                 Number(req.body?.rideId);
@@ -1121,15 +1116,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Internally use the canonical accept route logic.
-            |--------------------------------------------------------------------------
-            |
-            | We do not trust driverId from the client.
-            |
-            */
-
             const uid =
                 getAuthenticatedUid(req);
 
@@ -1141,11 +1127,13 @@ router.post(
                 });
             }
 
+            await client.query('BEGIN');
+
             const driverResult =
-                await pool.query(
+                await client.query(
                     `
                     SELECT
-                        id,
+                        uid,
                         status,
                         is_online,
                         is_available
@@ -1159,6 +1147,8 @@ router.post(
             if (
                 driverResult.rows.length === 0
             ) {
+                await client.query('ROLLBACK');
+
                 return res.status(404).json({
                     success: false,
                     message:
@@ -1172,6 +1162,8 @@ router.post(
             if (
                 driver.status !== 'approved'
             ) {
+                await client.query('ROLLBACK');
+
                 return res.status(403).json({
                     success: false,
                     message:
@@ -1183,6 +1175,8 @@ router.post(
                 !driver.is_online ||
                 !driver.is_available
             ) {
+                await client.query('ROLLBACK');
+
                 return res.status(409).json({
                     success: false,
                     message:
@@ -1191,24 +1185,30 @@ router.post(
             }
 
             const result =
-                await pool.query(
+                await client.query(
                     `
                     UPDATE public.rides
                     SET
-                        driver_id = $1::bigint,
+                        driver_id = $1::text,
+
                         status = 'accepted',
+
                         driver_earnings =
                             ROUND(
                                 (fare * 0.80)::numeric,
                                 2
                             ),
+
                         tegaara_commission =
                             ROUND(
                                 (fare * 0.20)::numeric,
                                 2
                             )
+
                     WHERE id = $2::integer
+
                       AND status = 'requested'
+
                       AND driver_id IS NULL
 
                     RETURNING
@@ -1221,7 +1221,7 @@ router.post(
                         tegaara_commission
                     `,
                     [
-                        driver.id,
+                        uid,
                         rideId,
                     ],
                 );
@@ -1229,6 +1229,8 @@ router.post(
             if (
                 result.rows.length === 0
             ) {
+                await client.query('ROLLBACK');
+
                 return res.status(409).json({
                     success: false,
                     message:
@@ -1236,14 +1238,16 @@ router.post(
                 });
             }
 
-            await pool.query(
+            await client.query(
                 `
                 UPDATE public.drivers
                 SET is_available = false
-                WHERE id = $1::bigint
+                WHERE uid = $1::text
                 `,
-                [driver.id],
+                [uid],
             );
+
+            await client.query('COMMIT');
 
             return res.status(200).json({
                 success: true,
@@ -1252,6 +1256,8 @@ router.post(
                     'Ride accepted successfully.',
             });
         } catch (error) {
+            await client.query('ROLLBACK');
+
             console.error(
                 '❌ Compatibility accept error:',
                 error,
@@ -1262,13 +1268,15 @@ router.post(
                 message:
                     'Server error while accepting ride.',
             });
+        } finally {
+            client.release();
         }
     },
 );
 
 /*
 |--------------------------------------------------------------------------
-| DRIVER DECLINE
+| DECLINE RIDE
 |--------------------------------------------------------------------------
 */
 
@@ -1305,14 +1313,9 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | This endpoint intentionally does not modify the ride.
-            |
-            | A driver declining simply means the driver does not accept it.
-            | The ride remains requested for other drivers.
-            |--------------------------------------------------------------------------
-            */
+            console.log(
+                `ℹ️ Driver ${uid} declined ride ${rideId}`,
+            );
 
             return res.status(200).json({
                 success: true,
@@ -1338,6 +1341,12 @@ router.post(
 /*
 |--------------------------------------------------------------------------
 | DRIVER CURRENT RIDE
+|--------------------------------------------------------------------------
+|
+| GET /drivers/:uid/current-request
+|
+| The UID in the URL must equal the Firebase authenticated UID.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -1373,7 +1382,10 @@ router.get(
             const driverResult =
                 await pool.query(
                     `
-                    SELECT id
+                    SELECT
+                        uid,
+                        full_name,
+                        status
                     FROM public.drivers
                     WHERE uid = $1::text
                     LIMIT 1
@@ -1391,9 +1403,6 @@ router.get(
                 });
             }
 
-            const driverId =
-                driverResult.rows[0].id;
-
             const rideResult =
                 await pool.query(
                     `
@@ -1401,6 +1410,8 @@ router.get(
                         r.id AS "rideId",
 
                         r.passenger_id AS "passengerId",
+
+                        r.driver_id AS "driverId",
 
                         r.pickup_address AS "pickupAddress",
 
@@ -1443,7 +1454,7 @@ router.get(
                     LEFT JOIN public.passengers p
                         ON p.id = r.passenger_id
 
-                    WHERE r.driver_id = $1::bigint
+                    WHERE r.driver_id = $1::text
 
                       AND r.status IN (
                           'accepted',
@@ -1455,7 +1466,7 @@ router.get(
 
                     LIMIT 1
                     `,
-                    [driverId],
+                    [uid],
                 );
 
             if (
@@ -1541,7 +1552,7 @@ router.post(
                     UPDATE public.drivers
                     SET fcm_token = $1::text
                     WHERE uid = $2::text
-                    RETURNING id
+                    RETURNING uid
                     `,
                     [
                         fcmToken.trim(),
@@ -1710,23 +1721,20 @@ router.post(
             const result =
                 await pool.query(
                     `
-                    UPDATE public.rides r
+                    UPDATE public.rides
 
                     SET status = 'started'
 
-                    FROM public.drivers d
+                    WHERE id = $1::integer
 
-                    WHERE r.id = $1::integer
+                      AND driver_id = $2::text
 
-                      AND r.driver_id = d.id
-
-                      AND d.uid = $2::text
-
-                      AND r.status = 'accepted'
+                      AND status = 'accepted'
 
                     RETURNING
-                        r.id,
-                        r.status
+                        id,
+                        driver_id,
+                        status
                     `,
                     [
                         rideId,
@@ -1778,6 +1786,9 @@ router.post(
         req: AuthenticatedRequest,
         res: Response,
     ) => {
+        const client =
+            await pool.connect();
+
         try {
             const rideId =
                 Number(req.params.rideId);
@@ -1804,29 +1815,28 @@ router.post(
                 });
             }
 
+            await client.query('BEGIN');
+
             const result =
-                await pool.query(
+                await client.query(
                     `
-                    UPDATE public.rides r
+                    UPDATE public.rides
 
                     SET
                         status = 'completed',
                         completed_at = NOW()
 
-                    FROM public.drivers d
+                    WHERE id = $1::integer
 
-                    WHERE r.id = $1::integer
+                      AND driver_id = $2::text
 
-                      AND r.driver_id = d.id
-
-                      AND d.uid = $2::text
-
-                      AND r.status = 'started'
+                      AND status = 'started'
 
                     RETURNING
-                        r.id,
-                        r.status,
-                        r.completed_at
+                        id,
+                        driver_id,
+                        status,
+                        completed_at
                     `,
                     [
                         rideId,
@@ -1837,6 +1847,8 @@ router.post(
             if (
                 result.rows.length === 0
             ) {
+                await client.query('ROLLBACK');
+
                 return res.status(409).json({
                     success: false,
                     message:
@@ -1844,7 +1856,7 @@ router.post(
                 });
             }
 
-            await pool.query(
+            await client.query(
                 `
                 UPDATE public.drivers
                 SET is_available = true
@@ -1853,6 +1865,8 @@ router.post(
                 [uid],
             );
 
+            await client.query('COMMIT');
+
             return res.status(200).json({
                 success: true,
                 ride: result.rows[0],
@@ -1860,6 +1874,8 @@ router.post(
                     'Ride completed successfully.',
             });
         } catch (error) {
+            await client.query('ROLLBACK');
+
             console.error(
                 '❌ Complete ride error:',
                 error,
@@ -1870,6 +1886,8 @@ router.post(
                 message:
                     'Server error while completing ride.',
             });
+        } finally {
+            client.release();
         }
     },
 );
@@ -1920,19 +1938,19 @@ router.post(
             const result =
                 await pool.query(
                     `
-                    UPDATE public.rides r
+                    UPDATE public.rides
 
                     SET status = 'cancelled'
 
-                    WHERE r.id = $1::integer
+                    WHERE id = $1::integer
 
-                      AND r.status NOT IN (
+                      AND status NOT IN (
                           'completed',
                           'cancelled'
                       )
 
                       AND (
-                          r.passenger_id = (
+                          passenger_id = (
                               SELECT p.id
                               FROM public.passengers p
                               WHERE p.firebase_uid = $2::text
@@ -1941,18 +1959,13 @@ router.post(
 
                           OR
 
-                          r.driver_id = (
-                              SELECT d.id
-                              FROM public.drivers d
-                              WHERE d.uid = $2::text
-                              LIMIT 1
-                          )
+                          driver_id = $2::text
                       )
 
                     RETURNING
-                        r.id,
-                        r.driver_id,
-                        r.status
+                        id,
+                        driver_id,
+                        status
                     `,
                     [
                         rideId,
@@ -1973,6 +1986,12 @@ router.post(
             const cancelledRide =
                 result.rows[0];
 
+            /*
+            |--------------------------------------------------------------------------
+            | DRIVER UID IS NOW STORED DIRECTLY
+            |--------------------------------------------------------------------------
+            */
+
             if (
                 cancelledRide.driver_id
             ) {
@@ -1980,7 +1999,7 @@ router.post(
                     `
                     UPDATE public.drivers
                     SET is_available = true
-                    WHERE id = $1::bigint
+                    WHERE uid = $1::text
                     `,
                     [
                         cancelledRide.driver_id,
