@@ -339,16 +339,6 @@ async function notifyNearbyDrivers(
 |--------------------------------------------------------------------------
 | CREATE RIDE
 |--------------------------------------------------------------------------
-|
-| POST /rides
-|
-| Passenger Firebase UID comes from:
-|
-| Authorization: Bearer <Firebase ID Token>
-|
-| NEVER accept passengerId from Flutter.
-|
-|--------------------------------------------------------------------------
 */
 
 router.post(
@@ -398,12 +388,6 @@ router.post(
                 uid
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Find passenger
-            |--------------------------------------------------------------------------
-            */
-
             const passengerResult =
                 await pool.query(
                     `
@@ -431,12 +415,6 @@ router.post(
 
             const passenger =
                 passengerResult.rows[0];
-
-            /*
-            |--------------------------------------------------------------------------
-            | Validate locations
-            |--------------------------------------------------------------------------
-            */
 
             if (!isValidLocation(pickup)) {
                 return res.status(400).json({
@@ -467,12 +445,6 @@ router.post(
 
             const destinationLng =
                 Number(destination.lng);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Prevent duplicate active rides
-            |--------------------------------------------------------------------------
-            */
 
             const activeRideResult =
                 await pool.query(
@@ -505,12 +477,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Numbers
-            |--------------------------------------------------------------------------
-            */
-
             const rideDistance =
                 toNumber(distance, 0) ?? 0;
 
@@ -534,12 +500,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Ride type / payment
-            |--------------------------------------------------------------------------
-            */
-
             const rideType =
                 typeof ride_type === 'string' &&
                     ride_type.trim()
@@ -552,12 +512,6 @@ router.post(
                     payment_method.trim()
                     ? payment_method.trim()
                     : 'cash';
-
-            /*
-            |--------------------------------------------------------------------------
-            | Insert ride
-            |--------------------------------------------------------------------------
-            */
 
             const insertResult =
                 await pool.query(
@@ -656,12 +610,6 @@ router.post(
                 `✅ Ride ${ride.id} created for passenger UID ${uid}`
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Notify drivers
-            |--------------------------------------------------------------------------
-            */
-
             await notifyNearbyDrivers(
                 ride.id,
                 pickupLat,
@@ -685,12 +633,6 @@ router.post(
                         rideType,
                 }
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Response
-            |--------------------------------------------------------------------------
-            */
 
             return res.status(201).json({
                 success: true,
@@ -751,12 +693,6 @@ router.post(
 |--------------------------------------------------------------------------
 | GET NEARBY RIDES
 |--------------------------------------------------------------------------
-|
-| Driver only.
-|
-| GET /rides/nearby?lat=...&lng=...&radius=5000
-|
-|--------------------------------------------------------------------------
 */
 
 router.get(
@@ -808,12 +744,6 @@ router.get(
             radius =
                 Math.min(radius, 50000);
 
-            /*
-            |--------------------------------------------------------------------------
-            | Verify driver
-            |--------------------------------------------------------------------------
-            */
-
             const driverResult =
                 await pool.query(
                     `
@@ -850,12 +780,6 @@ router.get(
             ) {
                 return res.status(200).json([]);
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Nearby requested rides
-            |--------------------------------------------------------------------------
-            */
 
             const result =
                 await pool.query(
@@ -974,12 +898,6 @@ router.get(
 |--------------------------------------------------------------------------
 | ACCEPT RIDE
 |--------------------------------------------------------------------------
-|
-| POST /rides/:rideId/accept
-|
-| Driver Firebase UID comes from Firebase token.
-|
-|--------------------------------------------------------------------------
 */
 
 router.post(
@@ -1023,12 +941,6 @@ router.post(
             );
 
             await client.query('BEGIN');
-
-            /*
-            |--------------------------------------------------------------------------
-            | Verify driver
-            |--------------------------------------------------------------------------
-            */
 
             const driverResult =
                 await client.query(
@@ -1080,12 +992,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Accept ride atomically
-            |--------------------------------------------------------------------------
-            */
-
             const updateResult =
                 await client.query(
                     `
@@ -1135,12 +1041,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Driver becomes unavailable
-            |--------------------------------------------------------------------------
-            */
-
             await client.query(
                 `
                 UPDATE public.drivers
@@ -1151,12 +1051,6 @@ router.post(
                 `,
                 [uid]
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Get complete ride
-            |--------------------------------------------------------------------------
-            */
 
             const rideResult =
                 await client.query(
@@ -1244,12 +1138,6 @@ router.post(
             console.log(
                 `✅ Driver ${uid} accepted ride ${rideId}`
             );
-
-            /*
-            |--------------------------------------------------------------------------
-            | Notify passenger
-            |--------------------------------------------------------------------------
-            */
 
             try {
                 const passengerTokenResult =
@@ -1354,10 +1242,6 @@ router.post(
 /*
 |--------------------------------------------------------------------------
 | CURRENT DRIVER RIDE
-|--------------------------------------------------------------------------
-|
-| GET /drivers/:uid/current-request
-|
 |--------------------------------------------------------------------------
 */
 
@@ -1545,15 +1429,6 @@ router.get(
 |--------------------------------------------------------------------------
 | DECLINE RIDE
 |--------------------------------------------------------------------------
-|
-| This intentionally does NOT cancel the passenger's ride.
-|
-| A driver declining means:
-| - this driver does not accept it
-| - ride remains requested
-| - other drivers can still accept it
-|
-|--------------------------------------------------------------------------
 */
 
 router.post(
@@ -1616,7 +1491,7 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| GET RIDE STATUS (with driver location)
+| GET RIDE STATUS (with driver & vehicle details)
 |--------------------------------------------------------------------------
 */
 
@@ -1679,7 +1554,13 @@ router.get(
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
                         ST_Y(d.location) AS driver_lat,
-                        ST_X(d.location) AS driver_lng
+                        ST_X(d.location) AS driver_lng,
+                        -- vehicle details
+                        d.vehicle_type,
+                        d.vehicle_model,
+                        d.vehicle_color,
+                        d.vehicle_registration,
+                        d.vehicle_year
                     FROM public.rides r
                     LEFT JOIN public.passengers p ON p.id = r.passenger_id
                     LEFT JOIN public.drivers d ON d.uid = r.driver_id
@@ -2046,12 +1927,6 @@ router.post(
 
             const cancelledRide =
                 result.rows[0];
-
-            /*
-            |--------------------------------------------------------------------------
-            | Make driver available again
-            |--------------------------------------------------------------------------
-            */
 
             if (
                 cancelledRide.driver_id
