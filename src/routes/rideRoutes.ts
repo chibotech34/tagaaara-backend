@@ -1550,11 +1550,11 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details
+                        -- driver details (using numeric columns, NOT ST_Y/ST_X on geography)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
-                        ST_Y(d.location) AS driver_lat,
-                        ST_X(d.location) AS driver_lng,
+                        d.current_latitude AS driver_lat,
+                        d.current_longitude AS driver_lng,
                         -- vehicle details
                         d.vehicle_type,
                         d.vehicle_model,
@@ -1663,11 +1663,11 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details (may be null)
+                        -- driver details (using numeric columns)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
-                        ST_Y(d.location) AS driver_lat,
-                        ST_X(d.location) AS driver_lng,
+                        d.current_latitude AS driver_lat,
+                        d.current_longitude AS driver_lng,
                         d.vehicle_type,
                         d.vehicle_model,
                         d.vehicle_color,
