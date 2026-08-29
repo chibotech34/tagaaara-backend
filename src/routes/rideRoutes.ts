@@ -1946,7 +1946,7 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| CANCEL RIDE
+| CANCEL RIDE (MODIFIED: DELETE & NOTIFY BOTH PARTIES)
 |--------------------------------------------------------------------------
 */
 
@@ -1957,6 +1957,7 @@ router.post(
         req: AuthenticatedRequest,
         res: Response
     ) => {
+        const client = await pool.connect();
         try {
             const rideId =
                 Number(req.params.rideId);
@@ -1989,50 +1990,39 @@ router.post(
                     ? req.body.reason.trim()
                     : 'Not specified';
 
-            const result =
-                await pool.query(
+            console.log(
+                `🗑️ Cancelling ride ${rideId} by user ${uid}. Reason: ${reason}`
+            );
+
+            await client.query('BEGIN');
+
+            // 1. Lock and fetch ride details, including passenger & driver info
+            const rideResult =
+                await client.query(
                     `
-                    UPDATE public.rides
-
-                    SET status = 'cancelled'
-
-                    WHERE id = $1::integer
-
-                      AND status NOT IN (
-                          'completed',
-                          'cancelled'
-                      )
-
+                    SELECT
+                        r.id,
+                        r.passenger_id,
+                        r.driver_id,
+                        r.status,
+                        p.firebase_uid AS passenger_firebase_uid
+                    FROM public.rides r
+                    LEFT JOIN public.passengers p ON p.id = r.passenger_id
+                    WHERE r.id = $1::integer
+                      AND r.status NOT IN ('completed', 'cancelled')
                       AND (
-                          passenger_id = (
-                              SELECT p.id
-
-                              FROM public.passengers p
-
-                              WHERE p.firebase_uid =
-                                    $2::text
-
-                              LIMIT 1
-                          )
-
-                          OR driver_id =
-                              $2::text
+                        p.firebase_uid = $2::text
+                        OR r.driver_id = $2::text
                       )
-
-                    RETURNING
-                        id,
-                        driver_id,
-                        status
+                    FOR UPDATE
                     `,
-                    [
-                        rideId,
-                        uid,
-                    ]
+                    [rideId, uid]
                 );
 
             if (
-                result.rows.length === 0
+                rideResult.rows.length === 0
             ) {
+                await client.query('ROLLBACK');
                 return res.status(403).json({
                     success: false,
                     message:
@@ -2040,37 +2030,112 @@ router.post(
                 });
             }
 
-            const cancelledRide =
-                result.rows[0];
+            const ride = rideResult.rows[0];
+            const passengerFirebaseUid = ride.passenger_firebase_uid;
+            const driverFirebaseUid = ride.driver_id;
 
-            if (
-                cancelledRide.driver_id
-            ) {
-                await pool.query(
+            // 2. Delete the ride
+            await client.query(
+                `
+                DELETE FROM public.rides
+                WHERE id = $1::integer
+                `,
+                [rideId]
+            );
+
+            // 3. If driver was assigned, set availability back to true
+            if (driverFirebaseUid) {
+                await client.query(
                     `
                     UPDATE public.drivers
-
                     SET is_available = true
-
                     WHERE uid = $1::text
                     `,
-                    [
-                        cancelledRide.driver_id,
-                    ]
+                    [driverFirebaseUid]
                 );
             }
 
-            console.log(
-                `ℹ️ Ride ${rideId} cancelled by ${uid}. Reason: ${reason}`
+            await client.query('COMMIT');
+
+            // 4. Send notifications (outside transaction – failures are logged but don't roll back)
+            const notificationPromises: Promise<void>[] = [];
+
+            // Notify passenger if we have their Firebase UID
+            if (passengerFirebaseUid) {
+                const passengerTokenResult = await pool.query(
+                    `
+                    SELECT token
+                    FROM public.fcm_tokens
+                    WHERE user_id = $1::text
+                    ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 1
+                    `,
+                    [passengerFirebaseUid]
+                );
+                const passengerToken = passengerTokenResult.rows[0]?.token;
+                if (passengerToken) {
+                    notificationPromises.push(
+                        sendFcmNotification(
+                            passengerToken,
+                            'Ride Cancelled',
+                            `Your ride has been cancelled. Reason: ${reason}`,
+                            {
+                                rideId: String(rideId),
+                                status: 'cancelled',
+                                cancellationReason: reason,
+                                cancelledBy: 'driver',
+                            }
+                        )
+                    );
+                }
+            }
+
+            // Notify driver (if driver is the one who cancelled, we might skip, but we'll send anyway)
+            if (driverFirebaseUid) {
+                const driverTokenResult = await pool.query(
+                    `
+                    SELECT token
+                    FROM public.fcm_tokens
+                    WHERE user_id = $1::text
+                    ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 1
+                    `,
+                    [driverFirebaseUid]
+                );
+                const driverToken = driverTokenResult.rows[0]?.token;
+                if (driverToken) {
+                    notificationPromises.push(
+                        sendFcmNotification(
+                            driverToken,
+                            'Ride Cancelled',
+                            `You have cancelled ride #${rideId}. Reason: ${reason}`,
+                            {
+                                rideId: String(rideId),
+                                status: 'cancelled',
+                                cancellationReason: reason,
+                                cancelledBy: 'driver',
+                            }
+                        )
+                    );
+                }
+            }
+
+            // Fire notifications in background – don't wait for them
+            Promise.allSettled(notificationPromises).catch((err) =>
+                console.error('❌ Some notifications failed:', err)
             );
+
+            console.log(`✅ Ride ${rideId} deleted and notifications sent.`);
 
             return res.status(200).json({
                 success: true,
-                ride: cancelledRide,
-                message:
-                    'Ride cancelled successfully.',
+                message: 'Ride cancelled and removed from database.',
+                rideId,
             });
         } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (_) { }
             console.error(
                 '❌ Cancel ride error:',
                 error
@@ -2081,6 +2146,8 @@ router.post(
                 message:
                     'Server error while cancelling ride.',
             });
+        } finally {
+            client.release();
         }
     }
 );
