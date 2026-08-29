@@ -1600,6 +1600,118 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
+| GET RIDE DETAILS (NEW)
+|--------------------------------------------------------------------------
+| This endpoint returns the same data as /rides/:rideId/status,
+| but without the "/status" suffix – used by the Flutter app in
+| RideService.getRideDetails().
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+    '/rides/:rideId',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const rideId =
+                Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid ride ID.',
+                });
+            }
+
+            const uid =
+                getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        'Unauthenticated.',
+                });
+            }
+
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        r.id,
+                        r.passenger_id,
+                        r.driver_id,
+                        r.pickup_address,
+                        r.destination_address,
+                        ST_Y(r.pickup) AS pickup_lat,
+                        ST_X(r.pickup) AS pickup_lng,
+                        ST_Y(r.destination) AS dest_lat,
+                        ST_X(r.destination) AS dest_lng,
+                        r.distance,
+                        r.duration,
+                        r.fare,
+                        r.payment_method,
+                        r.payment_status,
+                        r.status,
+                        r.ride_type,
+                        r.requested_at,
+                        r.completed_at,
+                        -- driver details (may be null)
+                        d.full_name AS driver_name,
+                        d.profile_photo_url AS driver_photo,
+                        ST_Y(d.location) AS driver_lat,
+                        ST_X(d.location) AS driver_lng,
+                        d.vehicle_type,
+                        d.vehicle_model,
+                        d.vehicle_color,
+                        d.vehicle_registration,
+                        d.vehicle_year
+                    FROM public.rides r
+                    LEFT JOIN public.passengers p ON p.id = r.passenger_id
+                    LEFT JOIN public.drivers d ON d.uid = r.driver_id
+                    WHERE r.id = $1::integer
+                      AND (p.firebase_uid = $2::text OR r.driver_id = $2::text)
+                    LIMIT 1
+                    `,
+                    [rideId, uid]
+                );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Ride not found or you are not authorized.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                ride: result.rows[0],
+            });
+        } catch (error) {
+            console.error(
+                '❌ Get ride details error:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Server error while fetching ride details.',
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
 | START RIDE
 |--------------------------------------------------------------------------
 */
