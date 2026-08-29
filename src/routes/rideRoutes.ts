@@ -1550,7 +1550,7 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details (using numeric columns)
+                        -- driver details (using numeric columns, NOT PostGIS functions)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
                         d.current_latitude AS driver_lat,
@@ -1579,6 +1579,7 @@ router.get(
                 });
             }
 
+            // ✅ Return the ride object under "ride" key
             return res.status(200).json({
                 success: true,
                 ride: result.rows[0],
@@ -1692,6 +1693,7 @@ router.get(
                 });
             }
 
+            // ✅ Return the ride object under "ride" key
             return res.status(200).json({
                 success: true,
                 ride: result.rows[0],
