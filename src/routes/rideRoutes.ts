@@ -1550,16 +1550,16 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details (using numeric columns, NOT ST_Y/ST_X on geography)
+                        -- driver details (using numeric columns)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
                         d.current_latitude AS driver_lat,
                         d.current_longitude AS driver_lng,
-                        -- vehicle details
+                        -- vehicle details (correct column names)
                         d.vehicle_type,
                         d.vehicle_model,
                         d.vehicle_color,
-                        d.vehicle_registration,
+                        d.registration_number AS vehicle_registration,
                         d.vehicle_year
                     FROM public.rides r
                     LEFT JOIN public.passengers p ON p.id = r.passenger_id
@@ -1668,10 +1668,11 @@ router.get(
                         d.profile_photo_url AS driver_photo,
                         d.current_latitude AS driver_lat,
                         d.current_longitude AS driver_lng,
+                        -- vehicle details (correct column names)
                         d.vehicle_type,
                         d.vehicle_model,
                         d.vehicle_color,
-                        d.vehicle_registration,
+                        d.registration_number AS vehicle_registration,
                         d.vehicle_year
                     FROM public.rides r
                     LEFT JOIN public.passengers p ON p.id = r.passenger_id
