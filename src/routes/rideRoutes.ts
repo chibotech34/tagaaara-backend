@@ -229,7 +229,6 @@ async function notifyNearbyDrivers(
             `needs a ride from ` +
             `${rideData.pickup_address || 'your area'}`;
 
-        // ── Routing metadata + ride payload ───────────────────
         const dataPayload = {
             role: 'driver',
             notificationType: 'ride_request',
@@ -947,15 +946,24 @@ router.post(
 
             await client.query('BEGIN');
 
+            // ✅ UPDATED: fetch vehicle details and driver location too
             const driverResult =
                 await client.query(
                     `
                     SELECT
                         uid,
                         full_name,
+                        profile_photo_url,
+                        current_latitude,
+                        current_longitude,
                         status,
                         is_online,
-                        is_available
+                        is_available,
+                        vehicle_type,
+                        vehicle_model,
+                        vehicle_color,
+                        registration_number,
+                        vehicle_year
                     FROM public.drivers
                     WHERE uid = $1::text
                     LIMIT 1
@@ -1178,6 +1186,16 @@ router.post(
                         driver.full_name ||
                         'Driver';
 
+                    // ✅ Safely stringify driver location
+                    const driverLat =
+                        driver.current_latitude != null
+                            ? String(driver.current_latitude)
+                            : '';
+                    const driverLng =
+                        driver.current_longitude != null
+                            ? String(driver.current_longitude)
+                            : '';
+
                     await sendFcmNotification(
                         passengerToken,
 
@@ -1192,23 +1210,51 @@ router.post(
                             targetScreen: 'passenger_home',
 
                             // ── ride payload ────────────────
-                            rideId:
-                                String(
-                                    rideId
-                                ),
+                            rideId: String(rideId),
+                            status: 'accepted',
 
-                            driverName,
+                            // ── driver details ──────────────
+                            driverName: driverName,
+                            driverPhoto:
+                                driver.profile_photo_url || '',
+                            driverLat: driverLat,
+                            driverLng: driverLng,
 
-                            status:
-                                'accepted',
+                            // ── vehicle details ─────────────
+                            vehicleType:
+                                driver.vehicle_type || '',
+                            vehicleModel:
+                                driver.vehicle_model || '',
+                            vehicleColor:
+                                driver.vehicle_color || '',
+                            vehicleRegistration:
+                                driver.registration_number || '',
+                            vehicleYear:
+                                driver.vehicle_year != null
+                                    ? String(driver.vehicle_year)
+                                    : '',
 
+                            // ── location details ────────────
                             pickupAddress:
-                                ride.pickupAddress ||
-                                '',
-
+                                ride.pickupAddress || '',
                             destinationAddress:
-                                ride.destinationAddress ||
-                                '',
+                                ride.destinationAddress || '',
+                            pickupLat:
+                                ride.pickupLat != null
+                                    ? String(ride.pickupLat)
+                                    : '',
+                            pickupLng:
+                                ride.pickupLng != null
+                                    ? String(ride.pickupLng)
+                                    : '',
+                            destLat:
+                                ride.destLat != null
+                                    ? String(ride.destLat)
+                                    : '',
+                            destLng:
+                                ride.destLng != null
+                                    ? String(ride.destLng)
+                                    : '',
                         }
                     );
                 }
@@ -1561,12 +1607,10 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details (using numeric columns, NOT PostGIS functions)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
                         d.current_latitude AS driver_lat,
                         d.current_longitude AS driver_lng,
-                        -- vehicle details (correct column names)
                         d.vehicle_type,
                         d.vehicle_model,
                         d.vehicle_color,
@@ -1590,7 +1634,6 @@ router.get(
                 });
             }
 
-            // ✅ Return the ride object under "ride" key
             return res.status(200).json({
                 success: true,
                 ride: result.rows[0],
@@ -1612,11 +1655,7 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
-| GET RIDE DETAILS (NEW)
-|--------------------------------------------------------------------------
-| This endpoint returns the same data as /rides/:rideId/status,
-| but without the "/status" suffix – used by the Flutter app in
-| RideService.getRideDetails().
+| GET RIDE DETAILS
 |--------------------------------------------------------------------------
 */
 
@@ -1675,12 +1714,10 @@ router.get(
                         r.ride_type,
                         r.requested_at,
                         r.completed_at,
-                        -- driver details (using numeric columns)
                         d.full_name AS driver_name,
                         d.profile_photo_url AS driver_photo,
                         d.current_latitude AS driver_lat,
                         d.current_longitude AS driver_lng,
-                        -- vehicle details (correct column names)
                         d.vehicle_type,
                         d.vehicle_model,
                         d.vehicle_color,
@@ -1704,7 +1741,6 @@ router.get(
                 });
             }
 
-            // ✅ Return the ride object under "ride" key
             return res.status(200).json({
                 success: true,
                 ride: result.rows[0],
@@ -2007,7 +2043,6 @@ router.post(
 
             await client.query('BEGIN');
 
-            // 1. Lock and fetch ride details, including passenger & driver info
             const rideResult =
                 await client.query(
                     `
@@ -2045,7 +2080,6 @@ router.post(
             const passengerFirebaseUid = ride.passenger_firebase_uid;
             const driverFirebaseUid = ride.driver_id;
 
-            // 2. Delete the ride
             await client.query(
                 `
                 DELETE FROM public.rides
@@ -2054,7 +2088,6 @@ router.post(
                 [rideId]
             );
 
-            // 3. If driver was assigned, set availability back to true
             if (driverFirebaseUid) {
                 await client.query(
                     `
@@ -2068,10 +2101,8 @@ router.post(
 
             await client.query('COMMIT');
 
-            // 4. Send notifications (outside transaction)
             const notificationPromises: Promise<void>[] = [];
 
-            // Notify passenger
             if (passengerFirebaseUid) {
                 const passengerTokenResult = await pool.query(
                     `
@@ -2091,12 +2122,9 @@ router.post(
                             'Ride Cancelled',
                             `Your ride has been cancelled. Reason: ${reason}`,
                             {
-                                // ── routing metadata ────────
                                 role: 'passenger',
                                 notificationType: 'ride_cancelled',
                                 targetScreen: 'passenger_home',
-
-                                // ── ride payload ────────────
                                 rideId: String(rideId),
                                 status: 'cancelled',
                                 cancellationReason: reason,
@@ -2107,7 +2135,6 @@ router.post(
                 }
             }
 
-            // Notify driver
             if (driverFirebaseUid) {
                 const driverTokenResult = await pool.query(
                     `
@@ -2127,12 +2154,9 @@ router.post(
                             'Ride Cancelled',
                             `You have cancelled ride #${rideId}. Reason: ${reason}`,
                             {
-                                // ── routing metadata ────────
                                 role: 'driver',
                                 notificationType: 'ride_cancelled',
                                 targetScreen: 'driver_home',
-
-                                // ── ride payload ────────────
                                 rideId: String(rideId),
                                 status: 'cancelled',
                                 cancellationReason: reason,
@@ -2143,7 +2167,6 @@ router.post(
                 }
             }
 
-            // Fire notifications in background
             Promise.allSettled(notificationPromises).catch((err) =>
                 console.error('❌ Some notifications failed:', err)
             );
