@@ -946,7 +946,6 @@ router.post(
 
             await client.query('BEGIN');
 
-            // ✅ UPDATED: fetch vehicle details and driver location too
             const driverResult =
                 await client.query(
                     `
@@ -1186,7 +1185,6 @@ router.post(
                         driver.full_name ||
                         'Driver';
 
-                    // ✅ Safely stringify driver location
                     const driverLat =
                         driver.current_latitude != null
                             ? String(driver.current_latitude)
@@ -1207,7 +1205,8 @@ router.post(
                             // ── routing metadata ────────────
                             role: 'passenger',
                             notificationType: 'ride_accepted',
-                            targetScreen: 'passenger_home',
+                            targetScreen: 'track_ride', // ← MODIFIED
+                            // was 'passenger_home'
 
                             // ── ride payload ────────────────
                             rideId: String(rideId),
