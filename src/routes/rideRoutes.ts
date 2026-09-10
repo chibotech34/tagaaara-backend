@@ -229,7 +229,12 @@ async function notifyNearbyDrivers(
             `needs a ride from ` +
             `${rideData.pickup_address || 'your area'}`;
 
+        // ── Routing metadata + ride payload ───────────────────
         const dataPayload = {
+            role: 'driver',
+            notificationType: 'ride_request',
+            targetScreen: 'driver_home',
+
             rideId: String(rideId),
 
             passengerName:
@@ -1181,6 +1186,12 @@ router.post(
                         `Your ride has been accepted by ${driverName}. They are on their way.`,
 
                         {
+                            // ── routing metadata ────────────
+                            role: 'passenger',
+                            notificationType: 'ride_accepted',
+                            targetScreen: 'passenger_home',
+
+                            // ── ride payload ────────────────
                             rideId:
                                 String(
                                     rideId
@@ -1946,7 +1957,7 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| CANCEL RIDE (MODIFIED: DELETE & NOTIFY BOTH PARTIES)
+| CANCEL RIDE (DELETE & NOTIFY BOTH PARTIES)
 |--------------------------------------------------------------------------
 */
 
@@ -2057,10 +2068,10 @@ router.post(
 
             await client.query('COMMIT');
 
-            // 4. Send notifications (outside transaction – failures are logged but don't roll back)
+            // 4. Send notifications (outside transaction)
             const notificationPromises: Promise<void>[] = [];
 
-            // Notify passenger if we have their Firebase UID
+            // Notify passenger
             if (passengerFirebaseUid) {
                 const passengerTokenResult = await pool.query(
                     `
@@ -2080,6 +2091,12 @@ router.post(
                             'Ride Cancelled',
                             `Your ride has been cancelled. Reason: ${reason}`,
                             {
+                                // ── routing metadata ────────
+                                role: 'passenger',
+                                notificationType: 'ride_cancelled',
+                                targetScreen: 'passenger_home',
+
+                                // ── ride payload ────────────
                                 rideId: String(rideId),
                                 status: 'cancelled',
                                 cancellationReason: reason,
@@ -2090,7 +2107,7 @@ router.post(
                 }
             }
 
-            // Notify driver (if driver is the one who cancelled, we might skip, but we'll send anyway)
+            // Notify driver
             if (driverFirebaseUid) {
                 const driverTokenResult = await pool.query(
                     `
@@ -2110,6 +2127,12 @@ router.post(
                             'Ride Cancelled',
                             `You have cancelled ride #${rideId}. Reason: ${reason}`,
                             {
+                                // ── routing metadata ────────
+                                role: 'driver',
+                                notificationType: 'ride_cancelled',
+                                targetScreen: 'driver_home',
+
+                                // ── ride payload ────────────
                                 rideId: String(rideId),
                                 status: 'cancelled',
                                 cancellationReason: reason,
@@ -2120,7 +2143,7 @@ router.post(
                 }
             }
 
-            // Fire notifications in background – don't wait for them
+            // Fire notifications in background
             Promise.allSettled(notificationPromises).catch((err) =>
                 console.error('❌ Some notifications failed:', err)
             );
