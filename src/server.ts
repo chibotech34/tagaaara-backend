@@ -25,6 +25,10 @@ import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
 
+import otpRoutes from "./routes/otpRoutes";
+
+
+
 /*
 |--------------------------------------------------------------------------
 | Types
@@ -85,6 +89,10 @@ app.use(
     }),
 );
 
+app.use(
+    "/api/auth",
+    otpRoutes
+);
 /*
 |--------------------------------------------------------------------------
 | BODY PARSERS
