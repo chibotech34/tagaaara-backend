@@ -1,73 +1,332 @@
 // routes/passengerRoutes.js
-
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
+const pool = require('../config/database');
+const admin = require('firebase-admin');
 
-const pool = require('../config/database').default;
-const { getAuth } = require('firebase-admin/auth');
+const ZAVU_API_URL = 'https://api.zavu.dev/v1/messages';
+const OTP_EXPIRY_MINUTES = 5;
+const OTP_RESEND_SECONDS = 60;
+const MAX_OTP_ATTEMPTS = 5;
+
+function normalizePhone(phone) {
+    let value = String(phone || '').trim().replace(/[^0-9+]/g, '');
+
+    if (value.startsWith('0')) value = '+233' + value.substring(1);
+    else if (value.startsWith('233')) value = '+' + value;
+    else if (/^\d{9}$/.test(value)) value = '+233' + value;
+
+    if (!/^\+233\d{9}$/.test(value)) return null;
+    return value;
+}
+
+function hashOtp(otp) {
+    return crypto.createHash('sha256').update(String(otp)).digest('hex');
+}
+
+function generateOtp() {
+    return crypto.randomInt(100000, 1000000).toString();
+}
+
+async function sendZavuSms(to, text) {
+    const apiKey = process.env.ZAVU_API_KEY;
+    if (!apiKey) throw new Error('ZAVU_API_KEY is not configured.');
+
+    const headers = {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+    };
+
+    if (process.env.ZAVU_SENDER_ID) {
+        headers['Zavu-Sender'] = process.env.ZAVU_SENDER_ID;
+    }
+
+    const response = await fetch(ZAVU_API_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+            to,
+            channel: 'sms',
+            messageType: 'text',
+            text,
+        }),
+    });
+
+    const bodyText = await response.text();
+    let body;
+    try {
+        body = JSON.parse(bodyText);
+    } catch (_) {
+        body = { raw: bodyText };
+    }
+
+    if (!response.ok) {
+        console.error('❌ Zavu API error:', response.status, body);
+        const error = new Error(body?.message || body?.error || `Zavu returned HTTP ${response.status}`);
+        error.status = response.status;
+        throw error;
+    }
+
+    return body;
+}
 
 // ============================================================
-// FIREBASE AUTHENTICATION MIDDLEWARE
+// PUBLIC ZAVU OTP ROUTES
+// These routes do NOT use Firebase authentication.
 // ============================================================
 
+router.post('/send-otp', async (req, res) => {
+    try {
+        const phone = normalizePhone(req.body?.phoneNumber || req.body?.phone);
+        const purpose = req.body?.purpose === 'login' ? 'login' : 'register';
+
+        if (!phone) {
+            return res.status(400).json({
+                success: false,
+                message: 'Enter a valid Ghana mobile number.',
+                code: 'INVALID_PHONE',
+            });
+        }
+
+        // Registration must not start for an existing number.
+        const existing = await pool.query(
+            `SELECT id, firebase_uid FROM passengers WHERE phone = $1 LIMIT 1`,
+            [phone],
+        );
+
+        if (purpose === 'register' && existing.rows.length > 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'This phone number is already registered. Please log in.',
+                code: 'PHONE_ALREADY_REGISTERED',
+            });
+        }
+
+        if (purpose === 'login' && existing.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: 'This phone number is not registered on Tegaara.',
+                code: 'PASSENGER_NOT_FOUND',
+            });
+        }
+
+        // Anti-spam: one OTP per number/purpose every 60 seconds.
+        const recent = await pool.query(
+            `SELECT created_at
+             FROM phone_otps
+             WHERE phone_number = $1 AND purpose = $2
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [phone, purpose],
+        );
+
+        if (recent.rows.length > 0) {
+            const ageSeconds = (Date.now() - new Date(recent.rows[0].created_at).getTime()) / 1000;
+            if (ageSeconds < OTP_RESEND_SECONDS) {
+                const retryAfter = Math.ceil(OTP_RESEND_SECONDS - ageSeconds);
+                return res.status(429).json({
+                    success: false,
+                    message: `Please wait ${retryAfter} seconds before requesting another OTP.`,
+                    retryAfter,
+                    code: 'OTP_RATE_LIMITED',
+                });
+            }
+        }
+
+        const otp = generateOtp();
+        const otpHash = hashOtp(otp);
+        const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
+
+        await pool.query(
+            `DELETE FROM phone_otps WHERE phone_number = $1 AND purpose = $2 AND verified_at IS NULL`,
+            [phone, purpose],
+        );
+
+        await pool.query(
+            `INSERT INTO phone_otps
+                (phone_number, purpose, otp_hash, expires_at, attempts, created_at)
+             VALUES ($1, $2, $3, $4, 0, NOW())`,
+            [phone, purpose, otpHash, expiresAt],
+        );
+
+        await sendZavuSms(
+            phone,
+            `TEGAARA: Your verification code is ${otp}. It expires in 5 minutes. Do not share this code.`,
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: 'OTP sent successfully.',
+            phoneNumber: phone,
+            expiresIn: OTP_EXPIRY_MINUTES * 60,
+        });
+    } catch (error) {
+        console.error('❌ SEND ZAVU OTP ERROR:', error);
+        return res.status(error.status || 500).json({
+            success: false,
+            message: error.status === 402
+                ? 'Tegaara SMS service has insufficient balance.'
+                : 'Unable to send OTP right now. Please try again.',
+            code: 'OTP_SEND_FAILED',
+        });
+    }
+});
+
+router.post('/verify-otp', async (req, res) => {
+    try {
+        const phone = normalizePhone(req.body?.phoneNumber || req.body?.phone);
+        const otp = String(req.body?.otp || '').trim();
+        const purpose = req.body?.purpose === 'login' ? 'login' : 'register';
+
+        if (!phone || !/^\d{6}$/.test(otp)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number and a 6-digit OTP are required.',
+                code: 'INVALID_OTP_REQUEST',
+            });
+        }
+
+        const result = await pool.query(
+            `SELECT * FROM phone_otps
+             WHERE phone_number = $1 AND purpose = $2 AND verified_at IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1`,
+            [phone, purpose],
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'OTP not found. Please request a new code.',
+                code: 'OTP_NOT_FOUND',
+            });
+        }
+
+        const record = result.rows[0];
+
+        if (record.attempts >= MAX_OTP_ATTEMPTS) {
+            return res.status(429).json({
+                success: false,
+                message: 'Too many incorrect OTP attempts. Request a new code.',
+                code: 'OTP_ATTEMPTS_EXCEEDED',
+            });
+        }
+
+        if (new Date(record.expires_at).getTime() < Date.now()) {
+            return res.status(400).json({
+                success: false,
+                message: 'OTP has expired. Please request a new code.',
+                code: 'OTP_EXPIRED',
+            });
+        }
+
+        const suppliedHash = hashOtp(otp);
+        if (suppliedHash !== record.otp_hash) {
+            await pool.query(
+                `UPDATE phone_otps SET attempts = attempts + 1 WHERE id = $1`,
+                [record.id],
+            );
+
+            return res.status(400).json({
+                success: false,
+                message: 'Incorrect OTP. Please check the code and try again.',
+                code: 'OTP_INVALID',
+            });
+        }
+
+        await pool.query(
+            `UPDATE phone_otps SET verified_at = NOW() WHERE id = $1`,
+            [record.id],
+        );
+
+        // Login flow: convert the verified phone number into a Firebase custom token.
+        if (purpose === 'login') {
+            const passenger = await pool.query(
+                `SELECT id, firebase_uid, full_name, phone, email
+                 FROM passengers
+                 WHERE phone = $1
+                 LIMIT 1`,
+                [phone],
+            );
+
+            if (passenger.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger account was not found.',
+                    code: 'PASSENGER_NOT_FOUND',
+                });
+            }
+
+            const row = passenger.rows[0];
+            const customToken = await admin.auth().createCustomToken(row.firebase_uid, {
+                role: 'passenger',
+                phone,
+            });
+
+            return res.status(200).json({
+                success: true,
+                verified: true,
+                customToken,
+                passenger: row,
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            verified: true,
+            phoneNumber: phone,
+        });
+    } catch (error) {
+        console.error('❌ VERIFY ZAVU OTP ERROR:', error);
+        return res.status(500).json({
+            success: false,
+            message: 'OTP verification failed. Please try again.',
+            code: 'OTP_VERIFY_FAILED',
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// Middleware: verify Firebase ID token (no admin check)
+// ------------------------------------------------------------
 const verifyFirebaseToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({
             success: false,
             message: 'Missing or invalid Authorization header. Expected Bearer token.'
         });
     }
-
     const token = authHeader.split(' ')[1];
-
     try {
-        const decodedToken = await getAuth().verifyIdToken(token);
+        const decodedToken = await admin.auth().verifyIdToken(token);
         req.decodedToken = decodedToken;
-        console.log('✅ Firebase user authenticated:', decodedToken.uid);
         next();
     } catch (error) {
-        console.error('❌ Firebase token verification failed:', error);
+        console.error('Token verification failed:', error);
         return res.status(401).json({
             success: false,
             message: 'Invalid Firebase token.',
-            details: error.message
         });
     }
 };
 
-// ============================================================
-// PROFILE (GET & PATCH)
-// ============================================================
-
+// ------------------------------------------------------------
+// GET /api/passenger/profile
+// ------------------------------------------------------------
 router.get('/profile', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
-
     try {
         const result = await pool.query(
-            `SELECT
-                id,
-                firebase_uid,
-                full_name,
-                phone,
-                email,
-                gender,
-                emergency_contact_name,
-                emergency_contact_phone,
-                emergency_relationship,
-                home_address,
-                region,
-                district,
-                town_city,
-                saved_locations,
-                preferred_payment_method,
-                mobile_money_number,
-                language_preference,
-                notification_enabled,
-                privacy_enabled,
-                created_at,
-                updated_at
+            `SELECT 
+                id, firebase_uid, full_name, phone, email, gender,
+                emergency_contact_name, emergency_contact_phone, emergency_relationship,
+                home_address, region, district, town_city,
+                saved_locations, preferred_payment_method, mobile_money_number,
+                language_preference, notification_enabled, privacy_enabled,
+                created_at, updated_at
              FROM passengers
              WHERE firebase_uid = $1`,
             [uid]
@@ -80,99 +339,34 @@ router.get('/profile', verifyFirebaseToken, async (req, res) => {
             });
         }
 
-        return res.status(200).json({
+        res.json({
             success: true,
             passenger: result.rows[0]
         });
-
     } catch (error) {
         console.error('❌ Error fetching passenger profile:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Server error while fetching profile'
         });
     }
 });
 
-router.patch('/profile', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    const updates = req.body;
-
-    const allowedFields = [
-        'full_name', 'phone', 'email', 'gender',
-        'emergency_contact_name', 'emergency_contact_phone', 'emergency_relationship',
-        'home_address', 'region', 'district', 'town_city',
-        'saved_locations', 'preferred_payment_method', 'mobile_money_number',
-        'language_preference', 'notification_enabled', 'privacy_enabled'
-    ];
-
-    const setClauses = [];
-    const values = [];
-    let paramIndex = 1;
-
-    for (const field of allowedFields) {
-        if (updates.hasOwnProperty(field)) {
-            if (field === 'saved_locations') {
-                const locations = Array.isArray(updates[field]) ? updates[field] : [];
-                setClauses.push(`saved_locations = $${paramIndex}::jsonb`);
-                values.push(JSON.stringify(locations));
-            } else {
-                setClauses.push(`${field} = $${paramIndex}`);
-                values.push(updates[field]);
-            }
-            paramIndex++;
-        }
-    }
-
-    if (setClauses.length === 0) {
-        return res.status(400).json({
-            success: false,
-            message: 'No valid fields provided to update'
-        });
-    }
-
-    setClauses.push(`updated_at = NOW()`);
-
-    const query = `
-        UPDATE passengers
-        SET ${setClauses.join(', ')}
-        WHERE firebase_uid = $${paramIndex}
-        RETURNING *
-    `;
-    values.push(uid);
-
-    try {
-        const result = await pool.query(query, values);
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found'
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            passenger: result.rows[0]
-        });
-
-    } catch (error) {
-        console.error('❌ Error updating passenger profile:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while updating profile'
-        });
-    }
-});
-
-// ============================================================
-// CREATE PASSENGER
-// ============================================================
-
+// ------------------------------------------------------------
+// POST /api/passenger/create
+// (Used when no passenger exists yet; creates a new record)
+// ------------------------------------------------------------
 router.post('/create', verifyFirebaseToken, async (req, res) => {
     try {
-        const { uid, email, phone, displayName } = req.body;
+        const {
+            uid,
+            email,
+            phone,
+            displayName,
+            // optional extra fields can be added later
+        } = req.body;
 
+        // Ensure the UID matches the authenticated user
         if (!uid || uid !== req.decodedToken.uid) {
             return res.status(403).json({
                 success: false,
@@ -180,12 +374,13 @@ router.post('/create', verifyFirebaseToken, async (req, res) => {
             });
         }
 
+        // Check if passenger already exists (by firebase_uid or phone)
         const existing = await pool.query(
             `SELECT id FROM passengers WHERE firebase_uid = $1 OR phone = $2`,
             [uid, phone]
         );
-
         if (existing.rows.length > 0) {
+            // If already exists, just return success (frontend can treat as logged in)
             return res.status(200).json({
                 success: true,
                 message: 'Passenger already exists',
@@ -193,20 +388,21 @@ router.post('/create', verifyFirebaseToken, async (req, res) => {
             });
         }
 
+        // Insert new passenger
         const result = await pool.query(
             `INSERT INTO passengers (
-                firebase_uid,
-                full_name,
+                firebase_uid, full_name, phone, email, created_at
+            ) VALUES ($1, $2, $3, $4, NOW())
+            RETURNING id`,
+            [
+                uid,
+                displayName || 'Passenger',
                 phone,
-                email,
-                created_at
-             )
-             VALUES ($1, $2, $3, $4, NOW())
-             RETURNING id`,
-            [uid, displayName || 'Passenger', phone, email || null]
+                email || null
+            ]
         );
 
-        return res.status(201).json({
+        res.status(201).json({
             success: true,
             message: 'Passenger created successfully',
             passengerId: result.rows[0].id
@@ -214,21 +410,37 @@ router.post('/create', verifyFirebaseToken, async (req, res) => {
 
     } catch (error) {
         console.error('❌ Error creating passenger:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Server error while creating passenger'
         });
     }
 });
 
+// ------------------------------------------------------------
+// POST /api/passenger/register (full registration – kept for compatibility)
+// ------------------------------------------------------------
 router.post('/register', verifyFirebaseToken, async (req, res) => {
     try {
         const {
-            uid, fullName, phone, email, gender,
-            emergencyContactName, emergencyContactPhone, emergencyRelationship,
-            homeAddress, region, district, townCity,
-            savedLocations, preferredPaymentMethod, mobileMoneyNumber,
-            languagePreference, notificationEnabled, privacyEnabled
+            uid,
+            fullName,
+            phone,
+            email,
+            gender,
+            emergencyContactName,
+            emergencyContactPhone,
+            emergencyRelationship,
+            homeAddress,
+            region,
+            district,
+            townCity,
+            savedLocations,
+            preferredPaymentMethod,
+            mobileMoneyNumber,
+            languagePreference,
+            notificationEnabled,
+            privacyEnabled
         } = req.body;
 
         if (!uid || !fullName || !phone) {
@@ -258,10 +470,32 @@ router.post('/register', verifyFirebaseToken, async (req, res) => {
             });
         }
 
+        // Registration is allowed only after a successful Zavu OTP verification.
+        const verification = await pool.query(
+            `SELECT id
+             FROM phone_otps
+             WHERE phone_number = $1
+               AND purpose = 'register'
+               AND verified_at IS NOT NULL
+               AND verified_at >= NOW() - INTERVAL '10 minutes'
+             ORDER BY verified_at DESC
+             LIMIT 1`,
+            [phone]
+        );
+
+        if (verification.rows.length === 0) {
+            return res.status(403).json({
+                success: false,
+                message: 'Phone number has not been verified. Please verify the OTP first.',
+                code: 'PHONE_NOT_VERIFIED'
+            });
+        }
+
         const locations = Array.isArray(savedLocations) ? savedLocations : [];
 
         const result = await pool.query(
-            `INSERT INTO passengers (
+            `
+            INSERT INTO passengers (
                 firebase_uid, full_name, phone, email, gender,
                 emergency_contact_name, emergency_contact_phone, emergency_relationship,
                 home_address, region, district, town_city,
@@ -269,18 +503,48 @@ router.post('/register', verifyFirebaseToken, async (req, res) => {
                 language_preference, notification_enabled, privacy_enabled,
                 created_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW())
-            RETURNING id`,
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15,
+                $16, $17, $18,
+                NOW()
+            )
+            RETURNING id
+            `,
             [
-                uid, fullName, phone, email || null, gender || null,
-                emergencyContactName || null, emergencyContactPhone || null, emergencyRelationship || null,
-                homeAddress || null, region || null, district || null, townCity || null,
-                JSON.stringify(locations), preferredPaymentMethod || null, mobileMoneyNumber || null,
-                languagePreference || null, notificationEnabled ?? true, privacyEnabled ?? true
+                uid,
+                fullName,
+                phone,
+                email || null,
+                gender || null,
+                emergencyContactName || null,
+                emergencyContactPhone || null,
+                emergencyRelationship || null,
+                homeAddress || null,
+                region || null,
+                district || null,
+                townCity || null,
+                JSON.stringify(locations),
+                preferredPaymentMethod || null,
+                mobileMoneyNumber || null,
+                languagePreference || null,
+                notificationEnabled ?? true,
+                privacyEnabled ?? true
             ]
         );
 
-        return res.status(201).json({
+        await pool.query(
+            `UPDATE phone_otps
+             SET consumed_at = NOW()
+             WHERE phone_number = $1
+               AND purpose = 'register'
+               AND verified_at IS NOT NULL
+               AND consumed_at IS NULL`,
+            [phone]
+        );
+
+        res.status(201).json({
             success: true,
             message: 'Passenger registered successfully',
             passengerId: result.rows[0].id
@@ -288,7 +552,7 @@ router.post('/register', verifyFirebaseToken, async (req, res) => {
 
     } catch (error) {
         console.error('❌ Passenger registration error:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Registration failed due to a server error.',
             code: 'DB_INSERT_FAILED'
@@ -297,69 +561,69 @@ router.post('/register', verifyFirebaseToken, async (req, res) => {
 });
 
 // ============================================================
-// WALLET (GET and POST)
+// WALLET ROUTES (NEW)
 // ============================================================
 
+/**
+ * GET /api/passenger/wallet
+ * Get the current passenger's wallet
+ */
 router.get('/wallet', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
-
     try {
         const passengerResult = await pool.query(
             `SELECT id FROM passengers WHERE firebase_uid = $1`,
             [uid]
         );
-
         if (passengerResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Passenger not found. Please complete registration first.'
             });
         }
-
         const passengerId = passengerResult.rows[0].id;
 
         const walletResult = await pool.query(
-            `SELECT
-                id, passenger_id, balance, pending_balance,
-                total_spent, last_transaction_at, created_at, updated_at
+            `SELECT id, passenger_id, balance, pending_balance, total_spent, 
+                    last_transaction_at, created_at, updated_at
              FROM wallets
              WHERE passenger_id = $1`,
             [passengerId]
         );
-
         if (walletResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Wallet not found. Please create one.'
             });
         }
-
-        return res.status(200).json({
+        res.json({
             success: true,
             wallet: walletResult.rows[0]
         });
-
     } catch (error) {
         console.error('❌ Error fetching wallet:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Server error while fetching wallet'
         });
     }
 });
 
+/**
+ * POST /api/passenger/wallet
+ * Create a wallet for the passenger (if one doesn't exist)
+ */
 router.post('/wallet', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
     const { full_name, email, phone } = req.body;
 
     try {
+        // 1. Ensure passenger exists
         let passengerId;
-
         const existingPassenger = await pool.query(
             `SELECT id FROM passengers WHERE firebase_uid = $1`,
             [uid]
         );
-
         if (existingPassenger.rows.length === 0) {
             const displayName = full_name || req.decodedToken.name || 'Passenger';
             const emailAddress = email || req.decodedToken.email || null;
@@ -376,11 +640,11 @@ router.post('/wallet', verifyFirebaseToken, async (req, res) => {
             passengerId = existingPassenger.rows[0].id;
         }
 
+        // 2. Check if wallet already exists
         const existingWallet = await pool.query(
             `SELECT id FROM wallets WHERE passenger_id = $1`,
             [passengerId]
         );
-
         if (existingWallet.rows.length > 0) {
             const wallet = await pool.query(
                 `SELECT * FROM wallets WHERE passenger_id = $1`,
@@ -393,6 +657,7 @@ router.post('/wallet', verifyFirebaseToken, async (req, res) => {
             });
         }
 
+        // 3. Create new wallet with zero balance
         const newWallet = await pool.query(
             `INSERT INTO wallets (passenger_id, balance, pending_balance, total_spent, created_at)
              VALUES ($1, 0, 0, 0, NOW())
@@ -400,720 +665,73 @@ router.post('/wallet', verifyFirebaseToken, async (req, res) => {
             [passengerId]
         );
 
-        return res.status(201).json({
+        res.status(201).json({
             success: true,
             message: 'Wallet created successfully',
             wallet: newWallet.rows[0]
         });
-
     } catch (error) {
         console.error('❌ Error creating wallet:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Server error while creating wallet'
         });
     }
 });
 
-// ============================================================
-// TRANSACTIONS
-// ============================================================
-
-router.get('/transactions', verifyFirebaseToken, async (req, res) => {
+/**
+ * GET /api/passenger/wallet/transactions
+ * Get transaction history for the passenger's wallet
+ */
+router.get('/wallet/transactions', verifyFirebaseToken, async (req, res) => {
     const uid = req.decodedToken.uid;
-
     try {
         const passengerResult = await pool.query(
             `SELECT id FROM passengers WHERE firebase_uid = $1`,
             [uid]
         );
-
         if (passengerResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Passenger not found'
             });
         }
-
         const passengerId = passengerResult.rows[0].id;
 
         const walletResult = await pool.query(
             `SELECT id FROM wallets WHERE passenger_id = $1`,
             [passengerId]
         );
-
         if (walletResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 message: 'Wallet not found'
             });
         }
-
         const walletId = walletResult.rows[0].id;
 
-        const limit = parseInt(req.query.limit) || 50;
-
         const transactions = await pool.query(
-            `SELECT
-                id, wallet_id, type, amount,
-                balance_before, balance_after, status,
-                payment_method, provider, ride_id,
-                description, created_at
+            `SELECT id, wallet_id, type, amount, balance_before, balance_after,
+                    status, payment_method, provider, ride_id, description,
+                    created_at
              FROM transactions
              WHERE wallet_id = $1
              ORDER BY created_at DESC
-             LIMIT $2`,
-            [walletId, limit]
+             LIMIT 50`,
+            [walletId]
         );
 
-        return res.status(200).json({
+        res.json({
             success: true,
             transactions: transactions.rows
         });
-
     } catch (error) {
         console.error('❌ Error fetching transactions:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             message: 'Server error while fetching transactions'
         });
     }
 });
-
-// ============================================================
-// RIDE HISTORY
-// ============================================================
-
-router.get('/rides', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-
-    try {
-        const passengerResult = await pool.query(
-            `SELECT id FROM passengers WHERE firebase_uid = $1`,
-            [uid]
-        );
-
-        if (passengerResult.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found'
-            });
-        }
-
-        const passengerId = passengerResult.rows[0].id;
-
-        const limit = parseInt(req.query.limit) || 20;
-
-        const rides = await pool.query(
-            `SELECT
-                id, passenger_id, driver_id, pickup_location,
-                dropoff_location, status, fare, distance,
-                started_at, completed_at, created_at
-             FROM rides
-             WHERE passenger_id = $1
-             ORDER BY created_at DESC
-             LIMIT $2`,
-            [passengerId, limit]
-        );
-
-        return res.status(200).json({
-            success: true,
-            rides: rides.rows
-        });
-
-    } catch (error) {
-        console.error('❌ Error fetching ride history:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while fetching ride history'
-        });
-    }
-});
-
-// ============================================================
-// DELETE ACCOUNT
-// ============================================================
-
-router.delete('/account', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-
-    try {
-        const result = await pool.query(
-            `DELETE FROM passengers WHERE firebase_uid = $1 RETURNING id`,
-            [uid]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found'
-            });
-        }
-
-        return res.status(204).send();
-
-    } catch (error) {
-        console.error('❌ Error deleting account:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while deleting account'
-        });
-    }
-});
-
-// ============================================================
-// ALERTS (existing)
-// ============================================================
-
-router.get('/alerts', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    console.log('🔔 Loading alerts for Firebase UID:', uid);
-
-    try {
-        const result = await pool.query(
-            `SELECT
-                id, title, body AS description,
-                created_at AS timestamp, is_read AS "isRead",
-                priority, category, target_screen AS "targetScreen",
-                metadata
-             FROM alerts
-             WHERE user_id = $1
-             ORDER BY created_at DESC`,
-            [uid]
-        );
-
-        console.log(`🔔 Found ${result.rows.length} alerts for ${uid}`);
-        return res.status(200).json({
-            success: true,
-            alerts: result.rows
-        });
-
-    } catch (error) {
-        console.error('❌ Error fetching passenger alerts:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while fetching alerts',
-            details: error.message
-        });
-    }
-});
-
-router.patch('/alerts/:id/read', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    const alertId = req.params.id;
-
-    try {
-        const result = await pool.query(
-            `UPDATE alerts
-             SET is_read = TRUE
-             WHERE id = $1 AND user_id = $2
-             RETURNING id`,
-            [alertId, uid]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Alert not found or not owned by this user'
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: 'Alert marked as read'
-        });
-
-    } catch (error) {
-        console.error('❌ Error marking alert as read:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error',
-            details: error.message
-        });
-    }
-});
-
-router.patch('/alerts/read-all', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-
-    try {
-        const result = await pool.query(
-            `UPDATE alerts
-             SET is_read = TRUE
-             WHERE user_id = $1 AND is_read = FALSE`,
-            [uid]
-        );
-
-        return res.status(200).json({
-            success: true,
-            message: 'All alerts marked as read',
-            updatedCount: result.rowCount
-        });
-
-    } catch (error) {
-        console.error('❌ Error marking all alerts as read:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error',
-            details: error.message
-        });
-    }
-});
-
-router.delete('/alerts/:id', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    const alertId = req.params.id;
-
-    try {
-        const result = await pool.query(
-            `DELETE FROM alerts
-             WHERE id = $1 AND user_id = $2
-             RETURNING id`,
-            [alertId, uid]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Alert not found or not owned by this user'
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: 'Alert deleted'
-        });
-
-    } catch (error) {
-        console.error('❌ Error deleting alert:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error',
-            details: error.message
-        });
-    }
-});
-
-router.delete('/alerts', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-
-    try {
-        const result = await pool.query(
-            `DELETE FROM alerts WHERE user_id = $1`,
-            [uid]
-        );
-
-        return res.status(200).json({
-            success: true,
-            message: 'All alerts cleared',
-            deletedCount: result.rowCount
-        });
-
-    } catch (error) {
-        console.error('❌ Error clearing alerts:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error',
-            details: error.message
-        });
-    }
-});
-
-// ============================================================
-// NEW: PASSENGER LOCATION AND NEARBY ENDPOINTS
-// ============================================================
-
-/**
- * POST /api/passengers/update-location
- * Update passenger's current location and online status.
- * Body: { latitude, longitude, isOnline? }
- */
-router.post('/update-location', verifyFirebaseToken, async (req, res) => {
-    try {
-        const { latitude, longitude, isOnline } = req.body;
-        const uid = req.decodedToken.uid;
-
-        if (latitude == null || longitude == null) {
-            return res.status(400).json({
-                success: false,
-                message: 'latitude and longitude are required'
-            });
-        }
-
-        const lat = Number(latitude);
-        const lng = Number(longitude);
-        if (!isFinite(lat) || !isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid coordinates'
-            });
-        }
-
-        const online = (isOnline === undefined) ? true : Boolean(isOnline);
-
-        const result = await pool.query(
-            `UPDATE passengers
-             SET current_latitude = $1,
-                 current_longitude = $2,
-                 is_online = $3,
-                 last_location_update = NOW()
-             WHERE firebase_uid = $4
-             RETURNING id, current_latitude, current_longitude, is_online, last_location_update`,
-            [lat, lng, online, uid]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found'
-            });
-        }
-
-        return res.status(200).json({
-            success: true,
-            passenger: result.rows[0]
-        });
-
-    } catch (error) {
-        console.error('❌ Update passenger location error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error'
-        });
-    }
-});
-
-/**
- * GET /api/passengers/nearby
- * Returns online passengers within a radius (meters).
- * Query: ?lat=...&lng=...&radius=5000 (default 5 km)
- */
-router.get('/nearby', verifyFirebaseToken, async (req, res) => {
-    try {
-        const { lat, lng, radius = 5000 } = req.query;
-
-        if (!lat || !lng) {
-            return res.status(400).json({
-                success: false,
-                message: 'lat and lng are required'
-            });
-        }
-
-        const latitude = Number(lat);
-        const longitude = Number(lng);
-        if (!isFinite(latitude) || !isFinite(longitude)) {
-            return res.status(400).json({
-                success: false,
-                message: 'Invalid coordinates'
-            });
-        }
-
-        const query = `
-            SELECT id,
-                   firebase_uid AS uid,
-                   full_name,
-                   phone,
-                   email,
-                   current_latitude AS latitude,
-                   current_longitude AS longitude,
-                   is_online,
-                   last_location_update,
-                   ROUND(
-                       ST_Distance(
-                           ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-                           ST_SetSRID(ST_MakePoint(current_longitude, current_latitude), 4326)::geography
-                       )
-                   ) AS distance_meters
-            FROM passengers
-            WHERE is_online = true
-              AND current_latitude IS NOT NULL
-              AND current_longitude IS NOT NULL
-              AND ST_DWithin(
-                    ST_SetSRID(ST_MakePoint(current_longitude, current_latitude), 4326)::geography,
-                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-                    $3
-                  )
-            ORDER BY distance_meters ASC
-            LIMIT 50;
-        `;
-
-        const result = await pool.query(query, [longitude, latitude, radius]);
-
-        return res.status(200).json({
-            success: true,
-            passengers: result.rows
-        });
-
-    } catch (error) {
-        console.error('❌ Fetch nearby passengers error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error'
-        });
-    }
-});
-
-// ============================================================
-// WALLET TOP-UP (Add Money)
-// ============================================================
-router.post('/wallet/topup', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    const { amount, payment_method, provider } = req.body;
-
-    // Validate input
-    if (amount == null || amount <= 0) {
-        return res.status(400).json({
-            success: false,
-            message: 'Invalid amount. Must be a positive number.'
-        });
-    }
-    if (!payment_method) {
-        return res.status(400).json({
-            success: false,
-            message: 'Payment method is required.'
-        });
-    }
-
-    try {
-        // 1. Get passenger by firebase_uid
-        const passengerResult = await pool.query(
-            `SELECT id FROM passengers WHERE firebase_uid = $1`,
-            [uid]
-        );
-        if (passengerResult.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found.'
-            });
-        }
-        const passengerId = passengerResult.rows[0].id;
-
-        // 2. Get the wallet
-        const walletResult = await pool.query(
-            `SELECT id, balance FROM wallets WHERE passenger_id = $1`,
-            [passengerId]
-        );
-        if (walletResult.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Wallet not found. Please create one first.'
-            });
-        }
-        const wallet = walletResult.rows[0];
-        const walletId = wallet.id;
-        const oldBalance = parseFloat(wallet.balance);
-        const newBalance = oldBalance + amount;
-
-        // 3. Begin a transaction to update balance and create a transaction record
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-
-            // Update wallet balance
-            await client.query(
-                `UPDATE wallets
-                 SET balance = $1, last_transaction_at = NOW(), updated_at = NOW()
-                 WHERE id = $2`,
-                [newBalance, walletId]
-            );
-
-            // Insert transaction record
-            const txResult = await client.query(
-                `INSERT INTO transactions (
-                    wallet_id, passenger_id, type, amount,
-                    balance_before, balance_after, status,
-                    payment_method, provider, description, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-                RETURNING id`,
-                [
-                    walletId,
-                    passengerId,
-                    'topup',
-                    amount,
-                    oldBalance,
-                    newBalance,
-                    'completed',
-                    payment_method,
-                    provider || null,
-                    `Top-up via ${payment_method}`
-                ]
-            );
-
-            await client.query('COMMIT');
-
-            return res.status(201).json({
-                success: true,
-                message: 'Top-up successful',
-                transactionId: txResult.rows[0].id,
-                newBalance: newBalance
-            });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally {
-            client.release();
-        }
-    } catch (error) {
-        console.error('❌ Top-up error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while processing top-up'
-        });
-    }
-});
-
-// ============================================================
-// WALLET PAY FOR RIDE
-// ============================================================
-router.post('/wallet/pay', verifyFirebaseToken, async (req, res) => {
-    const uid = req.decodedToken.uid;
-    const { ride_id, amount } = req.body;
-
-    if (ride_id == null || amount == null || amount <= 0) {
-        return res.status(400).json({
-            success: false,
-            message: 'ride_id and amount (positive number) are required.'
-        });
-    }
-
-    try {
-        // 1. Get passenger
-        const passengerResult = await pool.query(
-            `SELECT id FROM passengers WHERE firebase_uid = $1`,
-            [uid]
-        );
-        if (passengerResult.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Passenger not found.'
-            });
-        }
-        const passengerId = passengerResult.rows[0].id;
-
-        // 2. Verify that the ride belongs to this passenger and is in a payable state
-        const rideCheck = await pool.query(
-            `SELECT id, driver_id, fare, payment_status, status
-             FROM rides
-             WHERE id = $1 AND passenger_id = $2`,
-            [ride_id, passengerId]
-        );
-        if (rideCheck.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Ride not found or does not belong to you.'
-            });
-        }
-        const ride = rideCheck.rows[0];
-        if (ride.payment_status === 'completed') {
-            return res.status(400).json({
-                success: false,
-                message: 'Ride already paid.'
-            });
-        }
-        if (ride.status !== 'completed') {
-            return res.status(400).json({
-                success: false,
-                message: 'Ride must be completed before payment.'
-            });
-        }
-        // Optionally check that amount matches fare, or allow partial – here we require full fare
-        if (parseFloat(ride.fare) !== amount) {
-            return res.status(400).json({
-                success: false,
-                message: `Amount must match ride fare of ${ride.fare}.`
-            });
-        }
-
-        // 3. Get wallet and check balance
-        const walletResult = await pool.query(
-            `SELECT id, balance FROM wallets WHERE passenger_id = $1`,
-            [passengerId]
-        );
-        if (walletResult.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Wallet not found.'
-            });
-        }
-        const wallet = walletResult.rows[0];
-        const walletId = wallet.id;
-        const currentBalance = parseFloat(wallet.balance);
-        if (currentBalance < amount) {
-            return res.status(400).json({
-                success: false,
-                message: 'Insufficient balance.'
-            });
-        }
-        const newBalance = currentBalance - amount;
-
-        // 4. Begin transaction
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-
-            // Deduct from wallet
-            await client.query(
-                `UPDATE wallets
-                 SET balance = $1, total_spent = total_spent + $2,
-                     last_transaction_at = NOW(), updated_at = NOW()
-                 WHERE id = $3`,
-                [newBalance, amount, walletId]
-            );
-
-            // Insert transaction record
-            const txResult = await client.query(
-                `INSERT INTO transactions (
-                    wallet_id, passenger_id, ride_id, type, amount,
-                    balance_before, balance_after, status,
-                    description, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-                RETURNING id`,
-                [
-                    walletId,
-                    passengerId,
-                    ride_id,
-                    'ridePayment',
-                    amount,
-                    currentBalance,
-                    newBalance,
-                    'completed',
-                    `Payment for ride #${ride_id}`
-                ]
-            );
-
-            // Update ride payment status
-            await client.query(
-                `UPDATE rides
-                 SET payment_status = 'completed', paid_at = NOW()
-                 WHERE id = $1`,
-                [ride_id]
-            );
-
-            await client.query('COMMIT');
-
-            return res.status(201).json({
-                success: true,
-                message: 'Ride paid successfully',
-                transactionId: txResult.rows[0].id,
-                newBalance: newBalance
-            });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally {
-            client.release();
-        }
-    } catch (error) {
-        console.error('❌ Pay for ride error:', error);
-        return res.status(500).json({
-            success: false,
-            message: 'Server error while processing payment'
-        });
-    }
-});
-
-// ============================================================
-// EXPORT
-// ============================================================
 
 module.exports = router;
