@@ -25,9 +25,8 @@ import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
 
-import otpRoutes from "./routes/otpRoutes";
-
-
+// ❌ Removed: import otpRoutes from "./routes/otpRoutes";
+// Firebase Phone Auth now handles OTP on the client. No Zavu, no server OTP routes.
 
 /*
 |--------------------------------------------------------------------------
@@ -82,6 +81,11 @@ if (!process.env.FIREBASE_DATABASE_URL) {
 |--------------------------------------------------------------------------
 */
 
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    next();
+});
+
 app.use(
     cors({
         origin: true,
@@ -89,10 +93,19 @@ app.use(
     }),
 );
 
-app.use(
-    "/api/auth",
-    otpRoutes
-);
+/*
+|--------------------------------------------------------------------------
+| ❌ REMOVED: app.use("/api/auth", otpRoutes);
+|
+| Firebase Phone Auth now sends & verifies OTPs on the client.
+| The backend only verifies the resulting Firebase ID token
+| (via verifyFirebaseToken inside passengerRoutes).
+|
+| If you still have a /routes/otpRoutes.js file that uses Zavu,
+| delete it.
+|--------------------------------------------------------------------------
+*/
+
 /*
 |--------------------------------------------------------------------------
 | BODY PARSERS
@@ -236,6 +249,13 @@ app.use(
 /*
 |--------------------------------------------------------------------------
 | Passenger Routes
+|--------------------------------------------------------------------------
+|
+| Passenger registration and login are now backed entirely by
+| Firebase Phone Authentication. The client sends a Firebase ID
+| token; passengerRoutes verifies it and reads the verified phone
+| number from decoded.phone_number.
+|
 |--------------------------------------------------------------------------
 */
 
