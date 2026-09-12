@@ -28,7 +28,9 @@ interface AuthenticatedRequest extends Request {
 // HELPERS
 // ============================================================
 
-function normalizePhone(phone: unknown): string | null {
+function normalizePhone(
+    phone: unknown,
+): string | null {
     let value = String(phone || '')
         .trim()
         .replace(/[^0-9+]/g, '');
@@ -107,7 +109,9 @@ async function verifyFirebaseToken(
         // BEARER TOKEN
         // ----------------------------------------------------
 
-        if (!authHeader.startsWith('Bearer ')) {
+        if (
+            !authHeader.startsWith('Bearer ')
+        ) {
             return res.status(401).json({
                 success: false,
                 code: 'INVALID_AUTHORIZATION',
@@ -145,7 +149,8 @@ async function verifyFirebaseToken(
             uid: decoded.uid,
             email: decoded.email,
             name: decoded.name,
-            phone_number: decoded.phone_number,
+            phone_number:
+                decoded.phone_number,
         };
 
         console.log(
@@ -183,15 +188,6 @@ async function verifyFirebaseToken(
 // ============================================================
 //
 // GET /api/passengers/profile
-//
-// This endpoint is used by the Flutter passenger login screen
-// after Firebase Phone Authentication succeeds.
-//
-// It finds the passenger using:
-//
-//     Firebase UID
-//          ↓
-//     passengers.firebase_uid
 //
 // ============================================================
 
@@ -247,48 +243,50 @@ router.get(
             );
 
             // ------------------------------------------------
-            // FIND PASSENGER BY FIREBASE UID
+            // FIND PASSENGER
             // ------------------------------------------------
 
-            const result = await pool.query(
-                `
-                SELECT
-                    id,
-                    firebase_uid,
-                    full_name,
-                    phone,
-                    email,
-                    gender,
-                    emergency_contact_name,
-                    emergency_contact_phone,
-                    emergency_relationship,
-                    home_address,
-                    region,
-                    district,
-                    town_city,
-                    saved_locations,
-                    preferred_payment_method,
-                    mobile_money_number,
-                    language_preference,
-                    notification_enabled,
-                    privacy_enabled,
-                    created_at,
-                    profile_photo_url,
-                    account_status,
-                    phone_verified,
-                    email_verified,
-                    updated_at,
-                    is_online,
-                    last_online_at,
-                    current_latitude,
-                    current_longitude,
-                    last_location_update
-                FROM passengers
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        firebase_uid,
+                        full_name,
+                        phone,
+                        email,
+                        gender,
+                        emergency_contact_name,
+                        emergency_contact_phone,
+                        emergency_relationship,
+                        home_address,
+                        region,
+                        district,
+                        town_city,
+                        saved_locations,
+                        preferred_payment_method,
+                        mobile_money_number,
+                        language_preference,
+                        notification_enabled,
+                        privacy_enabled,
+                        created_at,
+                        profile_photo_url,
+                        account_status,
+                        phone_verified,
+                        email_verified,
+                        updated_at,
+                        is_online,
+                        last_online_at,
+                        current_latitude,
+                        current_longitude,
+                        last_location_update,
+                        fcm_token
+                    FROM passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
             console.log(
                 'Passenger database rows:',
@@ -304,11 +302,6 @@ router.get(
                     'PASSENGER NOT FOUND',
                 );
 
-                console.log(
-                    'Firebase UID searched:',
-                    uid,
-                );
-
                 return res.status(404).json({
                     success: false,
                     code: 'PASSENGER_NOT_FOUND',
@@ -317,39 +310,11 @@ router.get(
                 });
             }
 
-            // ------------------------------------------------
-            // PASSENGER FOUND
-            // ------------------------------------------------
-
             const passenger =
                 result.rows[0];
 
-            console.log(
-                'PASSENGER FOUND',
-            );
-
-            console.log(
-                'Passenger ID:',
-                passenger.id,
-            );
-
-            console.log(
-                'Passenger Firebase UID:',
-                passenger.firebase_uid,
-            );
-
-            console.log(
-                'Passenger phone:',
-                passenger.phone,
-            );
-
-            console.log(
-                'Passenger account status:',
-                passenger.account_status,
-            );
-
             // ------------------------------------------------
-            // CHECK ACCOUNT STATUS
+            // ACCOUNT STATUS
             // ------------------------------------------------
 
             if (
@@ -374,7 +339,7 @@ router.get(
                 success: true,
                 message:
                     'Passenger profile retrieved successfully.',
-                passenger: passenger,
+                passenger,
             });
         } catch (error) {
             console.error(
@@ -402,8 +367,8 @@ router.get(
 //
 // {
 //     "isOnline": true,
-//     "latitude": 10.0361508,
-//     "longitude": -2.4851098
+//     "latitude": 10.0605,
+//     "longitude": -2.5072
 // }
 //
 // ============================================================
@@ -448,7 +413,7 @@ router.post(
                     : true;
 
             // ------------------------------------------------
-            // LOCATION
+            // CONVERT COORDINATES
             // ------------------------------------------------
 
             const lat =
@@ -458,7 +423,7 @@ router.post(
                 toFiniteNumber(longitude);
 
             // ------------------------------------------------
-            // BOTH COORDINATES REQUIRED
+            // COORDINATES MUST COME TOGETHER
             // ------------------------------------------------
 
             if (
@@ -512,7 +477,7 @@ router.post(
             );
 
             console.log(
-                'PASSENGER STATUS UPDATE',
+                'PASSENGER STATUS / LOCATION UPDATE',
             );
 
             console.log(
@@ -543,64 +508,67 @@ router.post(
             // UPDATE DATABASE
             // ------------------------------------------------
 
-            const result = await pool.query(
-                `
-                UPDATE passengers
-                SET
-                    is_online = $1,
+            const result =
+                await pool.query(
+                    `
+                    UPDATE passengers
+                    SET
+                        is_online = $1,
 
-                    last_online_at =
-                        CASE
-                            WHEN $1 = TRUE
-                            THEN NOW()
-                            ELSE last_online_at
-                        END,
+                        last_online_at =
+                            CASE
+                                WHEN $1 = TRUE
+                                THEN NOW()
+                                ELSE last_online_at
+                            END,
 
-                    current_latitude =
-                        COALESCE(
-                            $2,
-                            current_latitude
-                        ),
+                        current_latitude =
+                            CASE
+                                WHEN $2 IS NOT NULL
+                                THEN $2
+                                ELSE current_latitude
+                            END,
 
-                    current_longitude =
-                        COALESCE(
-                            $3,
-                            current_longitude
-                        ),
+                        current_longitude =
+                            CASE
+                                WHEN $3 IS NOT NULL
+                                THEN $3
+                                ELSE current_longitude
+                            END,
 
-                    last_location_update =
-                        CASE
-                            WHEN $2 IS NOT NULL
-                             AND $3 IS NOT NULL
-                            THEN NOW()
-                            ELSE last_location_update
-                        END,
+                        last_location_update =
+                            CASE
+                                WHEN $2 IS NOT NULL
+                                 AND $3 IS NOT NULL
+                                THEN NOW()
+                                ELSE last_location_update
+                            END,
 
-                    updated_at = NOW()
+                        updated_at = NOW()
 
-                WHERE firebase_uid = $4
+                    WHERE firebase_uid = $4
 
-                RETURNING
-                    id,
-                    firebase_uid,
-                    full_name,
-                    phone,
-                    email,
-                    account_status,
-                    is_online,
-                    last_online_at,
-                    current_latitude,
-                    current_longitude,
-                    last_location_update,
-                    updated_at
-                `,
-                [
-                    online,
-                    lat,
-                    lng,
-                    uid,
-                ],
-            );
+                    RETURNING
+                        id,
+                        firebase_uid,
+                        full_name,
+                        phone,
+                        email,
+                        account_status,
+                        is_online,
+                        last_online_at,
+                        current_latitude,
+                        current_longitude,
+                        last_location_update,
+                        updated_at
+                    `,
+                    [
+                        online,
+                        lat,
+                        lng,
+                        uid,
+                    ],
+                );
 
             // ------------------------------------------------
             // PASSENGER NOT FOUND
@@ -608,11 +576,11 @@ router.post(
 
             if (result.rows.length === 0) {
                 console.log(
-                    'Passenger status update failed.',
+                    'PASSENGER NOT FOUND FOR LOCATION UPDATE',
                 );
 
                 console.log(
-                    'No passenger found for Firebase UID:',
+                    'Firebase UID:',
                     uid,
                 );
 
@@ -632,7 +600,7 @@ router.post(
                 result.rows[0];
 
             console.log(
-                'Passenger status updated successfully.',
+                'PASSENGER LOCATION UPDATED SUCCESSFULLY',
             );
 
             console.log(
@@ -641,8 +609,8 @@ router.post(
             );
 
             console.log(
-                'Online:',
-                passenger.is_online,
+                'Firebase UID:',
+                passenger.firebase_uid,
             );
 
             console.log(
@@ -655,18 +623,21 @@ router.post(
                 passenger.current_longitude,
             );
 
+            console.log(
+                'Last location update:',
+                passenger.last_location_update,
+            );
+
             // ------------------------------------------------
             // SUCCESS
             // ------------------------------------------------
 
             return res.status(200).json({
                 success: true,
-
                 message: online
-                    ? 'Passenger is now online.'
+                    ? 'Passenger is now online and location updated.'
                     : 'Passenger is now offline.',
-
-                passenger: passenger,
+                passenger,
             });
         } catch (error) {
             console.error(
@@ -678,14 +649,14 @@ router.post(
                 success: false,
                 code: 'SERVER_ERROR',
                 message:
-                    'Failed to update passenger status.',
+                    'Failed to update passenger status and location.',
             });
         }
     },
 );
 
 // ============================================================
-// EXPORT ROUTER
+// EXPORT
 // ============================================================
 
 export default router;
