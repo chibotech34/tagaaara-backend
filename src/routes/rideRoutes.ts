@@ -101,43 +101,72 @@ async function sendFcmNotification(
     body: string,
     data: Record<string, string>
 ): Promise<void> {
-    if (!token || !token.trim()) {
-        return;
-    }
+    if (!token || !token.trim()) return;
+
+    // Always include title/body in the data payload too, so a tap can
+    // reconstruct the notification even if the OS strips the `notification`
+    // block (which happens on some OEM Android builds).
+    const enrichedData: Record<string, string> = {
+        ...data,
+        title,
+        body,
+    };
 
     try {
         await firebaseMessaging.send({
             token,
+
+            // Rendered by FCM as the tray banner when app is background/killed.
             notification: {
                 title,
                 body,
             },
-            data,
+
+            data: enrichedData,
+
             android: {
                 priority: 'high',
+                ttl: 60 * 1000, // 60s — ride events are time-sensitive
+
                 notification: {
                     channelId: 'tegaara_ride_channel',
+                    priority: 'high' as const,
+                    defaultSound: true,
+                    defaultVibrateTimings: true,
+                    defaultLightSettings: true,
+                    // Ensures the tap is delivered to the Flutter app and
+                    // not swallowed by an OEM launcher.
+                    clickAction: 'FLUTTER_NOTIFICATION_CLICK',
                 },
             },
+
             apns: {
                 headers: {
                     'apns-priority': '10',
+                    'apns-push-type': 'alert',
+                },
+                payload: {
+                    aps: {
+                        alert: {
+                            title,
+                            body,
+                        },
+                        sound: 'default',
+                        badge: 1,
+                        contentAvailable: true,
+                        mutableContent: true,
+                    },
                 },
             },
         });
     } catch (error: any) {
         if (
-            error?.code ===
-            'messaging/invalid-registration-token' ||
-            error?.code ===
-            'messaging/registration-token-not-registered'
+            error?.code === 'messaging/invalid-registration-token' ||
+            error?.code === 'messaging/registration-token-not-registered'
         ) {
             try {
                 await pool.query(
-                    `
-                    DELETE FROM public.fcm_tokens
-                    WHERE token = $1
-                    `,
+                    `DELETE FROM public.fcm_tokens WHERE token = $1`,
                     [token]
                 );
             } catch (deleteError) {
@@ -147,11 +176,7 @@ async function sendFcmNotification(
                 );
             }
         }
-
-        console.error(
-            '❌ FCM notification error:',
-            error
-        );
+        console.error('❌ FCM notification error:', error);
     }
 }
 
@@ -274,18 +299,44 @@ async function notifyNearbyDrivers(
                         body,
                     },
 
-                    data: dataPayload,
+                    // Include title/body in data so taps can reconstruct
+                    // everything even if the OS strips the `notification`
+                    // block on some OEM Android builds.
+                    data: {
+                        ...dataPayload,
+                        title,
+                        body,
+                    },
 
                     android: {
                         priority: 'high',
+                        ttl: 60 * 1000,
                         notification: {
                             channelId: 'tegaara_ride_channel',
+                            priority: 'high',
+                            defaultSound: true,
+                            defaultVibrateTimings: true,
+                            defaultLightSettings: true,
+                            clickAction: 'FLUTTER_NOTIFICATION_CLICK',
                         },
                     },
 
                     apns: {
                         headers: {
                             'apns-priority': '10',
+                            'apns-push-type': 'alert',
+                        },
+                        payload: {
+                            aps: {
+                                alert: {
+                                    title,
+                                    body,
+                                },
+                                sound: 'default',
+                                badge: 1,
+                                contentAvailable: true,
+                                mutableContent: true,
+                            },
                         },
                     },
                 });
@@ -1202,57 +1253,53 @@ router.post(
                         `Your ride has been accepted by ${driverName}. They are on their way.`,
 
                         {
-                            // ── routing metadata ────────────
+                            // ── routing metadata ─────────────────────────
                             role: 'passenger',
                             notificationType: 'ride_accepted',
-                            targetScreen: 'track_ride', // ← MODIFIED
-                            // was 'passenger_home'
-
-                            // ── ride payload ────────────────
-                            rideId: String(rideId),
+                            targetScreen: 'track_ride', // ← matches the Alerts "Rides" card
                             status: 'accepted',
 
-                            // ── driver details ──────────────
-                            driverName: driverName,
-                            driverPhoto:
-                                driver.profile_photo_url || '',
-                            driverLat: driverLat,
-                            driverLng: driverLng,
+                            // ── ride payload ─────────────────────────────
+                            rideId: String(rideId),
 
-                            // ── vehicle details ─────────────
-                            vehicleType:
-                                driver.vehicle_type || '',
-                            vehicleModel:
-                                driver.vehicle_model || '',
-                            vehicleColor:
-                                driver.vehicle_color || '',
-                            vehicleRegistration:
-                                driver.registration_number || '',
+                            // ── driver details ───────────────────────────
+                            driverName,
+                            driverPhoto: driver.profile_photo_url || '',
+                            driverLat,
+                            driverLng,
+
+                            // ── vehicle details ──────────────────────────
+                            vehicleType: driver.vehicle_type || '',
+                            vehicleModel: driver.vehicle_model || '',
+                            vehicleColor: driver.vehicle_color || '',
+                            vehicleRegistration: driver.registration_number || '',
                             vehicleYear:
                                 driver.vehicle_year != null
                                     ? String(driver.vehicle_year)
                                     : '',
 
-                            // ── location details ────────────
-                            pickupAddress:
-                                ride.pickupAddress || '',
-                            destinationAddress:
-                                ride.destinationAddress || '',
+                            // ── location details ─────────────────────────
+                            pickupAddress: ride.pickupAddress || '',
+                            destinationAddress: ride.destinationAddress || '',
                             pickupLat:
-                                ride.pickupLat != null
-                                    ? String(ride.pickupLat)
-                                    : '',
+                                ride.pickupLat != null ? String(ride.pickupLat) : '',
                             pickupLng:
-                                ride.pickupLng != null
-                                    ? String(ride.pickupLng)
-                                    : '',
+                                ride.pickupLng != null ? String(ride.pickupLng) : '',
                             destLat:
-                                ride.destLat != null
-                                    ? String(ride.destLat)
-                                    : '',
+                                ride.destLat != null ? String(ride.destLat) : '',
                             destLng:
-                                ride.destLng != null
-                                    ? String(ride.destLng)
+                                ride.destLng != null ? String(ride.destLng) : '',
+
+                            // ── trip summary (for instant UI paint) ──────
+                            fare:
+                                ride.fare != null ? String(ride.fare) : '',
+                            distanceKm:
+                                ride.distanceKm != null
+                                    ? String(ride.distanceKm)
+                                    : '',
+                            durationMin:
+                                ride.durationMin != null
+                                    ? String(ride.durationMin)
                                     : '',
                         }
                     );
