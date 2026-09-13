@@ -1,6 +1,12 @@
 // src/routes/passengerRoutes.ts
 
-import { Router, Request, Response, NextFunction } from 'express';
+import {
+    Router,
+    Request,
+    Response,
+    NextFunction,
+} from 'express';
+
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
@@ -32,12 +38,17 @@ const verifyFirebaseToken = async (
 ): Promise<void> => {
     const authHeader = req.headers.authorization;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (
+        !authHeader ||
+        !authHeader.startsWith('Bearer ')
+    ) {
         res.status(401).json({
             success: false,
-            message: 'Missing or invalid Authorization header.',
+            message:
+                'Missing or invalid Authorization header.',
             code: 'AUTH_HEADER_MISSING',
         });
+
         return;
     }
 
@@ -48,20 +59,24 @@ const verifyFirebaseToken = async (
     if (!token) {
         res.status(401).json({
             success: false,
-            message: 'Firebase ID token is missing.',
+            message:
+                'Firebase ID token is missing.',
             code: 'AUTH_TOKEN_MISSING',
         });
+
         return;
     }
 
     try {
-        const decoded = await firebaseAuth.verifyIdToken(token);
+        const decoded =
+            await firebaseAuth.verifyIdToken(token);
 
         req.decodedToken = {
             uid: decoded.uid,
             email: decoded.email,
             name: decoded.name,
-            phone_number: decoded.phone_number,
+            phone_number:
+                decoded.phone_number,
         };
 
         next();
@@ -75,19 +90,27 @@ const verifyFirebaseToken = async (
             code?: string;
         };
 
-        if (firebaseError.code === 'auth/id-token-expired') {
+        if (
+            firebaseError.code ===
+            'auth/id-token-expired'
+        ) {
             res.status(401).json({
                 success: false,
-                message: 'Firebase ID token expired.',
-                code: 'AUTH_TOKEN_EXPIRED',
+                message:
+                    'Firebase ID token expired.',
+                code:
+                    'AUTH_TOKEN_EXPIRED',
             });
+
             return;
         }
 
         res.status(401).json({
             success: false,
-            message: 'Firebase authentication failed.',
-            code: 'AUTH_TOKEN_INVALID',
+            message:
+                'Firebase authentication failed.',
+            code:
+                'AUTH_TOKEN_INVALID',
         });
     }
 };
@@ -109,69 +132,81 @@ const getAuthenticatedUid = (
 router.get(
     '/profile',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const result = await pool.query(
-                `
-                SELECT
-                    id,
-                    firebase_uid,
-                    full_name,
-                    phone,
-                    email,
-                    gender,
-                    emergency_contact_name,
-                    emergency_contact_phone,
-                    emergency_relationship,
-                    home_address,
-                    region,
-                    district,
-                    town_city,
-                    saved_locations,
-                    preferred_payment_method,
-                    mobile_money_number,
-                    language_preference,
-                    notification_enabled,
-                    privacy_enabled,
-                    profile_photo_url,
-                    account_status,
-                    phone_verified,
-                    email_verified,
-                    is_online,
-                    last_online_at,
-                    current_latitude,
-                    current_longitude,
-                    last_location_update,
-                    created_at,
-                    updated_at
-                FROM public.passengers
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        firebase_uid,
+                        full_name,
+                        phone,
+                        email,
+                        gender,
+                        emergency_contact_name,
+                        emergency_contact_phone,
+                        emergency_relationship,
+                        home_address,
+                        region,
+                        district,
+                        town_city,
+                        saved_locations,
+                        preferred_payment_method,
+                        mobile_money_number,
+                        language_preference,
+                        notification_enabled,
+                        privacy_enabled,
+                        profile_photo_url,
+                        account_status,
+                        phone_verified,
+                        email_verified,
+                        is_online,
+                        last_online_at,
+                        current_latitude,
+                        current_longitude,
+                        last_location_update,
+                        created_at,
+                        updated_at
+                    FROM public.passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Passenger profile not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    message:
+                        'Passenger profile not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             return res.status(200).json({
                 success: true,
-                passenger: result.rows[0],
+                passenger:
+                    result.rows[0],
             });
         } catch (error: unknown) {
             const e = error as {
@@ -185,9 +220,865 @@ router.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to fetch passenger profile.',
-                code: 'PASSENGER_FETCH_FAILED',
-                error: e.message,
+                message:
+                    'Failed to fetch passenger profile.',
+                code:
+                    'PASSENGER_FETCH_FAILED',
+                error:
+                    e.message,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
+ * PATCH /api/passengers/profile
+ *
+ * Update authenticated passenger profile.
+ *
+ * Firebase UID is ALWAYS taken from the verified Firebase ID token.
+ * It is NEVER accepted from the request body.
+ * ========================================================================== */
+
+router.patch(
+    '/profile',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        const client =
+            await pool.connect();
+
+        let transactionStarted =
+            false;
+
+        try {
+            /* ----------------------------------------------------------------
+             * AUTHENTICATION
+             * ---------------------------------------------------------------- */
+
+            const uid =
+                getAuthenticatedUid(req);
+
+            if (!uid) {
+                client.release();
+
+                return res.status(401).json({
+                    success: false,
+                    message:
+                        'Authentication required.',
+                    code:
+                        'AUTH_REQUIRED',
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * REQUEST BODY
+             * ---------------------------------------------------------------- */
+
+            const body =
+                req.body ?? {};
+
+            if (
+                typeof body !== 'object' ||
+                Array.isArray(body)
+            ) {
+                client.release();
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Request body must be a JSON object.',
+                    code:
+                        'INVALID_REQUEST_BODY',
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * ALLOWED FIELDS
+             * ---------------------------------------------------------------- */
+
+            const allowedFields =
+                new Set([
+                    'full_name',
+                    'email',
+                    'phone',
+                    'phone_number',
+                    'emergency_contact_name',
+                    'emergency_contact_phone',
+                    'saved_locations',
+                    'payment_preference',
+                    'preferred_payment_method',
+                    'language',
+                    'language_preference',
+                    'notifications_enabled',
+                    'notification_enabled',
+                ]);
+
+            /* ----------------------------------------------------------------
+             * UNKNOWN FIELDS
+             * ---------------------------------------------------------------- */
+
+            const receivedFields =
+                Object.keys(body);
+
+            const unknownFields =
+                receivedFields.filter(
+                    (field) =>
+                        !allowedFields.has(
+                            field,
+                        ),
+                );
+
+            if (
+                unknownFields.length > 0
+            ) {
+                client.release();
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'One or more fields cannot be updated.',
+                    code:
+                        'INVALID_PROFILE_FIELDS',
+                    fields:
+                        unknownFields,
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * NOTHING TO UPDATE
+             * ---------------------------------------------------------------- */
+
+            if (
+                receivedFields.length === 0
+            ) {
+                client.release();
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'No profile fields were provided for update.',
+                    code:
+                        'NO_FIELDS_TO_UPDATE',
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * SQL UPDATE ARRAYS
+             * ---------------------------------------------------------------- */
+
+            const updateParts: string[] =
+                [];
+
+            const values: unknown[] =
+                [];
+
+            const addField = (
+                column: string,
+                value: unknown,
+            ): void => {
+                values.push(value);
+
+                updateParts.push(
+                    `${column} = $${values.length}`,
+                );
+            };
+
+            /* ----------------------------------------------------------------
+             * FULL NAME
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'full_name',
+                )
+            ) {
+                const fullName =
+                    String(
+                        body.full_name ?? '',
+                    ).trim();
+
+                if (!fullName) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Full name cannot be empty.',
+                        code:
+                            'INVALID_FULL_NAME',
+                    });
+                }
+
+                if (
+                    fullName.length > 150
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Full name is too long.',
+                        code:
+                            'INVALID_FULL_NAME',
+                    });
+                }
+
+                addField(
+                    'full_name',
+                    fullName,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * EMAIL
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'email',
+                )
+            ) {
+                const email =
+                    String(
+                        body.email ?? '',
+                    )
+                        .trim()
+                        .toLowerCase();
+
+                if (
+                    email &&
+                    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(
+                        email,
+                    )
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Please provide a valid email address.',
+                        code:
+                            'INVALID_EMAIL',
+                    });
+                }
+
+                addField(
+                    'email',
+                    email || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * PHONE
+             * ----------------------------------------------------------------
+             *
+             * NOTE:
+             * Phone authentication should normally control the phone.
+             * This route allows the field because your profile screen
+             * may expose it.
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'phone',
+                )
+            ) {
+                const phone =
+                    String(
+                        body.phone ?? '',
+                    ).trim();
+
+                if (
+                    phone &&
+                    phone.length > 30
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Phone number is invalid.',
+                        code:
+                            'INVALID_PHONE',
+                    });
+                }
+
+                addField(
+                    'phone',
+                    phone || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * PHONE NUMBER
+             *
+             * If your database does NOT have a phone_number column,
+             * do not send this field from Flutter.
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'phone_number',
+                )
+            ) {
+                const phoneNumber =
+                    String(
+                        body.phone_number ??
+                        '',
+                    ).trim();
+
+                if (
+                    phoneNumber &&
+                    phoneNumber.length > 30
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Phone number is invalid.',
+                        code:
+                            'INVALID_PHONE_NUMBER',
+                    });
+                }
+
+                /*
+                 * Your current passengers SELECT uses `phone`,
+                 * not `phone_number`.
+                 *
+                 * Therefore we map phone_number -> phone.
+                 */
+                addField(
+                    'phone',
+                    phoneNumber || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * EMERGENCY CONTACT NAME
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'emergency_contact_name',
+                )
+            ) {
+                const name =
+                    String(
+                        body.emergency_contact_name ??
+                        '',
+                    ).trim();
+
+                if (
+                    name.length > 150
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Emergency contact name is too long.',
+                        code:
+                            'INVALID_EMERGENCY_NAME',
+                    });
+                }
+
+                addField(
+                    'emergency_contact_name',
+                    name || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * EMERGENCY CONTACT PHONE
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'emergency_contact_phone',
+                )
+            ) {
+                const phone =
+                    String(
+                        body.emergency_contact_phone ??
+                        '',
+                    ).trim();
+
+                if (
+                    phone.length > 30
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Emergency contact phone number is invalid.',
+                        code:
+                            'INVALID_EMERGENCY_PHONE',
+                    });
+                }
+
+                addField(
+                    'emergency_contact_phone',
+                    phone || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * SAVED LOCATIONS
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'saved_locations',
+                )
+            ) {
+                const savedLocations =
+                    body.saved_locations;
+
+                if (
+                    !Array.isArray(
+                        savedLocations,
+                    )
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'saved_locations must be an array.',
+                        code:
+                            'INVALID_SAVED_LOCATIONS',
+                    });
+                }
+
+                /*
+                 * Send JSON string and cast to jsonb in SQL.
+                 */
+                values.push(
+                    JSON.stringify(
+                        savedLocations,
+                    ),
+                );
+
+                updateParts.push(
+                    `saved_locations = $${values.length}::jsonb`,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * PAYMENT PREFERENCE
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'payment_preference',
+                )
+            ) {
+                const paymentPreference =
+                    String(
+                        body.payment_preference ??
+                        '',
+                    ).trim();
+
+                if (
+                    paymentPreference.length >
+                    100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Payment preference is too long.',
+                        code:
+                            'INVALID_PAYMENT_PREFERENCE',
+                    });
+                }
+
+                /*
+                 * Map to the actual column used by GET /profile.
+                 */
+                addField(
+                    'preferred_payment_method',
+                    paymentPreference ||
+                    null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * PREFERRED PAYMENT METHOD
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'preferred_payment_method',
+                )
+            ) {
+                const paymentPreference =
+                    String(
+                        body.preferred_payment_method ??
+                        '',
+                    ).trim();
+
+                if (
+                    paymentPreference.length >
+                    100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Preferred payment method is too long.',
+                        code:
+                            'INVALID_PAYMENT_METHOD',
+                    });
+                }
+
+                addField(
+                    'preferred_payment_method',
+                    paymentPreference ||
+                    null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * LANGUAGE
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'language',
+                )
+            ) {
+                const language =
+                    String(
+                        body.language ?? '',
+                    ).trim();
+
+                if (
+                    language.length > 50
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Language value is too long.',
+                        code:
+                            'INVALID_LANGUAGE',
+                    });
+                }
+
+                addField(
+                    'language_preference',
+                    language || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * LANGUAGE PREFERENCE
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'language_preference',
+                )
+            ) {
+                const language =
+                    String(
+                        body.language_preference ??
+                        '',
+                    ).trim();
+
+                if (
+                    language.length > 50
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Language value is too long.',
+                        code:
+                            'INVALID_LANGUAGE',
+                    });
+                }
+
+                addField(
+                    'language_preference',
+                    language || null,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * NOTIFICATIONS
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'notifications_enabled',
+                )
+            ) {
+                const notificationValue =
+                    body.notifications_enabled;
+
+                if (
+                    typeof notificationValue !==
+                    'boolean'
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'notifications_enabled must be true or false.',
+                        code:
+                            'INVALID_NOTIFICATION_VALUE',
+                    });
+                }
+
+                addField(
+                    'notification_enabled',
+                    notificationValue,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * NOTIFICATION ENABLED
+             * ---------------------------------------------------------------- */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'notification_enabled',
+                )
+            ) {
+                const notificationValue =
+                    body.notification_enabled;
+
+                if (
+                    typeof notificationValue !==
+                    'boolean'
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'notification_enabled must be true or false.',
+                        code:
+                            'INVALID_NOTIFICATION_VALUE',
+                    });
+                }
+
+                addField(
+                    'notification_enabled',
+                    notificationValue,
+                );
+            }
+
+            /* ----------------------------------------------------------------
+             * SAFETY CHECK
+             * ---------------------------------------------------------------- */
+
+            if (
+                updateParts.length === 0
+            ) {
+                client.release();
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'No valid profile fields were provided.',
+                    code:
+                        'NO_VALID_FIELDS',
+                });
+            }
+
+            updateParts.push(
+                'updated_at = CURRENT_TIMESTAMP',
+            );
+
+            /* ----------------------------------------------------------------
+             * TRANSACTION
+             * ---------------------------------------------------------------- */
+
+            await client.query(
+                'BEGIN',
+            );
+
+            transactionStarted = true;
+
+            /* ----------------------------------------------------------------
+             * CHECK PASSENGER
+             * ---------------------------------------------------------------- */
+
+            const passengerResult =
+                await client.query(
+                    `
+                    SELECT *
+                    FROM public.passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
+
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
+                client.release();
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Passenger profile not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * ADD UID TO PARAMETERS
+             * ---------------------------------------------------------------- */
+
+            values.push(uid);
+
+            const uidParameter =
+                values.length;
+
+            /* ----------------------------------------------------------------
+             * UPDATE
+             * ---------------------------------------------------------------- */
+
+            const updateResult =
+                await client.query(
+                    `
+                    UPDATE public.passengers
+                    SET
+                        ${updateParts.join(', ')}
+                    WHERE firebase_uid = $${uidParameter}
+                    RETURNING *
+                    `,
+                    values,
+                );
+
+            if (
+                updateResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
+                client.release();
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Passenger profile could not be updated.',
+                    code:
+                        'PROFILE_UPDATE_FAILED',
+                });
+            }
+
+            await client.query(
+                'COMMIT',
+            );
+
+            transactionStarted =
+                false;
+
+            client.release();
+
+            console.log(
+                `✅ Passenger profile updated: ${uid}`,
+            );
+
+            return res.status(200).json({
+                success: true,
+                message:
+                    'Profile updated successfully.',
+                updatedFields:
+                    receivedFields,
+                passenger:
+                    updateResult.rows[0],
+            });
+        } catch (error: unknown) {
+            if (transactionStarted) {
+                try {
+                    await client.query(
+                        'ROLLBACK',
+                    );
+                } catch (
+                rollbackError
+                ) {
+                    console.error(
+                        '❌ Rollback error:',
+                        rollbackError,
+                    );
+                }
+            }
+
+            client.release();
+
+            console.error(
+                '❌ Update passenger profile error:',
+                error,
+            );
+
+            const dbError =
+                error as {
+                    message?: string;
+                    code?: string;
+                    detail?: string;
+                    constraint?: string;
+                };
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Failed to update passenger profile.',
+                code:
+                    dbError.code ||
+                    'PROFILE_UPDATE_FAILED',
+                error:
+                    dbError.message ||
+                    'Unknown database error',
+                detail:
+                    dbError.detail ||
+                    null,
+                constraint:
+                    dbError.constraint ||
+                    null,
             });
         }
     },
@@ -200,70 +1091,74 @@ router.get(
 router.get(
     '/alerts',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const result = await pool.query(
-                `
-                SELECT
-                    id,
-                    user_id,
-                    title,
-                    body,
-                    category,
-                    priority,
-                    is_read,
-                    target_screen,
-                    metadata,
-                    created_at
-                FROM public.alerts
-                WHERE user_id = $1
-                ORDER BY created_at DESC
-                `,
-                [uid],
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        user_id,
+                        title,
+                        body,
+                        category,
+                        priority,
+                        is_read,
+                        target_screen,
+                        metadata,
+                        created_at
+                    FROM public.alerts
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    `,
+                    [uid],
+                );
 
-            const unreadResult = await pool.query(
-                `
-                SELECT COUNT(*)::int AS unread_count
-                FROM public.alerts
-                WHERE user_id = $1
-                  AND is_read = false
-                `,
-                [uid],
-            );
+            const unreadResult =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::int AS unread_count
+                    FROM public.alerts
+                    WHERE user_id = $1
+                      AND is_read = false
+                    `,
+                    [uid],
+                );
 
             const unreadCount =
                 Number(
-                    unreadResult.rows[0]?.unread_count ?? 0,
+                    unreadResult.rows[0]
+                        ?.unread_count ?? 0,
                 );
-
-            console.log(
-                `🔔 /passengers/alerts: ` +
-                `${result.rows.length} alert(s) ` +
-                `for passenger UID ${uid}. ` +
-                `Unread: ${unreadCount}`,
-            );
 
             return res.status(200).json({
                 success: true,
-                count: result.rows.length,
+                count:
+                    result.rows.length,
                 unreadCount,
-                alerts: result.rows,
+                alerts:
+                    result.rows,
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -273,9 +1168,12 @@ router.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to load alerts.',
-                code: 'ALERTS_FETCH_FAILED',
-                error: e.message,
+                message:
+                    'Failed to load alerts.',
+                code:
+                    'ALERTS_FETCH_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -288,19 +1186,28 @@ router.get(
 router.patch(
     '/alerts/:alertId/read',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const alertId = Number(req.params.alertId);
+            const alertId =
+                Number(
+                    req.params.alertId,
+                );
 
             if (
                 !Number.isInteger(alertId) ||
@@ -308,53 +1215,57 @@ router.patch(
             ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Invalid alert ID.',
-                    code: 'INVALID_ALERT_ID',
+                    message:
+                        'Invalid alert ID.',
+                    code:
+                        'INVALID_ALERT_ID',
                 });
             }
 
-            const result = await pool.query(
-                `
-                UPDATE public.alerts
-                SET is_read = true
-                WHERE id = $1
-                  AND user_id = $2
-                RETURNING
-                    id,
-                    user_id,
-                    title,
-                    body,
-                    category,
-                    priority,
-                    is_read,
-                    target_screen,
-                    metadata,
-                    created_at
-                `,
-                [alertId, uid],
-            );
+            const result =
+                await pool.query(
+                    `
+                    UPDATE public.alerts
+                    SET is_read = true
+                    WHERE id = $1
+                      AND user_id = $2
+                    RETURNING
+                        id,
+                        user_id,
+                        title,
+                        body,
+                        category,
+                        priority,
+                        is_read,
+                        target_screen,
+                        metadata,
+                        created_at
+                    `,
+                    [alertId, uid],
+                );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Alert not found.',
-                    code: 'ALERT_NOT_FOUND',
+                    message:
+                        'Alert not found.',
+                    code:
+                        'ALERT_NOT_FOUND',
                 });
             }
-
-            console.log(
-                `✅ Alert ${alertId} marked as read for user ${uid}`,
-            );
 
             return res.status(200).json({
                 success: true,
-                message: 'Alert marked as read.',
-                alert: result.rows[0],
+                message:
+                    'Alert marked as read.',
+                alert:
+                    result.rows[0],
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -364,9 +1275,12 @@ router.patch(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to mark alert as read.',
-                code: 'ALERT_READ_FAILED',
-                error: e.message,
+                message:
+                    'Failed to mark alert as read.',
+                code:
+                    'ALERT_READ_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -379,43 +1293,46 @@ router.patch(
 router.patch(
     '/alerts/read-all',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const result = await pool.query(
-                `
-                UPDATE public.alerts
-                SET is_read = true
-                WHERE user_id = $1
-                  AND is_read = false
-                RETURNING id
-                `,
-                [uid],
-            );
-
-            console.log(
-                `✅ Marked ${result.rows.length} alert(s) as read ` +
-                `for user ${uid}`,
-            );
+            const result =
+                await pool.query(
+                    `
+                    UPDATE public.alerts
+                    SET is_read = true
+                    WHERE user_id = $1
+                      AND is_read = false
+                    RETURNING id
+                    `,
+                    [uid],
+                );
 
             return res.status(200).json({
                 success: true,
-                message: 'All alerts marked as read.',
-                updatedCount: result.rows.length,
+                message:
+                    'All alerts marked as read.',
+                updatedCount:
+                    result.rows.length,
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -425,9 +1342,12 @@ router.patch(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to mark all alerts as read.',
-                code: 'ALERTS_READ_ALL_FAILED',
-                error: e.message,
+                message:
+                    'Failed to mark all alerts as read.',
+                code:
+                    'ALERTS_READ_ALL_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -440,19 +1360,28 @@ router.patch(
 router.delete(
     '/alerts/:alertId',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const alertId = Number(req.params.alertId);
+            const alertId =
+                Number(
+                    req.params.alertId,
+                );
 
             if (
                 !Number.isInteger(alertId) ||
@@ -460,42 +1389,46 @@ router.delete(
             ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'Invalid alert ID.',
-                    code: 'INVALID_ALERT_ID',
+                    message:
+                        'Invalid alert ID.',
+                    code:
+                        'INVALID_ALERT_ID',
                 });
             }
 
-            const result = await pool.query(
-                `
-                DELETE FROM public.alerts
-                WHERE id = $1
-                  AND user_id = $2
-                RETURNING id
-                `,
-                [alertId, uid],
-            );
+            const result =
+                await pool.query(
+                    `
+                    DELETE FROM public.alerts
+                    WHERE id = $1
+                      AND user_id = $2
+                    RETURNING id
+                    `,
+                    [alertId, uid],
+                );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Alert not found.',
-                    code: 'ALERT_NOT_FOUND',
+                    message:
+                        'Alert not found.',
+                    code:
+                        'ALERT_NOT_FOUND',
                 });
             }
-
-            console.log(
-                `🗑️ Alert ${alertId} deleted for user ${uid}`,
-            );
 
             return res.status(200).json({
                 success: true,
-                message: 'Alert deleted successfully.',
-                deletedId: alertId,
+                message:
+                    'Alert deleted successfully.',
+                deletedId:
+                    alertId,
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -505,9 +1438,12 @@ router.delete(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to delete alert.',
-                code: 'ALERT_DELETE_FAILED',
-                error: e.message,
+                message:
+                    'Failed to delete alert.',
+                code:
+                    'ALERT_DELETE_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -520,41 +1456,44 @@ router.delete(
 router.delete(
     '/alerts',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const result = await pool.query(
-                `
-                DELETE FROM public.alerts
-                WHERE user_id = $1
-                RETURNING id
-                `,
-                [uid],
-            );
-
-            console.log(
-                `🗑️ Deleted ${result.rows.length} alert(s) ` +
-                `for user ${uid}`,
-            );
+            const result =
+                await pool.query(
+                    `
+                    DELETE FROM public.alerts
+                    WHERE user_id = $1
+                    RETURNING id
+                    `,
+                    [uid],
+                );
 
             return res.status(200).json({
                 success: true,
-                message: 'All alerts cleared successfully.',
-                deletedCount: result.rows.length,
+                message:
+                    'All alerts cleared successfully.',
+                deletedCount:
+                    result.rows.length,
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -564,9 +1503,12 @@ router.delete(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to clear alerts.',
-                code: 'ALERTS_CLEAR_FAILED',
-                error: e.message,
+                message:
+                    'Failed to clear alerts.',
+                code:
+                    'ALERTS_CLEAR_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -579,15 +1521,21 @@ router.delete(
 router.post(
     '/update-status',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
@@ -597,105 +1545,100 @@ router.post(
                 longitude,
             } = req.body ?? {};
 
-            if (typeof isOnline !== 'boolean') {
+            if (
+                typeof isOnline !==
+                'boolean'
+            ) {
                 return res.status(400).json({
                     success: false,
-                    message: 'isOnline must be a boolean.',
-                    code: 'INVALID_STATUS',
+                    message:
+                        'isOnline must be a boolean.',
+                    code:
+                        'INVALID_STATUS',
                 });
             }
 
             const hasCoords =
                 latitude !== undefined &&
                 longitude !== undefined &&
-                Number.isFinite(Number(latitude)) &&
-                Number.isFinite(Number(longitude));
-
-            const result = hasCoords
-                ? await pool.query(
-                    `
-                    UPDATE public.passengers
-                    SET
-                        is_online = $1,
-                        current_latitude = $2::numeric,
-                        current_longitude = $3::numeric,
-                        last_location_update = NOW(),
-                        last_online_at = NOW(),
-                        updated_at = NOW()
-                    WHERE firebase_uid = $4
-                    RETURNING
-                        id,
-                        firebase_uid,
-                        is_online,
-                        current_latitude,
-                        current_longitude,
-                        last_online_at
-                    `,
-                    [
-                        isOnline,
-                        Number(latitude),
-                        Number(longitude),
-                        uid,
-                    ],
-                )
-                : await pool.query(
-                    `
-                    UPDATE public.passengers
-                    SET
-                        is_online = $1,
-                        last_online_at = NOW(),
-                        updated_at = NOW()
-                    WHERE firebase_uid = $2
-                    RETURNING
-                        id,
-                        firebase_uid,
-                        is_online,
-                        last_online_at
-                    `,
-                    [
-                        isOnline,
-                        uid,
-                    ],
+                Number.isFinite(
+                    Number(latitude),
+                ) &&
+                Number.isFinite(
+                    Number(longitude),
                 );
 
-            if (result.rows.length === 0) {
+            const result =
+                hasCoords
+                    ? await pool.query(
+                        `
+                        UPDATE public.passengers
+                        SET
+                            is_online = $1,
+                            current_latitude = $2::numeric,
+                            current_longitude = $3::numeric,
+                            last_location_update = NOW(),
+                            last_online_at = NOW(),
+                            updated_at = NOW()
+                        WHERE firebase_uid = $4
+                        RETURNING
+                            id,
+                            firebase_uid,
+                            is_online,
+                            current_latitude,
+                            current_longitude,
+                            last_online_at
+                        `,
+                        [
+                            isOnline,
+                            Number(latitude),
+                            Number(longitude),
+                            uid,
+                        ],
+                    )
+                    : await pool.query(
+                        `
+                        UPDATE public.passengers
+                        SET
+                            is_online = $1,
+                            last_online_at = NOW(),
+                            updated_at = NOW()
+                        WHERE firebase_uid = $2
+                        RETURNING
+                            id,
+                            firebase_uid,
+                            is_online,
+                            last_online_at
+                        `,
+                        [
+                            isOnline,
+                            uid,
+                        ],
+                    );
+
+            if (
+                result.rows.length === 0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Passenger not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    message:
+                        'Passenger not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             console.log(
-                'PASSENGER LOCATION UPDATED SUCCESSFULLY',
+                '✅ PASSENGER LOCATION UPDATED',
+                result.rows[0],
             );
-
-            console.log(
-                'Passenger ID:',
-                result.rows[0].id,
-            );
-
-            console.log(
-                'Firebase UID:',
-                result.rows[0].firebase_uid,
-            );
-
-            if (hasCoords) {
-                console.log(
-                    'Latitude:',
-                    result.rows[0].current_latitude,
-                );
-
-                console.log(
-                    'Longitude:',
-                    result.rows[0].current_longitude,
-                );
-            }
 
             return res.status(200).json({
                 success: true,
-                message: 'Passenger status updated.',
-                passenger: result.rows[0],
+                message:
+                    'Passenger status updated.',
+                passenger:
+                    result.rows[0],
             });
         } catch (error: unknown) {
             const e = error as {
@@ -709,9 +1652,12 @@ router.post(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to update passenger status.',
-                code: 'STATUS_UPDATE_FAILED',
-                error: e.message,
+                message:
+                    'Failed to update passenger status.',
+                code:
+                    'STATUS_UPDATE_FAILED',
+                error:
+                    e.message,
             });
         }
     },
@@ -719,17 +1665,15 @@ router.post(
 
 /* ==========================================================================
  * GET /api/passengers/nearby
- *
- * Query:
- *   lat
- *   lng
- *   radius
  * ========================================================================== */
 
 router.get(
     '/nearby',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
             const {
                 lat,
@@ -744,25 +1688,38 @@ router.get(
                 return res.status(400).json({
                     success: false,
                     message:
-                        'Missing required query params: lat and lng',
-                    code: 'MISSING_PARAMETERS',
+                        'Missing required query params: lat and lng.',
+                    code:
+                        'MISSING_PARAMETERS',
                 });
             }
 
-            const latitude = Number(lat);
-            const longitude = Number(lng);
-            const searchRadius = Number(radius);
+            const latitude =
+                Number(lat);
+
+            const longitude =
+                Number(lng);
+
+            const searchRadius =
+                Number(radius);
 
             if (
-                !Number.isFinite(latitude) ||
-                !Number.isFinite(longitude) ||
-                !Number.isFinite(searchRadius)
+                !Number.isFinite(
+                    latitude,
+                ) ||
+                !Number.isFinite(
+                    longitude,
+                ) ||
+                !Number.isFinite(
+                    searchRadius,
+                )
             ) {
                 return res.status(400).json({
                     success: false,
                     message:
-                        'Invalid numeric values for lat, lng, or radius',
-                    code: 'INVALID_PARAMETERS',
+                        'Invalid numeric values for lat, lng, or radius.',
+                    code:
+                        'INVALID_PARAMETERS',
                 });
             }
 
@@ -833,10 +1790,8 @@ router.get(
                         current_longitude,
                         is_online,
                         last_online_at,
-                        current_latitude::double precision
-                            AS lat_num,
-                        current_longitude::double precision
-                            AS lng_num
+                        current_latitude::double precision AS lat_num,
+                        current_longitude::double precision AS lng_num
                     FROM public.passengers
                     WHERE is_online = true
                       AND account_status = 'active'
@@ -888,8 +1843,7 @@ router.get(
                     current_longitude,
                     is_online,
                     last_online_at,
-                    ROUND(distance_meters)::int
-                        AS distance_meters
+                    ROUND(distance_meters)::int AS distance_meters
                 FROM distances
                 WHERE distance_meters <= $3::double precision
                 ORDER BY distance_meters ASC
@@ -905,46 +1859,46 @@ router.get(
             let result;
 
             try {
-                result = await pool.query(
-                    postgisQuery,
-                    params,
-                );
-            } catch (postgisErr: unknown) {
-                const pe = postgisErr as {
-                    code?: string;
-                    message?: string;
-                };
+                result =
+                    await pool.query(
+                        postgisQuery,
+                        params,
+                    );
+            } catch (
+            postgisErr: unknown
+            ) {
+                const pe =
+                    postgisErr as {
+                        code?: string;
+                        message?: string;
+                    };
 
                 if (
                     pe.code === '42883' ||
                     pe.code === '42703'
                 ) {
                     console.warn(
-                        '⚠️ PostGIS unavailable, falling back ' +
-                        'to Haversine.',
+                        '⚠️ PostGIS unavailable. ' +
+                        'Falling back to Haversine.',
                         pe.message,
                     );
 
-                    result = await pool.query(
-                        haversineQuery,
-                        params,
-                    );
+                    result =
+                        await pool.query(
+                            haversineQuery,
+                            params,
+                        );
                 } else {
                     throw postgisErr;
                 }
             }
 
-            console.log(
-                `📍 /passengers/nearby returned ` +
-                `${result.rows.length} passenger(s) within ` +
-                `${searchRadius} m of ` +
-                `(${latitude}, ${longitude})`,
-            );
-
             return res.status(200).json({
                 success: true,
-                count: result.rows.length,
-                passengers: result.rows,
+                count:
+                    result.rows.length,
+                passengers:
+                    result.rows,
             });
         } catch (error: unknown) {
             const e = error as {
@@ -960,123 +1914,113 @@ router.get(
             return res.status(500).json({
                 success: false,
                 message:
-                    'Failed to fetch nearby passengers',
-                code: 'NEARBY_PASSENGERS_FAILED',
-                error: e.message,
+                    'Failed to fetch nearby passengers.',
+                code:
+                    'NEARBY_PASSENGERS_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
 
-
-/* ==========================================================================
- * WALLET ROUTES
- *
- * Authentication:
- *   Firebase ID token
- *
- * IMPORTANT:
- * Firebase UID is NEVER accepted from Flutter.
- *
- * The UID always comes from:
- *
- *   req.decodedToken.uid
- *
- * Database:
- *
- *   Firebase UID
- *        ↓
- *   passengers.firebase_uid
- *        ↓
- *   passengers.id
- *        ↓
- *   wallets.passenger_id
- *        ↓
- *   transactions.wallet_id
- * ========================================================================== */
-
-
 /* ==========================================================================
  * GET /api/passengers/wallet
- *
- * Returns authenticated passenger wallet.
  * ========================================================================== */
 
 router.get(
     '/wallet',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const passengerResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    firebase_uid,
-                    full_name,
-                    phone,
-                    email
-                FROM public.passengers
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const passengerResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        firebase_uid,
+                        full_name,
+                        phone,
+                        email
+                    FROM public.passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-            if (passengerResult.rows.length === 0) {
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Passenger account not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    message:
+                        'Passenger account not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             const passenger =
                 passengerResult.rows[0];
 
-            const walletResult = await pool.query(
-                `
-                SELECT
-                    id,
-                    passenger_id,
-                    balance,
-                    pending_balance,
-                    total_spent,
-                    last_transaction_at,
-                    created_at,
-                    updated_at
-                FROM public.wallets
-                WHERE passenger_id = $1
-                LIMIT 1
-                `,
-                [passenger.id],
-            );
+            const walletResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        passenger_id,
+                        balance,
+                        pending_balance,
+                        total_spent,
+                        last_transaction_at,
+                        created_at,
+                        updated_at
+                    FROM public.wallets
+                    WHERE passenger_id = $1
+                    LIMIT 1
+                    `,
+                    [passenger.id],
+                );
 
-            if (walletResult.rows.length === 0) {
+            if (
+                walletResult.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Wallet not found.',
-                    code: 'WALLET_NOT_FOUND',
+                    message:
+                        'Wallet not found.',
+                    code:
+                        'WALLET_NOT_FOUND',
                 });
             }
 
             return res.status(200).json({
                 success: true,
-                wallet: walletResult.rows[0],
+                wallet:
+                    walletResult.rows[0],
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -1086,126 +2030,145 @@ router.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to fetch wallet.',
-                code: 'WALLET_FETCH_FAILED',
-                error: e.message,
+                message:
+                    'Failed to fetch wallet.',
+                code:
+                    'WALLET_FETCH_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
 
-
 /* ==========================================================================
  * POST /api/passengers/wallet
- *
- * Creates wallet if it does not already exist.
  * ========================================================================== */
 
 router.post(
     '/wallet',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const passengerResult = await pool.query(
-                `
-                SELECT id
-                FROM public.passengers
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const passengerResult =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM public.passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-            if (passengerResult.rows.length === 0) {
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Passenger account not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    message:
+                        'Passenger account not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             const passengerId =
                 passengerResult.rows[0].id;
 
-            const existingWallet = await pool.query(
-                `
-                SELECT
-                    id,
-                    passenger_id,
-                    balance,
-                    pending_balance,
-                    total_spent,
-                    last_transaction_at,
-                    created_at,
-                    updated_at
-                FROM public.wallets
-                WHERE passenger_id = $1
-                LIMIT 1
-                `,
-                [passengerId],
-            );
+            const existingWallet =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        passenger_id,
+                        balance,
+                        pending_balance,
+                        total_spent,
+                        last_transaction_at,
+                        created_at,
+                        updated_at
+                    FROM public.wallets
+                    WHERE passenger_id = $1
+                    LIMIT 1
+                    `,
+                    [passengerId],
+                );
 
-            if (existingWallet.rows.length > 0) {
+            if (
+                existingWallet.rows.length >
+                0
+            ) {
                 return res.status(200).json({
                     success: true,
-                    message: 'Wallet already exists.',
-                    wallet: existingWallet.rows[0],
-                    alreadyExists: true,
+                    message:
+                        'Wallet already exists.',
+                    wallet:
+                        existingWallet.rows[0],
+                    alreadyExists:
+                        true,
                 });
             }
 
-            const walletResult = await pool.query(
-                `
-                INSERT INTO public.wallets (
-                    passenger_id,
-                    balance,
-                    pending_balance,
-                    total_spent,
-                    last_transaction_at,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    $1,
-                    0.00,
-                    0.00,
-                    0.00,
-                    NULL,
-                    NOW(),
-                    NOW()
-                )
-                RETURNING
-                    id,
-                    passenger_id,
-                    balance,
-                    pending_balance,
-                    total_spent,
-                    last_transaction_at,
-                    created_at,
-                    updated_at
-                `,
-                [passengerId],
-            );
-
-            console.log(
-                `✅ Wallet created for passenger ${passengerId}`,
-            );
+            const walletResult =
+                await pool.query(
+                    `
+                    INSERT INTO public.wallets (
+                        passenger_id,
+                        balance,
+                        pending_balance,
+                        total_spent,
+                        last_transaction_at,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (
+                        $1,
+                        0.00,
+                        0.00,
+                        0.00,
+                        NULL,
+                        NOW(),
+                        NOW()
+                    )
+                    RETURNING
+                        id,
+                        passenger_id,
+                        balance,
+                        pending_balance,
+                        total_spent,
+                        last_transaction_at,
+                        created_at,
+                        updated_at
+                    `,
+                    [passengerId],
+                );
 
             return res.status(201).json({
                 success: true,
-                message: 'Wallet created successfully.',
-                wallet: walletResult.rows[0],
-                alreadyExists: false,
+                message:
+                    'Wallet created successfully.',
+                wallet:
+                    walletResult.rows[0],
+                alreadyExists:
+                    false,
             });
         } catch (error: unknown) {
             const e = error as {
@@ -1218,65 +2181,77 @@ router.post(
                 e,
             );
 
-            if (e.code === '23505') {
+            if (
+                e.code === '23505'
+            ) {
                 return res.status(409).json({
                     success: false,
-                    message: 'Wallet already exists.',
-                    code: 'WALLET_ALREADY_EXISTS',
+                    message:
+                        'Wallet already exists.',
+                    code:
+                        'WALLET_ALREADY_EXISTS',
                 });
             }
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to create wallet.',
-                code: 'WALLET_CREATE_FAILED',
-                error: e.message,
+                message:
+                    'Failed to create wallet.',
+                code:
+                    'WALLET_CREATE_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
 
-
 /* ==========================================================================
  * GET /api/passengers/transactions
- *
- * Query:
- *   type
- *   status
- *   page
- *   limit
  * ========================================================================== */
 
 router.get(
     '/transactions',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
         try {
-            const uid = getAuthenticatedUid(req);
+            const uid =
+                getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
-            const passengerResult = await pool.query(
-                `
-                SELECT id
-                FROM public.passengers
-                WHERE firebase_uid = $1
-                LIMIT 1
-                `,
-                [uid],
-            );
+            const passengerResult =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM public.passengers
+                    WHERE firebase_uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-            if (passengerResult.rows.length === 0) {
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    message: 'Passenger account not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    message:
+                        'Passenger account not found.',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
@@ -1284,10 +2259,14 @@ router.get(
                 passengerResult.rows[0].id;
 
             let page =
-                Number(req.query.page ?? 1);
+                Number(
+                    req.query.page ?? 1,
+                );
 
             let limit =
-                Number(req.query.limit ?? 20);
+                Number(
+                    req.query.limit ?? 20,
+                );
 
             if (
                 !Number.isFinite(page) ||
@@ -1303,32 +2282,39 @@ router.get(
                 limit = 20;
             }
 
-            page = Math.floor(page);
-            limit = Math.min(
-                Math.floor(limit),
-                100,
-            );
+            page =
+                Math.floor(page);
+
+            limit =
+                Math.min(
+                    Math.floor(limit),
+                    100,
+                );
 
             const offset =
                 (page - 1) * limit;
 
             const type =
-                typeof req.query.type === 'string'
+                typeof req.query.type ===
+                    'string'
                     ? req.query.type.trim()
                     : null;
 
             const status =
-                typeof req.query.status === 'string'
+                typeof req.query.status ===
+                    'string'
                     ? req.query.status.trim()
                     : null;
 
-            const conditions: string[] = [
-                't.passenger_id = $1',
-            ];
+            const conditions: string[] =
+                [
+                    't.passenger_id = $1',
+                ];
 
-            const values: unknown[] = [
-                passengerId,
-            ];
+            const values: unknown[] =
+                [
+                    passengerId,
+                ];
 
             let parameterIndex = 2;
 
@@ -1338,6 +2324,7 @@ router.get(
                 );
 
                 values.push(type);
+
                 parameterIndex++;
             }
 
@@ -1347,6 +2334,7 @@ router.get(
                 );
 
                 values.push(status);
+
                 parameterIndex++;
             }
 
@@ -1384,18 +2372,21 @@ router.get(
                 OFFSET $${offsetParameter}
             `;
 
-            const result = await pool.query(
-                transactionQuery,
-                values,
-            );
+            const result =
+                await pool.query(
+                    transactionQuery,
+                    values,
+                );
 
-            const countValues: unknown[] = [
-                passengerId,
-            ];
+            const countValues: unknown[] =
+                [
+                    passengerId,
+                ];
 
-            const countConditions: string[] = [
-                'passenger_id = $1',
-            ];
+            const countConditions: string[] =
+                [
+                    'passenger_id = $1',
+                ];
 
             let countParameterIndex = 2;
 
@@ -1405,6 +2396,7 @@ router.get(
                 );
 
                 countValues.push(type);
+
                 countParameterIndex++;
             }
 
@@ -1416,34 +2408,42 @@ router.get(
                 countValues.push(status);
             }
 
-            const countResult = await pool.query(
-                `
-                SELECT COUNT(*)::int AS total
-                FROM public.transactions
-                WHERE ${countConditions.join(' AND ')}
-                `,
-                countValues,
-            );
+            const countResult =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::int AS total
+                    FROM public.transactions
+                    WHERE ${countConditions.join(
+                        ' AND ',
+                    )}
+                    `,
+                    countValues,
+                );
 
             const total =
                 Number(
-                    countResult.rows[0]?.total ?? 0,
+                    countResult.rows[0]
+                        ?.total ?? 0,
                 );
 
             return res.status(200).json({
                 success: true,
-                transactions: result.rows,
-                count: result.rows.length,
+                transactions:
+                    result.rows,
+                count:
+                    result.rows.length,
                 page,
                 limit,
                 total,
                 totalPages:
-                    Math.ceil(total / limit),
+                    Math.ceil(
+                        total / limit,
+                    ),
             });
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
-                code?: string;
             };
 
             console.error(
@@ -1453,40 +2453,42 @@ router.get(
 
             return res.status(500).json({
                 success: false,
-                message: 'Failed to fetch transactions.',
-                code: 'TRANSACTIONS_FETCH_FAILED',
-                error: e.message,
+                message:
+                    'Failed to fetch transactions.',
+                code:
+                    'TRANSACTIONS_FETCH_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
 
-
 /* ==========================================================================
  * POST /api/passengers/wallet/topup
  *
- * Body:
- *
- * {
- *   amount: number,
- *   payment_method: string,
- *   provider: string
- * }
- *
  * IMPORTANT:
- * This endpoint immediately credits the wallet.
+ * This route immediately credits the wallet.
  *
- * For production Mobile Money integration, the wallet should only be
- * credited after the payment provider confirms the transaction.
+ * For real Mobile Money production:
+ * 1. Initiate payment.
+ * 2. Wait for provider confirmation.
+ * 3. Verify provider transaction.
+ * 4. Then credit wallet.
  * ========================================================================== */
 
 router.post(
     '/wallet/topup',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
-        const client = await pool.connect();
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        const client =
+            await pool.connect();
 
-        let transactionStarted = false;
+        let transactionStarted =
+            false;
 
         try {
             const uid =
@@ -1497,21 +2499,29 @@ router.post(
 
                 return res.status(401).json({
                     success: false,
-                    message: 'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    message:
+                        'Authenticated user not found.',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
             const amount =
-                Number(req.body?.amount);
+                Number(
+                    req.body?.amount,
+                );
 
             const paymentMethod =
-                typeof req.body?.payment_method === 'string'
+                typeof req.body
+                    ?.payment_method ===
+                    'string'
                     ? req.body.payment_method.trim()
                     : null;
 
             const provider =
-                typeof req.body?.provider === 'string'
+                typeof req.body
+                    ?.provider ===
+                    'string'
                     ? req.body.provider.trim()
                     : null;
 
@@ -1525,24 +2535,31 @@ router.post(
                     success: false,
                     message:
                         'Top-up amount must be greater than zero.',
-                    code: 'INVALID_AMOUNT',
+                    code:
+                        'INVALID_AMOUNT',
                 });
             }
 
-            if (amount > 100000) {
+            if (
+                amount > 100000
+            ) {
                 client.release();
 
                 return res.status(400).json({
                     success: false,
                     message:
                         'Top-up amount is too large.',
-                    code: 'AMOUNT_TOO_LARGE',
+                    code:
+                        'AMOUNT_TOO_LARGE',
                 });
             }
 
-            await client.query('BEGIN');
+            await client.query(
+                'BEGIN',
+            );
 
-            transactionStarted = true;
+            transactionStarted =
+                true;
 
             const passengerResult =
                 await client.query(
@@ -1555,16 +2572,25 @@ router.post(
                     [uid],
                 );
 
-            if (passengerResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                transactionStarted = false;
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
                 client.release();
 
                 return res.status(404).json({
                     success: false,
                     message:
                         'Passenger account not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
@@ -1590,15 +2616,25 @@ router.post(
                     [passengerId],
                 );
 
-            if (walletResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                transactionStarted = false;
+            if (
+                walletResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
                 client.release();
 
                 return res.status(404).json({
                     success: false,
-                    message: 'Wallet not found.',
-                    code: 'WALLET_NOT_FOUND',
+                    message:
+                        'Wallet not found.',
+                    code:
+                        'WALLET_NOT_FOUND',
                 });
             }
 
@@ -1606,10 +2642,13 @@ router.post(
                 walletResult.rows[0];
 
             const balanceBefore =
-                Number(wallet.balance);
+                Number(
+                    wallet.balance,
+                );
 
             const balanceAfter =
-                balanceBefore + amount;
+                balanceBefore +
+                amount;
 
             const updatedWalletResult =
                 await client.query(
@@ -1701,14 +2740,18 @@ router.post(
                         balanceAfter,
                         'Wallet top-up',
                         JSON.stringify({
-                            firebase_uid: uid,
+                            firebase_uid:
+                                uid,
                         }),
                     ],
                 );
 
-            await client.query('COMMIT');
+            await client.query(
+                'COMMIT',
+            );
 
-            transactionStarted = false;
+            transactionStarted =
+                false;
 
             client.release();
 
@@ -1724,15 +2767,26 @@ router.post(
                 message:
                     'Wallet topped up successfully.',
                 wallet:
-                    updatedWalletResult.rows[0],
+                    updatedWalletResult
+                        .rows[0],
                 transaction:
-                    transactionResult.rows[0],
+                    transactionResult
+                        .rows[0],
             });
         } catch (error: unknown) {
             if (transactionStarted) {
                 try {
-                    await client.query('ROLLBACK');
-                } catch (_) { }
+                    await client.query(
+                        'ROLLBACK',
+                    );
+                } catch (
+                rollbackError
+                ) {
+                    console.error(
+                        '❌ Rollback error:',
+                        rollbackError,
+                    );
+                }
             }
 
             client.release();
@@ -1751,13 +2805,14 @@ router.post(
                 success: false,
                 message:
                     'Failed to process wallet top-up.',
-                code: 'WALLET_TOPUP_FAILED',
-                error: e.message,
+                code:
+                    'WALLET_TOPUP_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
-
 
 /* ==========================================================================
  * POST /api/passengers/wallet/pay
@@ -1765,18 +2820,23 @@ router.post(
  * Body:
  *
  * {
- *   ride_id: number,
- *   amount: number
+ *   "ride_id": 123,
+ *   "amount": 15
  * }
  * ========================================================================== */
 
 router.post(
     '/wallet/pay',
     verifyFirebaseToken,
-    async (req: AuthenticatedRequest, res: Response) => {
-        const client = await pool.connect();
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        const client =
+            await pool.connect();
 
-        let transactionStarted = false;
+        let transactionStarted =
+            false;
 
         try {
             const uid =
@@ -1789,26 +2849,35 @@ router.post(
                     success: false,
                     message:
                         'Authenticated user not found.',
-                    code: 'AUTH_USER_MISSING',
+                    code:
+                        'AUTH_USER_MISSING',
                 });
             }
 
             const rideId =
-                Number(req.body?.ride_id);
+                Number(
+                    req.body?.ride_id,
+                );
 
             const amount =
-                Number(req.body?.amount);
+                Number(
+                    req.body?.amount,
+                );
 
             if (
-                !Number.isInteger(rideId) ||
+                !Number.isInteger(
+                    rideId,
+                ) ||
                 rideId <= 0
             ) {
                 client.release();
 
                 return res.status(400).json({
                     success: false,
-                    message: 'Invalid ride ID.',
-                    code: 'INVALID_RIDE_ID',
+                    message:
+                        'Invalid ride ID.',
+                    code:
+                        'INVALID_RIDE_ID',
                 });
             }
 
@@ -1822,13 +2891,21 @@ router.post(
                     success: false,
                     message:
                         'Payment amount must be greater than zero.',
-                    code: 'INVALID_AMOUNT',
+                    code:
+                        'INVALID_AMOUNT',
                 });
             }
 
-            await client.query('BEGIN');
+            await client.query(
+                'BEGIN',
+            );
 
-            transactionStarted = true;
+            transactionStarted =
+                true;
+
+            /* ----------------------------------------------------------------
+             * PASSENGER
+             * ---------------------------------------------------------------- */
 
             const passengerResult =
                 await client.query(
@@ -1841,21 +2918,77 @@ router.post(
                     [uid],
                 );
 
-            if (passengerResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                transactionStarted = false;
+            if (
+                passengerResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
                 client.release();
 
                 return res.status(404).json({
                     success: false,
                     message:
                         'Passenger account not found.',
-                    code: 'PASSENGER_NOT_FOUND',
+                    code:
+                        'PASSENGER_NOT_FOUND',
                 });
             }
 
             const passengerId =
                 passengerResult.rows[0].id;
+
+            /* ----------------------------------------------------------------
+             * VERIFY RIDE BELONGS TO PASSENGER
+             * ---------------------------------------------------------------- */
+
+            const rideResult =
+                await client.query(
+                    `
+                    SELECT
+                        id,
+                        passenger_id
+                    FROM public.rides
+                    WHERE id = $1
+                      AND passenger_id = $2
+                    LIMIT 1
+                    `,
+                    [
+                        rideId,
+                        passengerId,
+                    ],
+                );
+
+            if (
+                rideResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
+                client.release();
+
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Ride not found for this passenger.',
+                    code:
+                        'RIDE_NOT_FOUND',
+                });
+            }
+
+            /* ----------------------------------------------------------------
+             * WALLET
+             * ---------------------------------------------------------------- */
 
             const walletResult =
                 await client.query(
@@ -1876,15 +3009,25 @@ router.post(
                     [passengerId],
                 );
 
-            if (walletResult.rows.length === 0) {
-                await client.query('ROLLBACK');
-                transactionStarted = false;
+            if (
+                walletResult.rows.length ===
+                0
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
                 client.release();
 
                 return res.status(404).json({
                     success: false,
-                    message: 'Wallet not found.',
-                    code: 'WALLET_NOT_FOUND',
+                    message:
+                        'Wallet not found.',
+                    code:
+                        'WALLET_NOT_FOUND',
                 });
             }
 
@@ -1892,29 +3035,47 @@ router.post(
                 walletResult.rows[0];
 
             const balanceBefore =
-                Number(wallet.balance);
+                Number(
+                    wallet.balance,
+                );
 
-            if (balanceBefore < amount) {
-                await client.query('ROLLBACK');
-                transactionStarted = false;
+            if (
+                balanceBefore < amount
+            ) {
+                await client.query(
+                    'ROLLBACK',
+                );
+
+                transactionStarted =
+                    false;
+
                 client.release();
 
                 return res.status(400).json({
                     success: false,
                     message:
                         'Insufficient wallet balance.',
-                    code: 'INSUFFICIENT_BALANCE',
-                    balance: balanceBefore,
-                    required: amount,
+                    code:
+                        'INSUFFICIENT_BALANCE',
+                    balance:
+                        balanceBefore,
+                    required:
+                        amount,
                 });
             }
 
             const balanceAfter =
-                balanceBefore - amount;
+                balanceBefore -
+                amount;
 
             const totalSpent =
-                Number(wallet.total_spent) +
-                amount;
+                Number(
+                    wallet.total_spent,
+                ) + amount;
+
+            /* ----------------------------------------------------------------
+             * UPDATE WALLET
+             * ---------------------------------------------------------------- */
 
             const updatedWalletResult =
                 await client.query(
@@ -1942,6 +3103,10 @@ router.post(
                         wallet.id,
                     ],
                 );
+
+            /* ----------------------------------------------------------------
+             * CREATE TRANSACTION
+             * ---------------------------------------------------------------- */
 
             const transactionResult =
                 await client.query(
@@ -2007,14 +3172,18 @@ router.post(
                         balanceAfter,
                         'Ride payment',
                         JSON.stringify({
-                            firebase_uid: uid,
+                            firebase_uid:
+                                uid,
                         }),
                     ],
                 );
 
-            await client.query('COMMIT');
+            await client.query(
+                'COMMIT',
+            );
 
-            transactionStarted = false;
+            transactionStarted =
+                false;
 
             client.release();
 
@@ -2031,15 +3200,26 @@ router.post(
                 message:
                     'Ride payment completed successfully.',
                 wallet:
-                    updatedWalletResult.rows[0],
+                    updatedWalletResult
+                        .rows[0],
                 transaction:
-                    transactionResult.rows[0],
+                    transactionResult
+                        .rows[0],
             });
         } catch (error: unknown) {
             if (transactionStarted) {
                 try {
-                    await client.query('ROLLBACK');
-                } catch (_) { }
+                    await client.query(
+                        'ROLLBACK',
+                    );
+                } catch (
+                rollbackError
+                ) {
+                    console.error(
+                        '❌ Rollback error:',
+                        rollbackError,
+                    );
+                }
             }
 
             client.release();
@@ -2058,13 +3238,14 @@ router.post(
                 success: false,
                 message:
                     'Failed to process wallet payment.',
-                code: 'WALLET_PAYMENT_FAILED',
-                error: e.message,
+                code:
+                    'WALLET_PAYMENT_FAILED',
+                error:
+                    e.message,
             });
         }
     },
 );
-
 
 /* ==========================================================================
  * EXPORT ROUTER
