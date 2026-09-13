@@ -371,6 +371,17 @@ router.get(
 //     "longitude": -2.5072
 // }
 //
+// NOTE:
+//   We cast every parameter explicitly in SQL
+//   ($1::boolean, $2::double precision, $3::double precision)
+//   otherwise PostgreSQL raises:
+//
+//     code 42P08:
+//     could not determine data type of parameter $2
+//
+//   because $2/$3 are referenced inside CASE WHEN ... IS NOT NULL
+//   and Postgres has no column context to infer a type for them.
+//
 // ============================================================
 
 router.post(
@@ -506,6 +517,16 @@ router.post(
 
             // ------------------------------------------------
             // UPDATE DATABASE
+            //
+            //  ⚠️ EXPLICIT CASTS ARE REQUIRED HERE.
+            //
+            //  $1::boolean
+            //  $2::double precision
+            //  $3::double precision
+            //
+            //  Without the casts Postgres throws
+            //  "could not determine data type of parameter $2"
+            //  (SQLSTATE 42P08).
             // ------------------------------------------------
 
             const result =
@@ -513,33 +534,31 @@ router.post(
                     `
                     UPDATE passengers
                     SET
-                        is_online = $1,
+                        is_online = $1::boolean,
 
                         last_online_at =
                             CASE
-                                WHEN $1 = TRUE
+                                WHEN $1::boolean = TRUE
                                 THEN NOW()
                                 ELSE last_online_at
                             END,
 
                         current_latitude =
-                            CASE
-                                WHEN $2 IS NOT NULL
-                                THEN $2
-                                ELSE current_latitude
-                            END,
+                            COALESCE(
+                                $2::double precision,
+                                current_latitude
+                            ),
 
                         current_longitude =
-                            CASE
-                                WHEN $3 IS NOT NULL
-                                THEN $3
-                                ELSE current_longitude
-                            END,
+                            COALESCE(
+                                $3::double precision,
+                                current_longitude
+                            ),
 
                         last_location_update =
                             CASE
-                                WHEN $2 IS NOT NULL
-                                 AND $3 IS NOT NULL
+                                WHEN $2::double precision IS NOT NULL
+                                 AND $3::double precision IS NOT NULL
                                 THEN NOW()
                                 ELSE last_location_update
                             END,
