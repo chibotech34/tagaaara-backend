@@ -173,7 +173,12 @@ router.get(
  * POST /api/passengers/update-status
  * --------------------------------------------------------------------------
  * Body: { isOnline: boolean, latitude?: number, longitude?: number }
- * Updates online flag and (optionally) the passenger's last known location.
+ *
+ * NOTE:
+ *   `current_latitude` and `current_longitude` are NUMERIC columns.
+ *   Do NOT cast the bound parameters to ::text — Postgres will reject
+ *   the assignment with error 42804 ("column ... is of type numeric
+ *   but expression is of type text").
  * ========================================================================== */
 
 router.post(
@@ -213,8 +218,8 @@ router.post(
                       UPDATE public.passengers
                       SET
                           is_online              = $1,
-                          current_latitude       = $2::text,
-                          current_longitude      = $3::text,
+                          current_latitude       = $2::numeric,
+                          current_longitude      = $3::numeric,
                           last_location_update   = NOW(),
                           last_online_at         = NOW(),
                           updated_at             = NOW()
@@ -225,8 +230,8 @@ router.post(
                       `,
                     [
                         isOnline,
-                        String(latitude),
-                        String(longitude),
+                        Number(latitude),
+                        Number(longitude),
                         uid,
                     ],
                 )
@@ -249,6 +254,14 @@ router.post(
                     message: 'Passenger not found.',
                     code: 'PASSENGER_NOT_FOUND',
                 });
+            }
+
+            console.log('PASSENGER LOCATION UPDATED SUCCESSFULLY');
+            console.log('Passenger ID:', result.rows[0].id);
+            console.log('Firebase UID:', result.rows[0].firebase_uid);
+            if (hasCoords) {
+                console.log('Latitude:', result.rows[0].current_latitude);
+                console.log('Longitude:', result.rows[0].current_longitude);
             }
 
             return res.status(200).json({
@@ -276,20 +289,11 @@ router.post(
  *   lat, lng    (required) – driver's current position
  *   radius      (optional, metres, default 5000)
  *
- * Response:
- *   {
- *     success: true,
- *     count: <number>,
- *     passengers: [ { id, firebase_uid, full_name, …, distance_meters } ]
- *   }
- *
- * Notes
- * -----
- *  • `passengers.current_latitude` / `current_longitude` are stored as TEXT.
- *  • There is no PostGIS `location` column on the passengers table.
- *  • We therefore build the geography point on the fly AND cast the text
- *    columns to double precision.
- *  • A pure‑SQL Haversine fallback is used if PostGIS is unavailable.
+ * NOTE:
+ *   `current_latitude` / `current_longitude` are NUMERIC columns.
+ *   Do NOT call TRIM()/btrim() on them — that only works on text and
+ *   raises error 42883 ("function pg_catalog.btrim(numeric) does not exist").
+ *   Just cast to ::double precision when you need to do math.
  * ========================================================================== */
 
 router.get(
@@ -324,30 +328,9 @@ router.get(
             }
 
             // ---------------------------------------------------------------
-            // Try PostGIS first.
+            // PostGIS query — works only if PostGIS is installed.
             // ---------------------------------------------------------------
             const postgisQuery = `
-                WITH candidates AS (
-                    SELECT
-                        id,
-                        firebase_uid,
-                        full_name,
-                        phone,
-                        profile_photo_url,
-                        current_latitude,
-                        current_longitude,
-                        is_online,
-                        last_online_at,
-                        NULLIF(TRIM(current_latitude),  '')::double precision AS lat_num,
-                        NULLIF(TRIM(current_longitude), '')::double precision AS lng_num
-                    FROM public.passengers
-                    WHERE is_online = true
-                      AND account_status = 'active'
-                      AND current_latitude  IS NOT NULL
-                      AND current_longitude IS NOT NULL
-                      AND TRIM(current_latitude)  <> ''
-                      AND TRIM(current_longitude) <> ''
-                )
                 SELECT
                     id,
                     firebase_uid,
@@ -360,24 +343,51 @@ router.get(
                     last_online_at,
                     ROUND(
                         ST_Distance(
-                            ST_SetSRID(ST_MakePoint(lng_num, lat_num), 4326)::geography,
-                            ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 4326)::geography
+                            ST_SetSRID(
+                                ST_MakePoint(
+                                    current_longitude::double precision,
+                                    current_latitude::double precision
+                                ),
+                                4326
+                            )::geography,
+                            ST_SetSRID(
+                                ST_MakePoint(
+                                    $1::double precision,
+                                    $2::double precision
+                                ),
+                                4326
+                            )::geography
                         )
                     )::int AS distance_meters
-                FROM candidates
-                WHERE lat_num IS NOT NULL
-                  AND lng_num IS NOT NULL
+                FROM public.passengers
+                WHERE is_online = true
+                  AND account_status = 'active'
+                  AND current_latitude  IS NOT NULL
+                  AND current_longitude IS NOT NULL
                   AND ST_DWithin(
-                        ST_SetSRID(ST_MakePoint(lng_num, lat_num), 4326)::geography,
-                        ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 4326)::geography,
+                        ST_SetSRID(
+                            ST_MakePoint(
+                                current_longitude::double precision,
+                                current_latitude::double precision
+                            ),
+                            4326
+                        )::geography,
+                        ST_SetSRID(
+                            ST_MakePoint(
+                                $1::double precision,
+                                $2::double precision
+                            ),
+                            4326
+                        )::geography,
                         $3::double precision
-                  )
+                      )
                 ORDER BY distance_meters ASC
                 LIMIT 50;
             `;
 
             // ---------------------------------------------------------------
-            // Haversine fallback (no PostGIS required).
+            // Haversine fallback — no PostGIS required.
+            // Safe to run on numeric lat/lng columns.
             // ---------------------------------------------------------------
             const haversineQuery = `
                 WITH candidates AS (
@@ -391,30 +401,36 @@ router.get(
                         current_longitude,
                         is_online,
                         last_online_at,
-                        NULLIF(TRIM(current_latitude),  '')::double precision AS lat_num,
-                        NULLIF(TRIM(current_longitude), '')::double precision AS lng_num
+                        current_latitude::double precision  AS lat_num,
+                        current_longitude::double precision AS lng_num
                     FROM public.passengers
                     WHERE is_online = true
                       AND account_status = 'active'
                       AND current_latitude  IS NOT NULL
                       AND current_longitude IS NOT NULL
-                      AND TRIM(current_latitude)  <> ''
-                      AND TRIM(current_longitude) <> ''
                 ),
                 distances AS (
                     SELECT
                         *,
                         6371000 * 2 * ASIN(
                             SQRT(
-                                POWER(SIN(RADIANS(lat_num - $2::double precision) / 2), 2) +
+                                POWER(
+                                    SIN(
+                                        RADIANS(lat_num - $2::double precision) / 2
+                                    ),
+                                    2
+                                ) +
                                 COS(RADIANS($2::double precision)) *
                                 COS(RADIANS(lat_num)) *
-                                POWER(SIN(RADIANS(lng_num - $1::double precision) / 2), 2)
+                                POWER(
+                                    SIN(
+                                        RADIANS(lng_num - $1::double precision) / 2
+                                    ),
+                                    2
+                                )
                             )
                         ) AS distance_meters
                     FROM candidates
-                    WHERE lat_num IS NOT NULL
-                      AND lng_num IS NOT NULL
                 )
                 SELECT
                     id,
@@ -441,8 +457,8 @@ router.get(
             } catch (postgisErr: unknown) {
                 const pe = postgisErr as { code?: string; message?: string };
 
-                // 42883 = undefined_function (PostGIS missing)
-                // 42703 = undefined_column (ST_* referenced a missing column)
+                // 42883 = undefined_function (PostGIS missing / btrim(numeric))
+                // 42703 = undefined_column
                 if (pe.code === '42883' || pe.code === '42703') {
                     console.warn(
                         '⚠️ PostGIS unavailable, falling back to Haversine.',
@@ -453,6 +469,11 @@ router.get(
                     throw postgisErr;
                 }
             }
+
+            console.log(
+                `📍 /passengers/nearby returned ${result.rows.length} passenger(s) ` +
+                `within ${searchRadius} m of (${latitude}, ${longitude})`,
+            );
 
             return res.status(200).json({
                 success: true,
