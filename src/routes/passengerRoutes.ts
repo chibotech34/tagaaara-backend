@@ -127,6 +127,11 @@ const getAuthenticatedUid = (
 
 /* ==========================================================================
  * GET /api/passengers/profile
+ *
+ * Returns the complete passenger profile.
+ *
+ * Database table:
+ * public.passengers
  * ========================================================================== */
 
 router.get(
@@ -173,17 +178,18 @@ router.get(
                         language_preference,
                         notification_enabled,
                         privacy_enabled,
+                        created_at,
                         profile_photo_url,
                         account_status,
                         phone_verified,
                         email_verified,
+                        updated_at,
                         is_online,
                         last_online_at,
                         current_latitude,
                         current_longitude,
                         last_location_update,
-                        created_at,
-                        updated_at
+                        fcm_token
                     FROM public.passengers
                     WHERE firebase_uid = $1
                     LIMIT 1
@@ -211,6 +217,7 @@ router.get(
         } catch (error: unknown) {
             const e = error as {
                 message?: string;
+                code?: string;
             };
 
             console.error(
@@ -236,8 +243,32 @@ router.get(
  *
  * Update authenticated passenger profile.
  *
- * Firebase UID is ALWAYS taken from the verified Firebase ID token.
- * It is NEVER accepted from the request body.
+ * IMPORTANT:
+ *
+ * firebase_uid is NEVER accepted from Flutter.
+ *
+ * The Firebase UID always comes from the verified Firebase ID token.
+ *
+ * Profile fields allowed:
+ *
+ * full_name
+ * phone
+ * email
+ * gender
+ * emergency_contact_name
+ * emergency_contact_phone
+ * emergency_relationship
+ * home_address
+ * region
+ * district
+ * town_city
+ * saved_locations
+ * preferred_payment_method
+ * mobile_money_number
+ * language_preference
+ * notification_enabled
+ * privacy_enabled
+ * profile_photo_url
  * ========================================================================== */
 
 router.patch(
@@ -254,9 +285,9 @@ router.patch(
             false;
 
         try {
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * AUTHENTICATION
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const uid =
                 getAuthenticatedUid(req);
@@ -273,16 +304,17 @@ router.patch(
                 });
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * REQUEST BODY
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const body =
                 req.body ?? {};
 
             if (
                 typeof body !== 'object' ||
-                Array.isArray(body)
+                Array.isArray(body) ||
+                body === null
             ) {
                 client.release();
 
@@ -295,33 +327,56 @@ router.patch(
                 });
             }
 
-            /* ----------------------------------------------------------------
+            const receivedFields =
+                Object.keys(body);
+
+            /* ================================================================
+             * NO FIELDS
+             * ================================================================ */
+
+            if (
+                receivedFields.length === 0
+            ) {
+                client.release();
+
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'No profile fields were provided for update.',
+                    code:
+                        'NO_FIELDS_TO_UPDATE',
+                });
+            }
+
+            /* ================================================================
              * ALLOWED FIELDS
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const allowedFields =
                 new Set([
                     'full_name',
-                    'email',
                     'phone',
-                    'phone_number',
+                    'email',
+                    'gender',
                     'emergency_contact_name',
                     'emergency_contact_phone',
+                    'emergency_relationship',
+                    'home_address',
+                    'region',
+                    'district',
+                    'town_city',
                     'saved_locations',
-                    'payment_preference',
                     'preferred_payment_method',
-                    'language',
+                    'mobile_money_number',
                     'language_preference',
-                    'notifications_enabled',
                     'notification_enabled',
+                    'privacy_enabled',
+                    'profile_photo_url',
                 ]);
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * UNKNOWN FIELDS
-             * ---------------------------------------------------------------- */
-
-            const receivedFields =
-                Object.keys(body);
+             * ================================================================ */
 
             const unknownFields =
                 receivedFields.filter(
@@ -347,27 +402,9 @@ router.patch(
                 });
             }
 
-            /* ----------------------------------------------------------------
-             * NOTHING TO UPDATE
-             * ---------------------------------------------------------------- */
-
-            if (
-                receivedFields.length === 0
-            ) {
-                client.release();
-
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        'No profile fields were provided for update.',
-                    code:
-                        'NO_FIELDS_TO_UPDATE',
-                });
-            }
-
-            /* ----------------------------------------------------------------
-             * SQL UPDATE ARRAYS
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * SQL ARRAYS
+             * ================================================================ */
 
             const updateParts: string[] =
                 [];
@@ -386,9 +423,9 @@ router.patch(
                 );
             };
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * FULL NAME
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -433,9 +470,45 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
+             * PHONE
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'phone',
+                )
+            ) {
+                const phone =
+                    String(
+                        body.phone ?? '',
+                    ).trim();
+
+                if (
+                    phone &&
+                    phone.length > 30
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Phone number is invalid.',
+                        code:
+                            'INVALID_PHONE',
+                    });
+                }
+
+                addField(
+                    'phone',
+                    phone || null,
+                );
+            }
+
+            /* ================================================================
              * EMAIL
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -473,97 +546,44 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
-             * PHONE
-             * ----------------------------------------------------------------
-             *
-             * NOTE:
-             * Phone authentication should normally control the phone.
-             * This route allows the field because your profile screen
-             * may expose it.
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * GENDER
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
                     body,
-                    'phone',
+                    'gender',
                 )
             ) {
-                const phone =
+                const gender =
                     String(
-                        body.phone ?? '',
+                        body.gender ?? '',
                     ).trim();
 
                 if (
-                    phone &&
-                    phone.length > 30
+                    gender.length > 50
                 ) {
                     client.release();
 
                     return res.status(400).json({
                         success: false,
                         message:
-                            'Phone number is invalid.',
+                            'Gender value is too long.',
                         code:
-                            'INVALID_PHONE',
+                            'INVALID_GENDER',
                     });
                 }
 
                 addField(
-                    'phone',
-                    phone || null,
+                    'gender',
+                    gender || null,
                 );
             }
 
-            /* ----------------------------------------------------------------
-             * PHONE NUMBER
-             *
-             * If your database does NOT have a phone_number column,
-             * do not send this field from Flutter.
-             * ---------------------------------------------------------------- */
-
-            if (
-                Object.prototype.hasOwnProperty.call(
-                    body,
-                    'phone_number',
-                )
-            ) {
-                const phoneNumber =
-                    String(
-                        body.phone_number ??
-                        '',
-                    ).trim();
-
-                if (
-                    phoneNumber &&
-                    phoneNumber.length > 30
-                ) {
-                    client.release();
-
-                    return res.status(400).json({
-                        success: false,
-                        message:
-                            'Phone number is invalid.',
-                        code:
-                            'INVALID_PHONE_NUMBER',
-                    });
-                }
-
-                /*
-                 * Your current passengers SELECT uses `phone`,
-                 * not `phone_number`.
-                 *
-                 * Therefore we map phone_number -> phone.
-                 */
-                addField(
-                    'phone',
-                    phoneNumber || null,
-                );
-            }
-
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * EMERGENCY CONTACT NAME
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -597,9 +617,9 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * EMERGENCY CONTACT PHONE
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -633,9 +653,185 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
+             * EMERGENCY RELATIONSHIP
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'emergency_relationship',
+                )
+            ) {
+                const relationship =
+                    String(
+                        body.emergency_relationship ??
+                        '',
+                    ).trim();
+
+                if (
+                    relationship.length > 100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Emergency relationship is too long.',
+                        code:
+                            'INVALID_EMERGENCY_RELATIONSHIP',
+                    });
+                }
+
+                addField(
+                    'emergency_relationship',
+                    relationship || null,
+                );
+            }
+
+            /* ================================================================
+             * HOME ADDRESS
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'home_address',
+                )
+            ) {
+                const address =
+                    String(
+                        body.home_address ?? '',
+                    ).trim();
+
+                if (
+                    address.length > 255
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Home address is too long.',
+                        code:
+                            'INVALID_HOME_ADDRESS',
+                    });
+                }
+
+                addField(
+                    'home_address',
+                    address || null,
+                );
+            }
+
+            /* ================================================================
+             * REGION
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'region',
+                )
+            ) {
+                const region =
+                    String(
+                        body.region ?? '',
+                    ).trim();
+
+                if (
+                    region.length > 100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Region value is too long.',
+                        code:
+                            'INVALID_REGION',
+                    });
+                }
+
+                addField(
+                    'region',
+                    region || null,
+                );
+            }
+
+            /* ================================================================
+             * DISTRICT
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'district',
+                )
+            ) {
+                const district =
+                    String(
+                        body.district ?? '',
+                    ).trim();
+
+                if (
+                    district.length > 100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'District value is too long.',
+                        code:
+                            'INVALID_DISTRICT',
+                    });
+                }
+
+                addField(
+                    'district',
+                    district || null,
+                );
+            }
+
+            /* ================================================================
+             * TOWN / CITY
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'town_city',
+                )
+            ) {
+                const townCity =
+                    String(
+                        body.town_city ?? '',
+                    ).trim();
+
+                if (
+                    townCity.length > 100
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Town/City value is too long.',
+                        code:
+                            'INVALID_TOWN_CITY',
+                    });
+                }
+
+                addField(
+                    'town_city',
+                    townCity || null,
+                );
+            }
+
+            /* ================================================================
              * SAVED LOCATIONS
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -662,9 +858,6 @@ router.patch(
                     });
                 }
 
-                /*
-                 * Send JSON string and cast to jsonb in SQL.
-                 */
                 values.push(
                     JSON.stringify(
                         savedLocations,
@@ -676,50 +869,9 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
-             * PAYMENT PREFERENCE
-             * ---------------------------------------------------------------- */
-
-            if (
-                Object.prototype.hasOwnProperty.call(
-                    body,
-                    'payment_preference',
-                )
-            ) {
-                const paymentPreference =
-                    String(
-                        body.payment_preference ??
-                        '',
-                    ).trim();
-
-                if (
-                    paymentPreference.length >
-                    100
-                ) {
-                    client.release();
-
-                    return res.status(400).json({
-                        success: false,
-                        message:
-                            'Payment preference is too long.',
-                        code:
-                            'INVALID_PAYMENT_PREFERENCE',
-                    });
-                }
-
-                /*
-                 * Map to the actual column used by GET /profile.
-                 */
-                addField(
-                    'preferred_payment_method',
-                    paymentPreference ||
-                    null,
-                );
-            }
-
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * PREFERRED PAYMENT METHOD
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -727,15 +879,14 @@ router.patch(
                     'preferred_payment_method',
                 )
             ) {
-                const paymentPreference =
+                const paymentMethod =
                     String(
                         body.preferred_payment_method ??
                         '',
                     ).trim();
 
                 if (
-                    paymentPreference.length >
-                    100
+                    paymentMethod.length > 100
                 ) {
                     client.release();
 
@@ -750,49 +901,49 @@ router.patch(
 
                 addField(
                     'preferred_payment_method',
-                    paymentPreference ||
-                    null,
+                    paymentMethod || null,
                 );
             }
 
-            /* ----------------------------------------------------------------
-             * LANGUAGE
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * MOBILE MONEY NUMBER
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
                     body,
-                    'language',
+                    'mobile_money_number',
                 )
             ) {
-                const language =
+                const mobileMoney =
                     String(
-                        body.language ?? '',
+                        body.mobile_money_number ??
+                        '',
                     ).trim();
 
                 if (
-                    language.length > 50
+                    mobileMoney.length > 30
                 ) {
                     client.release();
 
                     return res.status(400).json({
                         success: false,
                         message:
-                            'Language value is too long.',
+                            'Mobile money number is invalid.',
                         code:
-                            'INVALID_LANGUAGE',
+                            'INVALID_MOBILE_MONEY_NUMBER',
                     });
                 }
 
                 addField(
-                    'language_preference',
-                    language || null,
+                    'mobile_money_number',
+                    mobileMoney || null,
                 );
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * LANGUAGE PREFERENCE
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -826,43 +977,9 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
-             * NOTIFICATIONS
-             * ---------------------------------------------------------------- */
-
-            if (
-                Object.prototype.hasOwnProperty.call(
-                    body,
-                    'notifications_enabled',
-                )
-            ) {
-                const notificationValue =
-                    body.notifications_enabled;
-
-                if (
-                    typeof notificationValue !==
-                    'boolean'
-                ) {
-                    client.release();
-
-                    return res.status(400).json({
-                        success: false,
-                        message:
-                            'notifications_enabled must be true or false.',
-                        code:
-                            'INVALID_NOTIFICATION_VALUE',
-                    });
-                }
-
-                addField(
-                    'notification_enabled',
-                    notificationValue,
-                );
-            }
-
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * NOTIFICATION ENABLED
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 Object.prototype.hasOwnProperty.call(
@@ -894,9 +1011,79 @@ router.patch(
                 );
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
+             * PRIVACY ENABLED
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'privacy_enabled',
+                )
+            ) {
+                const privacyValue =
+                    body.privacy_enabled;
+
+                if (
+                    typeof privacyValue !==
+                    'boolean'
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'privacy_enabled must be true or false.',
+                        code:
+                            'INVALID_PRIVACY_VALUE',
+                    });
+                }
+
+                addField(
+                    'privacy_enabled',
+                    privacyValue,
+                );
+            }
+
+            /* ================================================================
+             * PROFILE PHOTO URL
+             * ================================================================ */
+
+            if (
+                Object.prototype.hasOwnProperty.call(
+                    body,
+                    'profile_photo_url',
+                )
+            ) {
+                const photoUrl =
+                    String(
+                        body.profile_photo_url ??
+                        '',
+                    ).trim();
+
+                if (
+                    photoUrl.length > 1000
+                ) {
+                    client.release();
+
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Profile photo URL is too long.',
+                        code:
+                            'INVALID_PROFILE_PHOTO_URL',
+                    });
+                }
+
+                addField(
+                    'profile_photo_url',
+                    photoUrl || null,
+                );
+            }
+
+            /* ================================================================
              * SAFETY CHECK
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             if (
                 updateParts.length === 0
@@ -912,28 +1099,35 @@ router.patch(
                 });
             }
 
+            /* ================================================================
+             * UPDATED TIMESTAMP
+             * ================================================================ */
+
             updateParts.push(
                 'updated_at = CURRENT_TIMESTAMP',
             );
 
-            /* ----------------------------------------------------------------
-             * TRANSACTION
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * START TRANSACTION
+             * ================================================================ */
 
             await client.query(
                 'BEGIN',
             );
 
-            transactionStarted = true;
+            transactionStarted =
+                true;
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * CHECK PASSENGER
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const passengerResult =
                 await client.query(
                     `
-                    SELECT *
+                    SELECT
+                        id,
+                        firebase_uid
                     FROM public.passengers
                     WHERE firebase_uid = $1
                     LIMIT 1
@@ -963,18 +1157,18 @@ router.patch(
                 });
             }
 
-            /* ----------------------------------------------------------------
-             * ADD UID TO PARAMETERS
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * FIREBASE UID PARAMETER
+             * ================================================================ */
 
             values.push(uid);
 
             const uidParameter =
                 values.length;
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * UPDATE
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const updateResult =
                 await client.query(
@@ -983,7 +1177,38 @@ router.patch(
                     SET
                         ${updateParts.join(', ')}
                     WHERE firebase_uid = $${uidParameter}
-                    RETURNING *
+                    RETURNING
+                        id,
+                        firebase_uid,
+                        full_name,
+                        phone,
+                        email,
+                        gender,
+                        emergency_contact_name,
+                        emergency_contact_phone,
+                        emergency_relationship,
+                        home_address,
+                        region,
+                        district,
+                        town_city,
+                        saved_locations,
+                        preferred_payment_method,
+                        mobile_money_number,
+                        language_preference,
+                        notification_enabled,
+                        privacy_enabled,
+                        created_at,
+                        profile_photo_url,
+                        account_status,
+                        phone_verified,
+                        email_verified,
+                        updated_at,
+                        is_online,
+                        last_online_at,
+                        current_latitude,
+                        current_longitude,
+                        last_location_update,
+                        fcm_token
                     `,
                     values,
                 );
@@ -1010,6 +1235,10 @@ router.patch(
                 });
             }
 
+            /* ================================================================
+             * COMMIT
+             * ================================================================ */
+
             await client.query(
                 'COMMIT',
             );
@@ -1021,6 +1250,7 @@ router.patch(
 
             console.log(
                 `✅ Passenger profile updated: ${uid}`,
+                receivedFields,
             );
 
             return res.status(200).json({
@@ -1033,6 +1263,10 @@ router.patch(
                     updateResult.rows[0],
             });
         } catch (error: unknown) {
+            /* ================================================================
+             * ROLLBACK
+             * ================================================================ */
+
             if (transactionStarted) {
                 try {
                     await client.query(
@@ -1050,34 +1284,33 @@ router.patch(
 
             client.release();
 
+            const e = error as {
+                message?: string;
+                code?: string;
+                detail?: string;
+                constraint?: string;
+            };
+
             console.error(
                 '❌ Update passenger profile error:',
-                error,
+                e,
             );
-
-            const dbError =
-                error as {
-                    message?: string;
-                    code?: string;
-                    detail?: string;
-                    constraint?: string;
-                };
 
             return res.status(500).json({
                 success: false,
                 message:
                     'Failed to update passenger profile.',
                 code:
-                    dbError.code ||
+                    e.code ||
                     'PROFILE_UPDATE_FAILED',
                 error:
-                    dbError.message ||
+                    e.message ||
                     'Unknown database error',
                 detail:
-                    dbError.detail ||
+                    e.detail ||
                     null,
                 constraint:
-                    dbError.constraint ||
+                    e.constraint ||
                     null,
             });
         }
@@ -1587,7 +1820,8 @@ router.post(
                             is_online,
                             current_latitude,
                             current_longitude,
-                            last_online_at
+                            last_online_at,
+                            last_location_update
                         `,
                         [
                             isOnline,
@@ -1629,7 +1863,7 @@ router.post(
             }
 
             console.log(
-                '✅ PASSENGER LOCATION UPDATED',
+                '✅ PASSENGER STATUS UPDATED',
                 result.rows[0],
             );
 
@@ -1704,15 +1938,10 @@ router.get(
                 Number(radius);
 
             if (
-                !Number.isFinite(
-                    latitude,
-                ) ||
-                !Number.isFinite(
-                    longitude,
-                ) ||
-                !Number.isFinite(
-                    searchRadius,
-                )
+                !Number.isFinite(latitude) ||
+                !Number.isFinite(longitude) ||
+                !Number.isFinite(searchRadius) ||
+                searchRadius <= 0
             ) {
                 return res.status(400).json({
                     success: false,
@@ -1875,11 +2104,11 @@ router.get(
 
                 if (
                     pe.code === '42883' ||
-                    pe.code === '42703'
+                    pe.code === '42703' ||
+                    pe.code === '42804'
                 ) {
                     console.warn(
-                        '⚠️ PostGIS unavailable. ' +
-                        'Falling back to Haversine.',
+                        '⚠️ PostGIS unavailable. Falling back to Haversine.',
                         pe.message,
                     );
 
@@ -2467,14 +2696,16 @@ router.get(
 /* ==========================================================================
  * POST /api/passengers/wallet/topup
  *
- * IMPORTANT:
- * This route immediately credits the wallet.
+ * DEVELOPMENT / TESTING VERSION
  *
- * For real Mobile Money production:
+ * IMPORTANT:
+ * This immediately credits the wallet.
+ *
+ * For production Mobile Money:
  * 1. Initiate payment.
  * 2. Wait for provider confirmation.
  * 3. Verify provider transaction.
- * 4. Then credit wallet.
+ * 4. Credit wallet.
  * ========================================================================== */
 
 router.post(
@@ -2816,13 +3047,6 @@ router.post(
 
 /* ==========================================================================
  * POST /api/passengers/wallet/pay
- *
- * Body:
- *
- * {
- *   "ride_id": 123,
- *   "amount": 15
- * }
  * ========================================================================== */
 
 router.post(
@@ -2903,9 +3127,9 @@ router.post(
             transactionStarted =
                 true;
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * PASSENGER
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const passengerResult =
                 await client.query(
@@ -2943,9 +3167,9 @@ router.post(
             const passengerId =
                 passengerResult.rows[0].id;
 
-            /* ----------------------------------------------------------------
-             * VERIFY RIDE BELONGS TO PASSENGER
-             * ---------------------------------------------------------------- */
+            /* ================================================================
+             * VERIFY RIDE
+             * ================================================================ */
 
             const rideResult =
                 await client.query(
@@ -2986,9 +3210,9 @@ router.post(
                 });
             }
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * WALLET
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const walletResult =
                 await client.query(
@@ -3073,9 +3297,9 @@ router.post(
                     wallet.total_spent,
                 ) + amount;
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * UPDATE WALLET
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const updatedWalletResult =
                 await client.query(
@@ -3104,9 +3328,9 @@ router.post(
                     ],
                 );
 
-            /* ----------------------------------------------------------------
+            /* ================================================================
              * CREATE TRANSACTION
-             * ---------------------------------------------------------------- */
+             * ================================================================ */
 
             const transactionResult =
                 await client.query(
