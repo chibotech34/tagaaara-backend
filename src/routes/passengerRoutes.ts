@@ -1,681 +1,476 @@
-import express, {
-    Request,
-    Response,
-    NextFunction,
-} from 'express';
-
+// src/routes/passengerRoutes.ts
+import { Router, Request, Response, NextFunction } from 'express';
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
-const router = express.Router();
+const router = Router();
 
-// ============================================================
-// TYPES
-// ============================================================
+/* ==========================================================================
+ * Types
+ * ========================================================================== */
 
 interface DecodedFirebaseToken {
     uid: string;
     email?: string;
     name?: string;
-    phone_number?: string;
 }
 
 interface AuthenticatedRequest extends Request {
     decodedToken?: DecodedFirebaseToken;
 }
 
-// ============================================================
-// HELPERS
-// ============================================================
+/* ==========================================================================
+ * Firebase ID‑token middleware
+ * ========================================================================== */
 
-function normalizePhone(
-    phone: unknown,
-): string | null {
-    let value = String(phone || '')
-        .trim()
-        .replace(/[^0-9+]/g, '');
-
-    // 0241234567 -> +233241234567
-    if (value.startsWith('0')) {
-        value = '+233' + value.substring(1);
-    }
-
-    // 233241234567 -> +233241234567
-    else if (value.startsWith('233')) {
-        value = '+' + value;
-    }
-
-    // 241234567 -> +233241234567
-    else if (
-        value.length === 9 &&
-        /^[25]\d{8}$/.test(value)
-    ) {
-        value = '+233' + value;
-    }
-
-    // Correct Ghana phone validation
-    if (!/^\+233\d{9}$/.test(value)) {
-        return null;
-    }
-
-    return value;
-}
-
-function toFiniteNumber(
-    value: unknown,
-): number | null {
-    if (
-        value === null ||
-        value === undefined ||
-        value === ''
-    ) {
-        return null;
-    }
-
-    const number = Number(value);
-
-    return Number.isFinite(number)
-        ? number
-        : null;
-}
-
-// ============================================================
-// FIREBASE AUTH MIDDLEWARE
-// ============================================================
-
-async function verifyFirebaseToken(
+const verifyFirebaseToken = async (
     req: AuthenticatedRequest,
     res: Response,
     next: NextFunction,
-) {
+): Promise<void> => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({
+            success: false,
+            message: 'Missing or invalid Authorization header.',
+            code: 'AUTH_HEADER_MISSING',
+        });
+        return;
+    }
+
+    const token = authHeader.substring('Bearer '.length).trim();
+
+    if (!token) {
+        res.status(401).json({
+            success: false,
+            message: 'Firebase ID token is missing.',
+            code: 'AUTH_TOKEN_MISSING',
+        });
+        return;
+    }
+
     try {
-        const authHeader =
-            req.headers.authorization;
-
-        // ----------------------------------------------------
-        // AUTHORIZATION HEADER
-        // ----------------------------------------------------
-
-        if (!authHeader) {
-            return res.status(401).json({
-                success: false,
-                code: 'MISSING_AUTHORIZATION',
-                message:
-                    'Authorization header is required.',
-            });
-        }
-
-        // ----------------------------------------------------
-        // BEARER TOKEN
-        // ----------------------------------------------------
-
-        if (
-            !authHeader.startsWith('Bearer ')
-        ) {
-            return res.status(401).json({
-                success: false,
-                code: 'INVALID_AUTHORIZATION',
-                message:
-                    'Authorization header must use Bearer token.',
-            });
-        }
-
-        const idToken =
-            authHeader.substring(7).trim();
-
-        if (!idToken) {
-            return res.status(401).json({
-                success: false,
-                code: 'EMPTY_TOKEN',
-                message:
-                    'Firebase ID token is missing.',
-            });
-        }
-
-        // ----------------------------------------------------
-        // VERIFY FIREBASE TOKEN
-        // ----------------------------------------------------
-
-        const decoded =
-            await firebaseAuth.verifyIdToken(
-                idToken,
-            );
-
-        // ----------------------------------------------------
-        // STORE DECODED USER
-        // ----------------------------------------------------
+        const decoded = await firebaseAuth.verifyIdToken(token);
 
         req.decodedToken = {
             uid: decoded.uid,
             email: decoded.email,
             name: decoded.name,
-            phone_number:
-                decoded.phone_number,
         };
 
-        console.log(
-            'Firebase token verified successfully.',
-        );
-
-        console.log(
-            'Firebase UID:',
-            decoded.uid,
-        );
-
-        console.log(
-            'Firebase phone:',
-            decoded.phone_number,
-        );
-
         next();
-    } catch (error: any) {
-        console.error(
-            'Firebase token verification error:',
-            error,
-        );
+    } catch (err: unknown) {
+        console.error('❌ Firebase token verification failed:', err);
 
-        return res.status(401).json({
+        const firebaseError = err as { code?: string };
+
+        if (firebaseError.code === 'auth/id-token-expired') {
+            res.status(401).json({
+                success: false,
+                message: 'Firebase ID token expired.',
+                code: 'AUTH_TOKEN_EXPIRED',
+            });
+            return;
+        }
+
+        res.status(401).json({
             success: false,
-            code: 'INVALID_FIREBASE_TOKEN',
-            message:
-                'Authentication token is invalid or expired.',
+            message: 'Firebase authentication failed.',
+            code: 'AUTH_TOKEN_INVALID',
         });
     }
-}
+};
 
-// ============================================================
-// GET PASSENGER PROFILE
-// ============================================================
-//
-// GET /api/passengers/profile
-//
-// ============================================================
+const getAuthenticatedUid = (req: AuthenticatedRequest): string | null =>
+    req.decodedToken?.uid ?? null;
+
+/* ==========================================================================
+ * GET /api/passengers/profile
+ * ========================================================================== */
 
 router.get(
     '/profile',
     verifyFirebaseToken,
-    async (
-        req: AuthenticatedRequest,
-        res: Response,
-    ) => {
-        const uid =
-            req.decodedToken?.uid;
+    async (req: AuthenticatedRequest, res: Response) => {
+        try {
+            const uid = getAuthenticatedUid(req);
 
-        // ----------------------------------------------------
-        // CHECK FIREBASE UID
-        // ----------------------------------------------------
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
 
-        if (!uid) {
-            return res.status(401).json({
+            const result = await pool.query(
+                `
+                SELECT
+                    id,
+                    firebase_uid,
+                    full_name,
+                    phone,
+                    email,
+                    gender,
+                    emergency_contact_name,
+                    emergency_contact_phone,
+                    emergency_relationship,
+                    home_address,
+                    region,
+                    district,
+                    town_city,
+                    saved_locations,
+                    preferred_payment_method,
+                    mobile_money_number,
+                    language_preference,
+                    notification_enabled,
+                    privacy_enabled,
+                    profile_photo_url,
+                    account_status,
+                    phone_verified,
+                    email_verified,
+                    is_online,
+                    last_online_at,
+                    current_latitude,
+                    current_longitude,
+                    last_location_update,
+                    created_at,
+                    updated_at
+                FROM public.passengers
+                WHERE firebase_uid = $1
+                LIMIT 1
+                `,
+                [uid],
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                    code: 'PASSENGER_NOT_FOUND',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                passenger: result.rows[0],
+            });
+        } catch (error: unknown) {
+            const e = error as { message?: string };
+            console.error('❌ Error fetching passenger profile:', e);
+            return res.status(500).json({
                 success: false,
-                code: 'MISSING_FIREBASE_UID',
-                message:
-                    'Authenticated Firebase UID is missing.',
+                message: 'Failed to fetch passenger profile.',
+                code: 'PASSENGER_FETCH_FAILED',
+                error: e.message,
             });
         }
+    },
+);
 
+/* ==========================================================================
+ * POST /api/passengers/update-status
+ * --------------------------------------------------------------------------
+ * Body: { isOnline: boolean, latitude?: number, longitude?: number }
+ * Updates online flag and (optionally) the passenger's last known location.
+ * ========================================================================== */
+
+router.post(
+    '/update-status',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
         try {
-            console.log(
-                '============================================',
-            );
+            const uid = getAuthenticatedUid(req);
 
-            console.log(
-                'PASSENGER PROFILE REQUEST',
-            );
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
 
-            console.log(
-                'Firebase UID:',
-                uid,
-            );
+            const { isOnline, latitude, longitude } = req.body ?? {};
 
-            console.log(
-                'Firebase phone:',
-                req.decodedToken?.phone_number,
-            );
+            if (typeof isOnline !== 'boolean') {
+                return res.status(400).json({
+                    success: false,
+                    message: 'isOnline must be a boolean.',
+                    code: 'INVALID_STATUS',
+                });
+            }
 
-            console.log(
-                'Firebase email:',
-                req.decodedToken?.email,
-            );
+            const hasCoords =
+                latitude !== undefined &&
+                longitude !== undefined &&
+                Number.isFinite(Number(latitude)) &&
+                Number.isFinite(Number(longitude));
 
-            console.log(
-                '============================================',
-            );
-
-            // ------------------------------------------------
-            // FIND PASSENGER
-            // ------------------------------------------------
-
-            const result =
-                await pool.query(
+            const result = hasCoords
+                ? await pool.query(
                     `
+                      UPDATE public.passengers
+                      SET
+                          is_online              = $1,
+                          current_latitude       = $2::text,
+                          current_longitude      = $3::text,
+                          last_location_update   = NOW(),
+                          last_online_at         = NOW(),
+                          updated_at             = NOW()
+                      WHERE firebase_uid = $4
+                      RETURNING id, firebase_uid, is_online,
+                                current_latitude, current_longitude,
+                                last_online_at
+                      `,
+                    [
+                        isOnline,
+                        String(latitude),
+                        String(longitude),
+                        uid,
+                    ],
+                )
+                : await pool.query(
+                    `
+                      UPDATE public.passengers
+                      SET
+                          is_online       = $1,
+                          last_online_at  = NOW(),
+                          updated_at      = NOW()
+                      WHERE firebase_uid = $2
+                      RETURNING id, firebase_uid, is_online, last_online_at
+                      `,
+                    [isOnline, uid],
+                );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger not found.',
+                    code: 'PASSENGER_NOT_FOUND',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                message: 'Passenger status updated.',
+                passenger: result.rows[0],
+            });
+        } catch (error: unknown) {
+            const e = error as { message?: string };
+            console.error('❌ Error updating passenger status:', e);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to update passenger status.',
+                code: 'STATUS_UPDATE_FAILED',
+                error: e.message,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
+ * GET /api/passengers/nearby
+ * --------------------------------------------------------------------------
+ * Query params:
+ *   lat, lng    (required) – driver's current position
+ *   radius      (optional, metres, default 5000)
+ *
+ * Response:
+ *   {
+ *     success: true,
+ *     count: <number>,
+ *     passengers: [ { id, firebase_uid, full_name, …, distance_meters } ]
+ *   }
+ *
+ * Notes
+ * -----
+ *  • `passengers.current_latitude` / `current_longitude` are stored as TEXT.
+ *  • There is no PostGIS `location` column on the passengers table.
+ *  • We therefore build the geography point on the fly AND cast the text
+ *    columns to double precision.
+ *  • A pure‑SQL Haversine fallback is used if PostGIS is unavailable.
+ * ========================================================================== */
+
+router.get(
+    '/nearby',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        try {
+            const { lat, lng, radius = 5000 } = req.query;
+
+            if (lat === undefined || lng === undefined) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Missing required query params: lat and lng',
+                    code: 'MISSING_PARAMETERS',
+                });
+            }
+
+            const latitude = Number(lat);
+            const longitude = Number(lng);
+            const searchRadius = Number(radius);
+
+            if (
+                !Number.isFinite(latitude) ||
+                !Number.isFinite(longitude) ||
+                !Number.isFinite(searchRadius)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid numeric values for lat, lng, or radius',
+                    code: 'INVALID_PARAMETERS',
+                });
+            }
+
+            // ---------------------------------------------------------------
+            // Try PostGIS first.
+            // ---------------------------------------------------------------
+            const postgisQuery = `
+                WITH candidates AS (
                     SELECT
                         id,
                         firebase_uid,
                         full_name,
                         phone,
-                        email,
-                        gender,
-                        emergency_contact_name,
-                        emergency_contact_phone,
-                        emergency_relationship,
-                        home_address,
-                        region,
-                        district,
-                        town_city,
-                        saved_locations,
-                        preferred_payment_method,
-                        mobile_money_number,
-                        language_preference,
-                        notification_enabled,
-                        privacy_enabled,
-                        created_at,
                         profile_photo_url,
-                        account_status,
-                        phone_verified,
-                        email_verified,
-                        updated_at,
-                        is_online,
-                        last_online_at,
                         current_latitude,
                         current_longitude,
-                        last_location_update,
-                        fcm_token
-                    FROM passengers
-                    WHERE firebase_uid = $1
-                    LIMIT 1
-                    `,
-                    [uid],
-                );
+                        is_online,
+                        last_online_at,
+                        NULLIF(TRIM(current_latitude),  '')::double precision AS lat_num,
+                        NULLIF(TRIM(current_longitude), '')::double precision AS lng_num
+                    FROM public.passengers
+                    WHERE is_online = true
+                      AND account_status = 'active'
+                      AND current_latitude  IS NOT NULL
+                      AND current_longitude IS NOT NULL
+                      AND TRIM(current_latitude)  <> ''
+                      AND TRIM(current_longitude) <> ''
+                )
+                SELECT
+                    id,
+                    firebase_uid,
+                    full_name,
+                    phone,
+                    profile_photo_url,
+                    current_latitude,
+                    current_longitude,
+                    is_online,
+                    last_online_at,
+                    ROUND(
+                        ST_Distance(
+                            ST_SetSRID(ST_MakePoint(lng_num, lat_num), 4326)::geography,
+                            ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 4326)::geography
+                        )
+                    )::int AS distance_meters
+                FROM candidates
+                WHERE lat_num IS NOT NULL
+                  AND lng_num IS NOT NULL
+                  AND ST_DWithin(
+                        ST_SetSRID(ST_MakePoint(lng_num, lat_num), 4326)::geography,
+                        ST_SetSRID(ST_MakePoint($1::double precision, $2::double precision), 4326)::geography,
+                        $3::double precision
+                  )
+                ORDER BY distance_meters ASC
+                LIMIT 50;
+            `;
 
-            console.log(
-                'Passenger database rows:',
-                result.rows.length,
-            );
-
-            // ------------------------------------------------
-            // PASSENGER NOT FOUND
-            // ------------------------------------------------
-
-            if (result.rows.length === 0) {
-                console.log(
-                    'PASSENGER NOT FOUND',
-                );
-
-                return res.status(404).json({
-                    success: false,
-                    code: 'PASSENGER_NOT_FOUND',
-                    message:
-                        'Passenger account was not found.',
-                });
-            }
-
-            const passenger =
-                result.rows[0];
-
-            // ------------------------------------------------
-            // ACCOUNT STATUS
-            // ------------------------------------------------
-
-            if (
-                passenger.account_status &&
-                passenger.account_status !== 'active'
-            ) {
-                return res.status(403).json({
-                    success: false,
-                    code: 'ACCOUNT_NOT_ACTIVE',
-                    message:
-                        `Passenger account is ${passenger.account_status}.`,
-                    accountStatus:
-                        passenger.account_status,
-                });
-            }
-
-            // ------------------------------------------------
-            // SUCCESS
-            // ------------------------------------------------
-
-            return res.status(200).json({
-                success: true,
-                message:
-                    'Passenger profile retrieved successfully.',
-                passenger,
-            });
-        } catch (error) {
-            console.error(
-                'Passenger profile database error:',
-                error,
-            );
-
-            return res.status(500).json({
-                success: false,
-                code: 'SERVER_ERROR',
-                message:
-                    'Failed to retrieve passenger profile.',
-            });
-        }
-    },
-);
-
-// ============================================================
-// UPDATE PASSENGER ONLINE STATUS + LOCATION
-// ============================================================
-//
-// POST /api/passengers/update-status
-//
-// Body:
-//
-// {
-//     "isOnline": true,
-//     "latitude": 10.0605,
-//     "longitude": -2.5072
-// }
-//
-// NOTE:
-//   We cast every parameter explicitly in SQL
-//   ($1::boolean, $2::double precision, $3::double precision)
-//   otherwise PostgreSQL raises:
-//
-//     code 42P08:
-//     could not determine data type of parameter $2
-//
-//   because $2/$3 are referenced inside CASE WHEN ... IS NOT NULL
-//   and Postgres has no column context to infer a type for them.
-//
-// ============================================================
-
-router.post(
-    '/update-status',
-    verifyFirebaseToken,
-    async (
-        req: AuthenticatedRequest,
-        res: Response,
-    ) => {
-        const uid =
-            req.decodedToken?.uid;
-
-        // ----------------------------------------------------
-        // CHECK FIREBASE UID
-        // ----------------------------------------------------
-
-        if (!uid) {
-            return res.status(401).json({
-                success: false,
-                code: 'MISSING_FIREBASE_UID',
-                message:
-                    'Authenticated Firebase UID is missing.',
-            });
-        }
-
-        try {
-            const {
-                isOnline,
-                latitude,
-                longitude,
-            } = req.body || {};
-
-            // ------------------------------------------------
-            // ONLINE STATUS
-            // ------------------------------------------------
-
-            const online =
-                typeof isOnline === 'boolean'
-                    ? isOnline
-                    : true;
-
-            // ------------------------------------------------
-            // CONVERT COORDINATES
-            // ------------------------------------------------
-
-            const lat =
-                toFiniteNumber(latitude);
-
-            const lng =
-                toFiniteNumber(longitude);
-
-            // ------------------------------------------------
-            // COORDINATES MUST COME TOGETHER
-            // ------------------------------------------------
-
-            if (
-                (lat !== null &&
-                    lng === null) ||
-                (lat === null &&
-                    lng !== null)
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    code: 'INVALID_LOCATION',
-                    message:
-                        'Latitude and longitude must be supplied together.',
-                });
-            }
-
-            // ------------------------------------------------
-            // LATITUDE VALIDATION
-            // ------------------------------------------------
-
-            if (
-                lat !== null &&
-                (lat < -90 || lat > 90)
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    code: 'INVALID_LATITUDE',
-                    message:
-                        'Latitude must be between -90 and 90.',
-                });
-            }
-
-            // ------------------------------------------------
-            // LONGITUDE VALIDATION
-            // ------------------------------------------------
-
-            if (
-                lng !== null &&
-                (lng < -180 || lng > 180)
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    code: 'INVALID_LONGITUDE',
-                    message:
-                        'Longitude must be between -180 and 180.',
-                });
-            }
-
-            console.log(
-                '============================================',
-            );
-
-            console.log(
-                'PASSENGER STATUS / LOCATION UPDATE',
-            );
-
-            console.log(
-                'Firebase UID:',
-                uid,
-            );
-
-            console.log(
-                'Online:',
-                online,
-            );
-
-            console.log(
-                'Latitude:',
-                lat,
-            );
-
-            console.log(
-                'Longitude:',
-                lng,
-            );
-
-            console.log(
-                '============================================',
-            );
-
-            // ------------------------------------------------
-            // UPDATE DATABASE
-            //
-            //  ⚠️ EXPLICIT CASTS ARE REQUIRED HERE.
-            //
-            //  $1::boolean
-            //  $2::double precision
-            //  $3::double precision
-            //
-            //  Without the casts Postgres throws
-            //  "could not determine data type of parameter $2"
-            //  (SQLSTATE 42P08).
-            // ------------------------------------------------
-
-            const result =
-                await pool.query(
-                    `
-                    UPDATE passengers
-                    SET
-                        is_online = $1::boolean,
-
-                        last_online_at =
-                            CASE
-                                WHEN $1::boolean = TRUE
-                                THEN NOW()
-                                ELSE last_online_at
-                            END,
-
-                        current_latitude =
-                            COALESCE(
-                                $2::double precision,
-                                current_latitude
-                            ),
-
-                        current_longitude =
-                            COALESCE(
-                                $3::double precision,
-                                current_longitude
-                            ),
-
-                        last_location_update =
-                            CASE
-                                WHEN $2::double precision IS NOT NULL
-                                 AND $3::double precision IS NOT NULL
-                                THEN NOW()
-                                ELSE last_location_update
-                            END,
-
-                        updated_at = NOW()
-
-                    WHERE firebase_uid = $4
-
-                    RETURNING
+            // ---------------------------------------------------------------
+            // Haversine fallback (no PostGIS required).
+            // ---------------------------------------------------------------
+            const haversineQuery = `
+                WITH candidates AS (
+                    SELECT
                         id,
                         firebase_uid,
                         full_name,
                         phone,
-                        email,
-                        account_status,
-                        is_online,
-                        last_online_at,
+                        profile_photo_url,
                         current_latitude,
                         current_longitude,
-                        last_location_update,
-                        updated_at
-                    `,
-                    [
-                        online,
-                        lat,
-                        lng,
-                        uid,
-                    ],
-                );
+                        is_online,
+                        last_online_at,
+                        NULLIF(TRIM(current_latitude),  '')::double precision AS lat_num,
+                        NULLIF(TRIM(current_longitude), '')::double precision AS lng_num
+                    FROM public.passengers
+                    WHERE is_online = true
+                      AND account_status = 'active'
+                      AND current_latitude  IS NOT NULL
+                      AND current_longitude IS NOT NULL
+                      AND TRIM(current_latitude)  <> ''
+                      AND TRIM(current_longitude) <> ''
+                ),
+                distances AS (
+                    SELECT
+                        *,
+                        6371000 * 2 * ASIN(
+                            SQRT(
+                                POWER(SIN(RADIANS(lat_num - $2::double precision) / 2), 2) +
+                                COS(RADIANS($2::double precision)) *
+                                COS(RADIANS(lat_num)) *
+                                POWER(SIN(RADIANS(lng_num - $1::double precision) / 2), 2)
+                            )
+                        ) AS distance_meters
+                    FROM candidates
+                    WHERE lat_num IS NOT NULL
+                      AND lng_num IS NOT NULL
+                )
+                SELECT
+                    id,
+                    firebase_uid,
+                    full_name,
+                    phone,
+                    profile_photo_url,
+                    current_latitude,
+                    current_longitude,
+                    is_online,
+                    last_online_at,
+                    ROUND(distance_meters)::int AS distance_meters
+                FROM distances
+                WHERE distance_meters <= $3::double precision
+                ORDER BY distance_meters ASC
+                LIMIT 50;
+            `;
 
-            // ------------------------------------------------
-            // PASSENGER NOT FOUND
-            // ------------------------------------------------
+            const params = [longitude, latitude, searchRadius];
 
-            if (result.rows.length === 0) {
-                console.log(
-                    'PASSENGER NOT FOUND FOR LOCATION UPDATE',
-                );
+            let result;
+            try {
+                result = await pool.query(postgisQuery, params);
+            } catch (postgisErr: unknown) {
+                const pe = postgisErr as { code?: string; message?: string };
 
-                console.log(
-                    'Firebase UID:',
-                    uid,
-                );
-
-                return res.status(404).json({
-                    success: false,
-                    code: 'PASSENGER_NOT_FOUND',
-                    message:
-                        'Passenger account was not found.',
-                });
+                // 42883 = undefined_function (PostGIS missing)
+                // 42703 = undefined_column (ST_* referenced a missing column)
+                if (pe.code === '42883' || pe.code === '42703') {
+                    console.warn(
+                        '⚠️ PostGIS unavailable, falling back to Haversine.',
+                        pe.message,
+                    );
+                    result = await pool.query(haversineQuery, params);
+                } else {
+                    throw postgisErr;
+                }
             }
-
-            // ------------------------------------------------
-            // UPDATED PASSENGER
-            // ------------------------------------------------
-
-            const passenger =
-                result.rows[0];
-
-            console.log(
-                'PASSENGER LOCATION UPDATED SUCCESSFULLY',
-            );
-
-            console.log(
-                'Passenger ID:',
-                passenger.id,
-            );
-
-            console.log(
-                'Firebase UID:',
-                passenger.firebase_uid,
-            );
-
-            console.log(
-                'Latitude:',
-                passenger.current_latitude,
-            );
-
-            console.log(
-                'Longitude:',
-                passenger.current_longitude,
-            );
-
-            console.log(
-                'Last location update:',
-                passenger.last_location_update,
-            );
-
-            // ------------------------------------------------
-            // SUCCESS
-            // ------------------------------------------------
 
             return res.status(200).json({
                 success: true,
-                message: online
-                    ? 'Passenger is now online and location updated.'
-                    : 'Passenger is now offline.',
-                passenger,
+                count: result.rows.length,
+                passengers: result.rows,
             });
-        } catch (error) {
-            console.error(
-                'Passenger update-status error:',
-                error,
-            );
+        } catch (error: unknown) {
+            const e = error as { message?: string; code?: string };
+            console.error('❌ Error fetching nearby passengers:', e);
 
             return res.status(500).json({
                 success: false,
-                code: 'SERVER_ERROR',
-                message:
-                    'Failed to update passenger status and location.',
+                message: 'Failed to fetch nearby passengers',
+                code: 'NEARBY_PASSENGERS_FAILED',
+                error: e.message,
             });
         }
     },
 );
-
-// ============================================================
-// EXPORT
-// ============================================================
 
 export default router;
