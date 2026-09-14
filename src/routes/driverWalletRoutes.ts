@@ -32,7 +32,8 @@ interface AuthenticatedDriverRequest extends Request {
 |--------------------------------------------------------------------------
 */
 
-const PAYSTACK_BASE_URL = 'https://api.paystack.co';
+const PAYSTACK_BASE_URL =
+    'https://api.paystack.co';
 
 const PAYSTACK_SECRET_KEY =
     process.env.PAYSTACK_SECRET_KEY || '';
@@ -61,13 +62,16 @@ const MINIMUM_WALLET_BALANCE = 100.00;
 function getPaystackHeaders() {
     if (!PAYSTACK_SECRET_KEY) {
         throw new Error(
-            'PAYSTACK_SECRET_KEY is not configured'
+            'PAYSTACK_SECRET_KEY is not configured',
         );
     }
 
     return {
-        Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-        'Content-Type': 'application/json',
+        Authorization:
+            `Bearer ${PAYSTACK_SECRET_KEY}`,
+
+        'Content-Type':
+            'application/json',
     };
 }
 
@@ -81,7 +85,7 @@ function getPaystackHeaders() {
  * Generate a unique wallet top-up reference.
  */
 function generateTopupReference(
-    driverId: number
+    driverId: number,
 ): string {
     const timestamp = Date.now();
 
@@ -91,14 +95,16 @@ function generateTopupReference(
             .substring(2, 8)
             .toUpperCase();
 
-    return `TGA-TOPUP-${driverId}-${timestamp}-${randomPart}`;
+    return (
+        `TGA-TOPUP-${driverId}-${timestamp}-${randomPart}`
+    );
 }
 
 /**
  * Generate a unique withdrawal reference.
  */
 function generateWithdrawalReference(
-    driverId: number
+    driverId: number,
 ): string {
     const timestamp = Date.now();
 
@@ -108,7 +114,9 @@ function generateWithdrawalReference(
             .substring(2, 8)
             .toUpperCase();
 
-    return `TGA-WD-${driverId}-${timestamp}-${randomPart}`;
+    return (
+        `TGA-WD-${driverId}-${timestamp}-${randomPart}`
+    );
 }
 
 /**
@@ -117,7 +125,7 @@ function generateWithdrawalReference(
  * GHS 10.50 -> 1050
  */
 function toPaystackAmount(
-    amount: number
+    amount: number,
 ): number {
     return Math.round(amount * 100);
 }
@@ -126,10 +134,10 @@ function toPaystackAmount(
  * Convert Paystack amount back to GHS.
  */
 function fromPaystackAmount(
-    amount: number
+    amount: number,
 ): number {
     return Number(
-        (amount / 100).toFixed(2)
+        (amount / 100).toFixed(2),
     );
 }
 
@@ -137,7 +145,7 @@ function fromPaystackAmount(
  * Safely convert database numeric values.
  */
 function toNumber(
-    value: unknown
+    value: unknown,
 ): number {
     const number = Number(value);
 
@@ -148,6 +156,56 @@ function toNumber(
     return number;
 }
 
+/**
+ * Normalize a Ghana mobile number.
+ *
+ * Supported:
+ *
+ * 0241234567
+ * +233241234567
+ * 233241234567
+ *
+ * Stored as:
+ *
+ * 0241234567
+ */
+function normalizeGhanaMobileNumber(
+    value: unknown,
+): string | null {
+    if (
+        value === null ||
+        value === undefined
+    ) {
+        return null;
+    }
+
+    let number =
+        String(value)
+            .trim()
+            .replace(/\s+/g, '')
+            .replace(/-/g, '');
+
+    if (
+        /^0\d{9}$/.test(number)
+    ) {
+        return number;
+    }
+
+    if (
+        /^\+233\d{9}$/.test(number)
+    ) {
+        return `0${number.substring(4)}`;
+    }
+
+    if (
+        /^233\d{9}$/.test(number)
+    ) {
+        return `0${number.substring(3)}`;
+    }
+
+    return null;
+}
+
 /*
 |--------------------------------------------------------------------------
 | DRIVER EMAIL
@@ -155,26 +213,30 @@ function toNumber(
 */
 
 async function getDriverEmail(
-    driverId: number
+    driverId: number,
 ): Promise<string> {
 
-    const result = await pool.query(
-        `
-        SELECT *
-        FROM public.drivers
-        WHERE id = $1
-        LIMIT 1
-        `,
-        [driverId]
-    );
+    const result =
+        await pool.query(
+            `
+            SELECT *
+            FROM public.drivers
+            WHERE id = $1
+            LIMIT 1
+            `,
+            [driverId],
+        );
 
-    if (result.rows.length === 0) {
+    if (
+        result.rows.length === 0
+    ) {
         throw new Error(
-            'Driver account not found'
+            'Driver account not found',
         );
     }
 
-    const driver = result.rows[0];
+    const driver =
+        result.rows[0];
 
     const possibleEmailFields = [
         'email',
@@ -183,22 +245,30 @@ async function getDriverEmail(
         'user_email',
     ];
 
-    for (const field of possibleEmailFields) {
+    for (
+        const field of possibleEmailFields
+    ) {
 
         if (
             driver[field] &&
-            typeof driver[field] === 'string'
+            typeof driver[field] ===
+            'string'
         ) {
+
             const email =
                 driver[field].trim();
 
-            if (email.includes('@')) {
+            if (
+                email.includes('@')
+            ) {
                 return email;
             }
         }
     }
 
-    return `driver-${driverId}@tegaara.app`;
+    return (
+        `driver-${driverId}@tegaara.app`
+    );
 }
 
 /*
@@ -212,7 +282,24 @@ async function getDriverEmail(
 |
 | Authorization: Bearer <FIREBASE_ID_TOKEN>
 |
-| NOT the Firebase custom token.
+| NOT:
+|
+| - Firebase custom token
+| - OTP verification ID
+| - refresh token
+|
+|--------------------------------------------------------------------------
+|
+| Firebase ID tokens normally expire after approximately one hour.
+|
+| The backend CANNOT refresh the Firebase ID token.
+|
+| Flutter must obtain a fresh ID token using:
+|
+|     await FirebaseAuth.instance.currentUser
+|         ?.getIdToken(true);
+|
+| Then retry the API request.
 |
 |--------------------------------------------------------------------------
 */
@@ -220,26 +307,30 @@ async function getDriverEmail(
 async function authenticateDriver(
     req: AuthenticatedDriverRequest,
     res: Response,
-    next: NextFunction
+    next: NextFunction,
 ): Promise<void> {
 
     try {
 
-        const authHeader =
-            req.headers.authorization;
-
         /*
         |--------------------------------------------------------------------------
-        | Authorization header missing
+        | Get Authorization header
         |--------------------------------------------------------------------------
         */
 
+        const authHeader =
+            req.headers.authorization;
+
         if (!authHeader) {
+
             res.status(401).json({
                 success: false,
+
                 message:
                     'Authentication token is required.',
-                code: 'TOKEN_MISSING',
+
+                code:
+                    'TOKEN_MISSING',
             });
 
             return;
@@ -247,18 +338,24 @@ async function authenticateDriver(
 
         /*
         |--------------------------------------------------------------------------
-        | Authorization header malformed
+        | Validate Bearer format
         |--------------------------------------------------------------------------
         */
 
         if (
-            !authHeader.startsWith('Bearer ')
+            !authHeader.startsWith(
+                'Bearer ',
+            )
         ) {
+
             res.status(401).json({
                 success: false,
+
                 message:
                     'Invalid authorization header format.',
-                code: 'INVALID_AUTH_HEADER',
+
+                code:
+                    'INVALID_AUTH_HEADER',
             });
 
             return;
@@ -276,11 +373,15 @@ async function authenticateDriver(
                 .trim();
 
         if (!token) {
+
             res.status(401).json({
                 success: false,
+
                 message:
                     'Authentication token is empty.',
-                code: 'TOKEN_MISSING',
+
+                code:
+                    'TOKEN_MISSING',
             });
 
             return;
@@ -290,20 +391,149 @@ async function authenticateDriver(
         |--------------------------------------------------------------------------
         | Verify Firebase ID token
         |--------------------------------------------------------------------------
+        |
+        | true = also check whether the token has been revoked.
+        |
+        |--------------------------------------------------------------------------
         */
 
-        const decodedToken =
-            await firebaseAuth.verifyIdToken(
-                token,
-                false
+        let decodedToken;
+
+        try {
+
+            decodedToken =
+                await firebaseAuth
+                    .verifyIdToken(
+                        token,
+                        true,
+                    );
+
+        } catch (
+        firebaseError: any
+        ) {
+
+            console.error(
+                'Firebase token verification failed:',
+                {
+                    code:
+                        firebaseError?.code,
+
+                    message:
+                        firebaseError?.message,
+                },
             );
 
-        if (!decodedToken?.uid) {
+            /*
+            |--------------------------------------------------------------------------
+            | EXPIRED TOKEN
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+                firebaseError?.code ===
+                'auth/id-token-expired'
+            ) {
+
+                res.status(401).json({
+                    success: false,
+
+                    message:
+                        'Your authentication session has expired. Please refresh your session and try again.',
+
+                    code:
+                        'TOKEN_EXPIRED',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | REVOKED TOKEN
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+                firebaseError?.code ===
+                'auth/id-token-revoked'
+            ) {
+
+                res.status(401).json({
+                    success: false,
+
+                    message:
+                        'Your authentication session has been revoked. Please sign in again.',
+
+                    code:
+                        'TOKEN_REVOKED',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | INVALID TOKEN
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+                firebaseError?.code ===
+                'auth/invalid-id-token' ||
+                firebaseError?.code ===
+                'auth/argument-error'
+            ) {
+
+                res.status(401).json({
+                    success: false,
+
+                    message:
+                        'Invalid authentication token. Please sign in again.',
+
+                    code:
+                        'INVALID_TOKEN',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | UNKNOWN FIREBASE AUTH ERROR
+            |--------------------------------------------------------------------------
+            */
+
             res.status(401).json({
                 success: false,
+
+                message:
+                    'Invalid or expired authentication token.',
+
+                code:
+                    'INVALID_OR_EXPIRED_TOKEN',
+            });
+
+            return;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Ensure Firebase UID exists
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            !decodedToken?.uid
+        ) {
+
+            res.status(401).json({
+                success: false,
+
                 message:
                     'Authentication token does not contain a valid Firebase UID.',
-                code: 'INVALID_TOKEN',
+
+                code:
+                    'INVALID_TOKEN',
             });
 
             return;
@@ -321,11 +551,11 @@ async function authenticateDriver(
         |
         | Your drivers table uses:
         |
-        | uid
+        |     uid
         |
         | NOT:
         |
-        | firebase_uid
+        |     firebase_uid
         |
         |--------------------------------------------------------------------------
         */
@@ -341,17 +571,21 @@ async function authenticateDriver(
                 WHERE uid = $1
                 LIMIT 1
                 `,
-                [firebaseUid]
+                [firebaseUid],
             );
 
         if (
             driverResult.rows.length === 0
         ) {
+
             res.status(404).json({
                 success: false,
+
                 message:
                     'Driver account not found.',
-                code: 'DRIVER_NOT_FOUND',
+
+                code:
+                    'DRIVER_NOT_FOUND',
             });
 
             return;
@@ -385,82 +619,22 @@ async function authenticateDriver(
         console.error(
             'Driver authentication error:',
             {
-                code: error?.code,
-                message: error?.message,
-            }
+                code:
+                    error?.code,
+
+                message:
+                    error?.message,
+            },
         );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Firebase ID token expired
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            error?.code ===
-            'auth/id-token-expired'
-        ) {
-            res.status(401).json({
-                success: false,
-                message:
-                    'Your authentication session has expired. Please refresh your session and try again.',
-                code: 'TOKEN_EXPIRED',
-            });
-
-            return;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Firebase ID token revoked
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            error?.code ===
-            'auth/id-token-revoked'
-        ) {
-            res.status(401).json({
-                success: false,
-                message:
-                    'Your authentication session has been revoked. Please sign in again.',
-                code: 'TOKEN_REVOKED',
-            });
-
-            return;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Firebase invalid token
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            error?.code ===
-            'auth/invalid-id-token'
-        ) {
-            res.status(401).json({
-                success: false,
-                message:
-                    'Invalid authentication token.',
-                code: 'INVALID_TOKEN',
-            });
-
-            return;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Generic Firebase authentication failure
-        |--------------------------------------------------------------------------
-        */
 
         res.status(401).json({
             success: false,
+
             message:
-                'Invalid or expired authentication token.',
-            code: 'INVALID_OR_EXPIRED_TOKEN',
+                'Authentication failed.',
+
+            code:
+                'AUTHENTICATION_FAILED',
         });
     }
 }
@@ -472,10 +646,53 @@ async function authenticateDriver(
 */
 
 async function getOrCreateWallet(
-    driverId: number
+    driverId: number,
 ) {
 
-    let result =
+    /*
+    |--------------------------------------------------------------------------
+    | Insert only if wallet does not exist.
+    |--------------------------------------------------------------------------
+    */
+
+    await pool.query(
+        `
+        INSERT INTO public.driver_wallets (
+            driver_id,
+            balance,
+            pending_balance,
+            total_earnings,
+            total_withdrawn,
+            total_commission_paid,
+            amount_owed,
+            minimum_balance
+        )
+        VALUES (
+            $1,
+            0.00,
+            0.00,
+            0.00,
+            0.00,
+            0.00,
+            0.00,
+            $2
+        )
+        ON CONFLICT (driver_id)
+        DO NOTHING
+        `,
+        [
+            driverId,
+            MINIMUM_WALLET_BALANCE,
+        ],
+    );
+
+    /*
+    |--------------------------------------------------------------------------
+    | Retrieve wallet.
+    |--------------------------------------------------------------------------
+    */
+
+    const result =
         await pool.query(
             `
             SELECT *
@@ -483,39 +700,16 @@ async function getOrCreateWallet(
             WHERE driver_id = $1
             LIMIT 1
             `,
-            [driverId]
+            [driverId],
         );
 
-    if (result.rows.length > 0) {
-        return result.rows[0];
+    if (
+        result.rows.length === 0
+    ) {
+        throw new Error(
+            'Unable to create or load driver wallet.',
+        );
     }
-
-    result =
-        await pool.query(
-            `
-            INSERT INTO public.driver_wallets (
-                driver_id,
-                balance,
-                pending_balance,
-                total_earnings,
-                total_withdrawn,
-                minimum_balance
-            )
-            VALUES (
-                $1,
-                0.00,
-                0.00,
-                0.00,
-                0.00,
-                $2
-            )
-            RETURNING *
-            `,
-            [
-                driverId,
-                MINIMUM_WALLET_BALANCE,
-            ]
-        );
 
     return result.rows[0];
 }
@@ -531,7 +725,7 @@ router.get(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -541,51 +735,52 @@ router.get(
 
             const wallet =
                 await getOrCreateWallet(
-                    driverId
+                    driverId,
                 );
 
             res.json({
                 success: true,
 
                 wallet: {
-                    id: wallet.id,
+                    id:
+                        wallet.id,
 
                     driverId:
                         wallet.driver_id,
 
                     balance:
                         toNumber(
-                            wallet.balance
+                            wallet.balance,
                         ),
 
                     pendingBalance:
                         toNumber(
-                            wallet.pending_balance
+                            wallet.pending_balance,
                         ),
 
                     totalEarnings:
                         toNumber(
-                            wallet.total_earnings
+                            wallet.total_earnings,
                         ),
 
                     totalWithdrawn:
                         toNumber(
-                            wallet.total_withdrawn
+                            wallet.total_withdrawn,
                         ),
 
                     totalCommissionPaid:
                         toNumber(
-                            wallet.total_commission_paid
+                            wallet.total_commission_paid,
                         ),
 
                     amountOwed:
                         toNumber(
-                            wallet.amount_owed
+                            wallet.amount_owed,
                         ),
 
                     minimumBalance:
                         toNumber(
-                            wallet.minimum_balance
+                            wallet.minimum_balance,
                         ),
 
                     lastTransactionAt:
@@ -603,16 +798,17 @@ router.get(
 
             console.error(
                 'GET /wallet error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to load wallet.',
             });
         }
-    }
+    },
 );
 
 /*
@@ -626,7 +822,7 @@ router.get(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -638,19 +834,19 @@ router.get(
                 Math.min(
                     Math.max(
                         Number(
-                            req.query.limit
+                            req.query.limit,
                         ) || 50,
-                        1
+                        1,
                     ),
-                    100
+                    100,
                 );
 
             const offset =
                 Math.max(
                     Number(
-                        req.query.offset
+                        req.query.offset,
                     ) || 0,
-                    0
+                    0,
                 );
 
             const result =
@@ -679,7 +875,7 @@ router.get(
                         driverId,
                         limit,
                         offset,
-                    ]
+                    ],
                 );
 
             res.json({
@@ -687,7 +883,9 @@ router.get(
 
                 transactions:
                     result.rows.map(
-                        (transaction) => ({
+                        (
+                            transaction,
+                        ) => ({
                             id:
                                 transaction.id,
 
@@ -702,17 +900,17 @@ router.get(
 
                             amount:
                                 toNumber(
-                                    transaction.amount
+                                    transaction.amount,
                                 ),
 
                             balanceBefore:
                                 toNumber(
-                                    transaction.balance_before
+                                    transaction.balance_before,
                                 ),
 
                             balanceAfter:
                                 toNumber(
-                                    transaction.balance_after
+                                    transaction.balance_after,
                                 ),
 
                             reference:
@@ -729,7 +927,7 @@ router.get(
 
                             createdAt:
                                 transaction.created_at,
-                        })
+                        }),
                     ),
             });
 
@@ -737,16 +935,17 @@ router.get(
 
             console.error(
                 'GET /wallet/transactions error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to load wallet transactions.',
             });
         }
-    }
+    },
 );
 
 /*
@@ -760,7 +959,7 @@ router.get(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -786,15 +985,18 @@ router.get(
                       AND is_active = TRUE
                     LIMIT 1
                     `,
-                    [driverId]
+                    [driverId],
                 );
 
             if (
                 result.rows.length === 0
             ) {
+
                 res.json({
                     success: true,
-                    paymentAccount: null,
+
+                    paymentAccount:
+                        null,
                 });
 
                 return;
@@ -840,16 +1042,17 @@ router.get(
 
             console.error(
                 'GET /wallet/payment-account error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to load payment account.',
             });
         }
-    }
+    },
 );
 
 /*
@@ -863,7 +1066,7 @@ router.post(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -873,17 +1076,28 @@ router.post(
 
             const {
                 mobileNetwork,
-                mobileNumber,
                 accountName,
             } = req.body;
+
+            /*
+            |--------------------------------------------------------------------------
+            | Support both names for Flutter compatibility
+            |--------------------------------------------------------------------------
+            */
+
+            const mobileNumber =
+                req.body.mobileNumber ??
+                req.body.mobileMoneyNumber;
 
             if (
                 !mobileNetwork ||
                 !mobileNumber ||
                 !accountName
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Mobile network, mobile number and account name are required.',
                 });
@@ -899,13 +1113,20 @@ router.post(
                 'Vodafone',
             ];
 
+            const normalizedNetwork =
+                String(
+                    mobileNetwork,
+                ).trim();
+
             if (
                 !allowedNetworks.includes(
-                    String(mobileNetwork)
+                    normalizedNetwork,
                 )
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Invalid mobile network.',
                 });
@@ -913,29 +1134,38 @@ router.post(
                 return;
             }
 
-            const cleanedNumber =
-                String(mobileNumber)
-                    .replace(/\s+/g, '')
-                    .replace(/-/g, '');
+            const normalizedNumber =
+                normalizeGhanaMobileNumber(
+                    mobileNumber,
+                );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Correct Ghana phone regex
-            |--------------------------------------------------------------------------
-            */
+            if (!normalizedNumber) {
 
-            const ghanaPhoneRegex =
-                /^(?:0\d{9}|\+233\d{9})$/;
-
-            if (
-                !ghanaPhoneRegex.test(
-                    cleanedNumber
-                )
-            ) {
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Enter a valid Ghana mobile number.',
+                });
+
+                return;
+            }
+
+            const normalizedAccountName =
+                String(
+                    accountName,
+                ).trim();
+
+            if (
+                normalizedAccountName.length <
+                2
+            ) {
+
+                res.status(400).json({
+                    success: false,
+
+                    message:
+                        'Enter a valid account name.',
                 });
 
                 return;
@@ -947,9 +1177,6 @@ router.post(
             |--------------------------------------------------------------------------
             |
             | driver_payment_accounts.driver_id is UNIQUE.
-            |
-            | Therefore we update the existing account instead
-            | of inserting another row.
             |
             |--------------------------------------------------------------------------
             */
@@ -1001,20 +1228,18 @@ router.post(
                     `,
                     [
                         driverId,
-                        String(
-                            mobileNetwork
-                        ).trim(),
 
-                        cleanedNumber,
+                        normalizedNetwork,
 
-                        String(
-                            accountName
-                        ).trim(),
-                    ]
+                        normalizedNumber,
+
+                        normalizedAccountName,
+                    ],
                 );
 
             res.status(200).json({
                 success: true,
+
                 message:
                     'Payment account saved successfully.',
 
@@ -1026,16 +1251,17 @@ router.post(
 
             console.error(
                 'POST /wallet/payment-account error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to save payment account.',
             });
         }
-    }
+    },
 );
 
 /*
@@ -1049,7 +1275,7 @@ router.post(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -1057,9 +1283,13 @@ router.post(
             const driverId =
                 req.driverId!;
 
-            if (!PAYSTACK_SECRET_KEY) {
+            if (
+                !PAYSTACK_SECRET_KEY
+            ) {
+
                 res.status(500).json({
                     success: false,
+
                     message:
                         'Paystack is not configured on the server. Please add PAYSTACK_SECRET_KEY.',
                 });
@@ -1069,15 +1299,17 @@ router.post(
 
             const amount =
                 Number(
-                    req.body.amount
+                    req.body.amount,
                 );
 
             if (
                 !Number.isFinite(amount) ||
                 amount <= 0
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Enter a valid top-up amount.',
                 });
@@ -1087,15 +1319,17 @@ router.post(
 
             const normalizedAmount =
                 Number(
-                    amount.toFixed(2)
+                    amount.toFixed(2),
                 );
 
             if (
                 normalizedAmount <
                 MIN_TOPUP_AMOUNT
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         `Minimum wallet top-up is GHS ${MIN_TOPUP_AMOUNT.toFixed(2)}.`,
                 });
@@ -1105,22 +1339,22 @@ router.post(
 
             const wallet =
                 await getOrCreateWallet(
-                    driverId
+                    driverId,
                 );
 
             const driverEmail =
                 await getDriverEmail(
-                    driverId
+                    driverId,
                 );
 
             const reference =
                 generateTopupReference(
-                    driverId
+                    driverId,
                 );
 
             const paystackAmount =
                 toPaystackAmount(
-                    normalizedAmount
+                    normalizedAmount,
                 );
 
             const topupResult =
@@ -1172,7 +1406,7 @@ router.post(
                             provider:
                                 'paystack',
                         }),
-                    ]
+                    ],
                 );
 
             let paystackResponse;
@@ -1189,7 +1423,7 @@ router.post(
 
                             amount:
                                 String(
-                                    paystackAmount
+                                    paystackAmount,
                                 ),
 
                             currency:
@@ -1229,15 +1463,18 @@ router.post(
 
                             timeout:
                                 30000,
-                        }
+                        },
                     );
 
-            } catch (paystackError: any) {
+            } catch (
+            paystackError: any
+            ) {
 
                 console.error(
                     'Paystack initialization error:',
-                    paystackError?.response?.data ||
-                    paystackError
+                    paystackError?.response
+                        ?.data ||
+                    paystackError,
                 );
 
                 await pool.query(
@@ -1257,13 +1494,15 @@ router.post(
                             ?.data
                             ?.message ||
                         'Paystack initialization failed',
-                    ]
+                    ],
                 );
 
                 res.status(502).json({
                     success: false,
+
                     message:
                         'Unable to initialize Paystack payment.',
+
                     reference,
                 });
 
@@ -1271,8 +1510,10 @@ router.post(
             }
 
             if (
-                !paystackResponse.data?.status ||
-                !paystackResponse.data?.data
+                !paystackResponse.data
+                    ?.status ||
+                !paystackResponse.data
+                    ?.data
             ) {
 
                 await pool.query(
@@ -1291,13 +1532,15 @@ router.post(
                             .data
                             ?.message ||
                         'Paystack initialization failed',
-                    ]
+                    ],
                 );
 
                 res.status(502).json({
                     success: false,
+
                     message:
                         'Paystack could not initialize the payment.',
+
                     reference,
                 });
 
@@ -1323,11 +1566,12 @@ router.post(
                         updated_at = NOW()
                     WHERE reference = $1
                     `,
-                    [reference]
+                    [reference],
                 );
 
                 res.status(502).json({
                     success: false,
+
                     message:
                         'Payment reference verification failed.',
                 });
@@ -1352,7 +1596,7 @@ router.post(
 
                     paystackData
                         .access_code,
-                ]
+                ],
             );
 
             res.status(200).json({
@@ -1387,16 +1631,17 @@ router.post(
 
             console.error(
                 'POST /wallet/topup error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to initialize wallet top-up.',
             });
         }
-    }
+    },
 );
 
 /*
@@ -1410,7 +1655,7 @@ router.get(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         const client =
@@ -1423,12 +1668,15 @@ router.get(
 
             const reference =
                 String(
-                    req.params.reference || ''
+                    req.params.reference ||
+                    '',
                 ).trim();
 
             if (!reference) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Payment reference is required.',
                 });
@@ -1448,14 +1696,17 @@ router.get(
                     [
                         reference,
                         driverId,
-                    ]
+                    ],
                 );
 
             if (
-                topupResult.rows.length === 0
+                topupResult.rows.length ===
+                0
             ) {
+
                 res.status(404).json({
                     success: false,
+
                     message:
                         'Wallet top-up transaction not found.',
                 });
@@ -1473,7 +1724,7 @@ router.get(
 
                 const wallet =
                     await getOrCreateWallet(
-                        driverId
+                        driverId,
                     );
 
                 res.json({
@@ -1489,12 +1740,12 @@ router.get(
 
                     amount:
                         toNumber(
-                            topup.amount
+                            topup.amount,
                         ),
 
                     walletBalance:
                         toNumber(
-                            wallet.balance
+                            wallet.balance,
                         ),
                 });
 
@@ -1515,21 +1766,26 @@ router.get(
 
                             timeout:
                                 30000,
-                        }
+                        },
                     );
 
-            } catch (paystackError: any) {
+            } catch (
+            paystackError: any
+            ) {
 
                 console.error(
                     'Paystack verification error:',
-                    paystackError?.response?.data ||
-                    paystackError
+                    paystackError?.response
+                        ?.data ||
+                    paystackError,
                 );
 
                 res.status(502).json({
                     success: false,
+
                     message:
                         'Unable to verify payment with Paystack.',
+
                     reference,
                 });
 
@@ -1544,10 +1800,13 @@ router.get(
                     .data
                     ?.data
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Paystack could not verify this transaction.',
+
                     reference,
                 });
 
@@ -1563,8 +1822,10 @@ router.get(
                 payment.reference !==
                 reference
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Payment reference does not match.',
                 });
@@ -1590,7 +1851,7 @@ router.get(
 
                         payment.status ||
                         'unknown',
-                    ]
+                    ],
                 );
 
                 res.status(400).json({
@@ -1612,8 +1873,10 @@ router.get(
                 payment.currency !==
                 PAYSTACK_CURRENCY
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Payment currency does not match.',
                 });
@@ -1624,13 +1887,13 @@ router.get(
             const expectedAmount =
                 toPaystackAmount(
                     toNumber(
-                        topup.amount
-                    )
+                        topup.amount,
+                    ),
                 );
 
             const paidAmount =
                 Number(
-                    payment.amount
+                    payment.amount,
                 );
 
             if (
@@ -1650,7 +1913,7 @@ router.get(
                     [
                         reference,
                         'amount_mismatch',
-                    ]
+                    ],
                 );
 
                 res.status(400).json({
@@ -1661,12 +1924,12 @@ router.get(
 
                     expectedAmount:
                         fromPaystackAmount(
-                            expectedAmount
+                            expectedAmount,
                         ),
 
                     paidAmount:
                         fromPaystackAmount(
-                            paidAmount
+                            paidAmount,
                         ),
                 });
 
@@ -1680,7 +1943,7 @@ router.get(
             */
 
             await client.query(
-                'BEGIN'
+                'BEGIN',
             );
 
             /*
@@ -1701,19 +1964,21 @@ router.get(
                     [
                         reference,
                         driverId,
-                    ]
+                    ],
                 );
 
             if (
-                lockedTopup.rows.length === 0
+                lockedTopup.rows.length ===
+                0
             ) {
 
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
 
                 res.status(404).json({
                     success: false,
+
                     message:
                         'Top-up transaction no longer exists.',
                 });
@@ -1730,12 +1995,12 @@ router.get(
             ) {
 
                 await client.query(
-                    'COMMIT'
+                    'COMMIT',
                 );
 
                 const wallet =
                     await getOrCreateWallet(
-                        driverId
+                        driverId,
                     );
 
                 res.json({
@@ -1751,12 +2016,12 @@ router.get(
 
                     amount:
                         toNumber(
-                            currentTopup.amount
+                            currentTopup.amount,
                         ),
 
                     walletBalance:
                         toNumber(
-                            wallet.balance
+                            wallet.balance,
                         ),
                 });
 
@@ -1781,19 +2046,21 @@ router.get(
                     [
                         currentTopup.wallet_id,
                         driverId,
-                    ]
+                    ],
                 );
 
             if (
-                walletResult.rows.length === 0
+                walletResult.rows.length ===
+                0
             ) {
 
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
 
                 res.status(404).json({
                     success: false,
+
                     message:
                         'Driver wallet not found.',
                 });
@@ -1806,12 +2073,12 @@ router.get(
 
             const balanceBefore =
                 toNumber(
-                    wallet.balance
+                    wallet.balance,
                 );
 
             const topupAmount =
                 toNumber(
-                    currentTopup.amount
+                    currentTopup.amount,
                 );
 
             const balanceAfter =
@@ -1819,7 +2086,7 @@ router.get(
                     (
                         balanceBefore +
                         topupAmount
-                    ).toFixed(2)
+                    ).toFixed(2),
                 );
 
             /*
@@ -1840,7 +2107,7 @@ router.get(
                 [
                     wallet.id,
                     balanceAfter,
-                ]
+                ],
             );
 
             /*
@@ -1899,7 +2166,7 @@ router.get(
 
                         paystackTransactionId:
                             String(
-                                payment.id
+                                payment.id,
                             ),
 
                         paystackStatus:
@@ -1912,7 +2179,7 @@ router.get(
                             payment.paid_at ||
                             null,
                     }),
-                ]
+                ],
             );
 
             /*
@@ -1936,15 +2203,15 @@ router.get(
                     currentTopup.id,
 
                     String(
-                        payment.id
+                        payment.id,
                     ),
 
                     payment.status,
-                ]
+                ],
             );
 
             await client.query(
-                'COMMIT'
+                'COMMIT',
             );
 
             res.json({
@@ -1972,7 +2239,7 @@ router.get(
 
             try {
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
             } catch (_) {
                 // Ignore rollback failure.
@@ -1980,11 +2247,12 @@ router.get(
 
             console.error(
                 'GET /wallet/topup/verify error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to verify wallet top-up.',
             });
@@ -1993,7 +2261,7 @@ router.get(
 
             client.release();
         }
-    }
+    },
 );
 
 /*
@@ -2007,7 +2275,7 @@ router.post(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         const client =
@@ -2020,15 +2288,17 @@ router.post(
 
             const amount =
                 Number(
-                    req.body.amount
+                    req.body.amount,
                 );
 
             if (
                 !Number.isFinite(amount) ||
                 amount <= 0
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Enter a valid withdrawal amount.',
                 });
@@ -2038,21 +2308,33 @@ router.post(
 
             const normalizedAmount =
                 Number(
-                    amount.toFixed(2)
+                    amount.toFixed(2),
                 );
 
             if (
                 normalizedAmount <
                 MIN_WITHDRAWAL_AMOUNT
             ) {
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         `Minimum withdrawal is GHS ${MIN_WITHDRAWAL_AMOUNT.toFixed(2)}.`,
                 });
 
                 return;
             }
+
+            /*
+            |--------------------------------------------------------------------------
+            | START TRANSACTION
+            |--------------------------------------------------------------------------
+            */
+
+            await client.query(
+                'BEGIN',
+            );
 
             /*
             |--------------------------------------------------------------------------
@@ -2069,14 +2351,21 @@ router.post(
                       AND is_active = TRUE
                     LIMIT 1
                     `,
-                    [driverId]
+                    [driverId],
                 );
 
             if (
-                paymentAccountResult.rows.length === 0
+                paymentAccountResult.rows.length ===
+                0
             ) {
+
+                await client.query(
+                    'ROLLBACK',
+                );
+
                 res.status(400).json({
                     success: false,
+
                     message:
                         'Please add a mobile money payment account before withdrawing.',
                 });
@@ -2086,16 +2375,6 @@ router.post(
 
             const paymentAccount =
                 paymentAccountResult.rows[0];
-
-            /*
-            |--------------------------------------------------------------------------
-            | START TRANSACTION
-            |--------------------------------------------------------------------------
-            */
-
-            await client.query(
-                'BEGIN'
-            );
 
             /*
             |--------------------------------------------------------------------------
@@ -2111,19 +2390,21 @@ router.post(
                     WHERE driver_id = $1
                     FOR UPDATE
                     `,
-                    [driverId]
+                    [driverId],
                 );
 
             if (
-                walletResult.rows.length === 0
+                walletResult.rows.length ===
+                0
             ) {
 
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
 
                 res.status(404).json({
                     success: false,
+
                     message:
                         'Driver wallet not found.',
                 });
@@ -2136,12 +2417,24 @@ router.post(
 
             const balance =
                 toNumber(
-                    wallet.balance
+                    wallet.balance,
                 );
 
             /*
             |--------------------------------------------------------------------------
-            | CHECK MINIMUM WALLET BALANCE
+            | USE DATABASE MINIMUM BALANCE
+            |--------------------------------------------------------------------------
+            */
+
+            const minimumBalance =
+                toNumber(
+                    wallet.minimum_balance,
+                ) ||
+                MINIMUM_WALLET_BALANCE;
+
+            /*
+            |--------------------------------------------------------------------------
+            | CALCULATE MAXIMUM WITHDRAWABLE
             |--------------------------------------------------------------------------
             */
 
@@ -2149,8 +2442,8 @@ router.post(
                 Number(
                     (
                         balance -
-                        MINIMUM_WALLET_BALANCE
-                    ).toFixed(2)
+                        minimumBalance
+                    ).toFixed(2),
                 );
 
             if (
@@ -2158,16 +2451,18 @@ router.post(
             ) {
 
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
 
                 res.status(400).json({
                     success: false,
 
                     message:
-                        `You must maintain at least GHS ${MINIMUM_WALLET_BALANCE.toFixed(2)} in your wallet.`,
+                        `You must maintain at least GHS ${minimumBalance.toFixed(2)} in your wallet.`,
 
                     balance,
+
+                    minimumBalance,
                 });
 
                 return;
@@ -2179,7 +2474,7 @@ router.post(
             ) {
 
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
 
                 res.status(400).json({
@@ -2190,6 +2485,8 @@ router.post(
 
                     balance,
 
+                    minimumBalance,
+
                     maximumWithdrawable:
                         availableToWithdraw,
                 });
@@ -2199,13 +2496,13 @@ router.post(
 
             /*
             |--------------------------------------------------------------------------
-            | CREATE REFERENCE
+            | CREATE WITHDRAWAL REFERENCE
             |--------------------------------------------------------------------------
             */
 
             const withdrawalReference =
                 generateWithdrawalReference(
-                    driverId
+                    driverId,
                 );
 
             /*
@@ -2226,12 +2523,12 @@ router.post(
                     (
                         normalizedAmount -
                         withdrawalFee
-                    ).toFixed(2)
+                    ).toFixed(2),
                 );
 
             /*
             |--------------------------------------------------------------------------
-            | CALCULATE BALANCE
+            | CALCULATE NEW WALLET BALANCE
             |--------------------------------------------------------------------------
             */
 
@@ -2240,7 +2537,7 @@ router.post(
                     (
                         balance -
                         normalizedAmount
-                    ).toFixed(2)
+                    ).toFixed(2),
                 );
 
             /*
@@ -2266,7 +2563,7 @@ router.post(
                     balanceAfter,
 
                     normalizedAmount,
-                ]
+                ],
             );
 
             /*
@@ -2274,9 +2571,9 @@ router.post(
             | CREATE WITHDRAWAL
             |--------------------------------------------------------------------------
             |
-            | Uses your NEW table:
+            | Exact table:
             |
-            | driver_wallet_withdrawals
+            | public.driver_wallet_withdrawals
             |
             |--------------------------------------------------------------------------
             */
@@ -2343,7 +2640,7 @@ router.post(
                             .account_name,
 
                         withdrawalReference,
-                    ]
+                    ],
                 );
 
             /*
@@ -2426,7 +2723,7 @@ router.post(
                         status:
                             'pending',
                     }),
-                ]
+                ],
             );
 
             /*
@@ -2436,7 +2733,7 @@ router.post(
             */
 
             await client.query(
-                'COMMIT'
+                'COMMIT',
             );
 
             res.status(201).json({
@@ -2450,13 +2747,19 @@ router.post(
 
                 walletBalance:
                     balanceAfter,
+
+                pendingBalance:
+                    toNumber(
+                        wallet.pending_balance,
+                    ) +
+                    normalizedAmount,
             });
 
         } catch (error) {
 
             try {
                 await client.query(
-                    'ROLLBACK'
+                    'ROLLBACK',
                 );
             } catch (_) {
                 // Ignore rollback failure.
@@ -2464,11 +2767,12 @@ router.post(
 
             console.error(
                 'POST /wallet/withdraw error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to create withdrawal request.',
             });
@@ -2477,7 +2781,7 @@ router.post(
 
             client.release();
         }
-    }
+    },
 );
 
 /*
@@ -2491,7 +2795,7 @@ router.get(
     authenticateDriver,
     async (
         req: AuthenticatedDriverRequest,
-        res: Response
+        res: Response,
     ) => {
 
         try {
@@ -2503,19 +2807,19 @@ router.get(
                 Math.min(
                     Math.max(
                         Number(
-                            req.query.limit
+                            req.query.limit,
                         ) || 50,
-                        1
+                        1,
                     ),
-                    100
+                    100,
                 );
 
             const offset =
                 Math.max(
                     Number(
-                        req.query.offset
+                        req.query.offset,
                     ) || 0,
-                    0
+                    0,
                 );
 
             const result =
@@ -2548,7 +2852,7 @@ router.get(
                         driverId,
                         limit,
                         offset,
-                    ]
+                    ],
                 );
 
             res.json({
@@ -2556,7 +2860,9 @@ router.get(
 
                 withdrawals:
                     result.rows.map(
-                        (withdrawal) => ({
+                        (
+                            withdrawal,
+                        ) => ({
                             id:
                                 withdrawal.id,
 
@@ -2571,17 +2877,17 @@ router.get(
 
                             amount:
                                 toNumber(
-                                    withdrawal.amount
+                                    withdrawal.amount,
                                 ),
 
                             fee:
                                 toNumber(
-                                    withdrawal.fee
+                                    withdrawal.fee,
                                 ),
 
                             netAmount:
                                 toNumber(
-                                    withdrawal.net_amount
+                                    withdrawal.net_amount,
                                 ),
 
                             mobileNetwork:
@@ -2610,7 +2916,7 @@ router.get(
 
                             updatedAt:
                                 withdrawal.updated_at,
-                        })
+                        }),
                     ),
             });
 
@@ -2618,16 +2924,17 @@ router.get(
 
             console.error(
                 'GET /wallet/withdrawals error:',
-                error
+                error,
             );
 
             res.status(500).json({
                 success: false,
+
                 message:
                     'Failed to load withdrawals.',
             });
         }
-    }
+    },
 );
 
 /*
