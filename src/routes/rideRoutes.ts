@@ -94,12 +94,10 @@ function toNumber(
 | DRIVER AVAILABILITY HELPER
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-|
 | A driver is available for a NEW ride only when:
 |
-|   status      = approved
-|   is_online   = true
+|   status       = approved
+|   is_online    = true
 |   is_available = true
 |
 | After a ride is completed/cancelled:
@@ -1496,6 +1494,16 @@ router.post(
 |--------------------------------------------------------------------------
 | CURRENT DRIVER RIDE
 |--------------------------------------------------------------------------
+|
+| Used by the driver app to resume an accepted ride after the app
+| was closed and reopened.
+|
+| IMPORTANT: when the driver profile does not exist we return 200
+| with `ride: null`, NOT 404. This lets the Flutter resume helper
+| treat "driver has no ride" and "driver record missing" the same
+| way, without having to special-case a 404.
+|
+|--------------------------------------------------------------------------
 */
 
 router.get(
@@ -1547,13 +1555,13 @@ router.get(
                     [authenticatedUid]
                 );
 
+            // Driver profile missing → treat as "no active ride".
             if (
                 driverResult.rows.length === 0
             ) {
-                return res.status(404).json({
-                    success: false,
-                    message:
-                        'Driver not found.',
+                return res.status(200).json({
+                    success: true,
+                    ride: null,
                 });
             }
 
@@ -2217,8 +2225,6 @@ router.post(
 | COMPLETE RIDE
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-|
 | Driver becomes available again ONLY when:
 |
 |   status = approved
@@ -2406,11 +2412,7 @@ router.post(
 | CANCEL RIDE
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-|
-| We NO LONGER DELETE the ride.
-|
-| Instead:
+| We NO LONGER DELETE the ride. Instead:
 |
 |   status = cancelled
 |
@@ -2472,20 +2474,10 @@ router.post(
             | LOCK RIDE
             |--------------------------------------------------------------------------
             |
-            | NOTE:
-            |
-            | `FOR UPDATE OF r` is REQUIRED here.
-            |
-            | The query joins public.passengers via a LEFT JOIN.
-            | PostgreSQL refuses plain `FOR UPDATE` when the query
-            | touches the nullable side of an outer join, and throws:
-            |
-            |   "FOR UPDATE cannot be applied to the nullable side
-            |    of an outer join"
-            |
-            | By scoping the lock to `r` (rides) only, we lock just the
-            | ride row — which is the only row we mutate. The passenger
-            | row is read-only (used for authorization).
+            | `FOR UPDATE OF r` scopes the lock to the rides row only,
+            | since the query joins public.passengers via a LEFT JOIN
+            | and PostgreSQL refuses plain FOR UPDATE on the nullable
+            | side of an outer join.
             |
             |--------------------------------------------------------------------------
             */
