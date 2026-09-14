@@ -37,11 +37,9 @@ async function authenticateDriver(
     res: Response,
 ): Promise<boolean> {
 
-    /*
-    |--------------------------------------------------------------------------
-    | 1. CHECK AUTHORIZATION HEADER
-    |--------------------------------------------------------------------------
-    */
+    /* ----------------------------------------------------------------------
+     * 1. CHECK AUTHORIZATION HEADER
+     * ---------------------------------------------------------------------- */
 
     const authHeader =
         req.headers.authorization;
@@ -61,11 +59,9 @@ async function authenticateDriver(
         return false;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 2. EXTRACT BEARER TOKEN
-    |--------------------------------------------------------------------------
-    */
+    /* ----------------------------------------------------------------------
+     * 2. EXTRACT BEARER TOKEN
+     * ---------------------------------------------------------------------- */
 
     const token =
         authHeader
@@ -84,11 +80,9 @@ async function authenticateDriver(
         return false;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 3. VERIFY FIREBASE ID TOKEN
-    |--------------------------------------------------------------------------
-    */
+    /* ----------------------------------------------------------------------
+     * 3. VERIFY FIREBASE ID TOKEN
+     * ---------------------------------------------------------------------- */
 
     let firebaseUid: string;
 
@@ -125,12 +119,6 @@ async function authenticateDriver(
                 message?: string;
             };
 
-        /*
-        |--------------------------------------------------------------------------
-        | EXPIRED TOKEN
-        |--------------------------------------------------------------------------
-        */
-
         if (
             firebaseError.code ===
             'auth/id-token-expired'
@@ -145,12 +133,6 @@ async function authenticateDriver(
 
             return false;
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | REVOKED TOKEN
-        |--------------------------------------------------------------------------
-        */
 
         if (
             firebaseError.code ===
@@ -167,12 +149,6 @@ async function authenticateDriver(
             return false;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | INVALID TOKEN
-        |--------------------------------------------------------------------------
-        */
-
         res.status(401).json({
             success: false,
             error:
@@ -184,19 +160,12 @@ async function authenticateDriver(
         return false;
     }
 
-    /*
-    |--------------------------------------------------------------------------
-    | 4. FIND DRIVER IN DATABASE
-    |--------------------------------------------------------------------------
-    |
-    | IMPORTANT:
-    |
-    | The drivers table uses `uid`.
-    |
-    | DO NOT use `firebase_uid`.
-    |
-    |--------------------------------------------------------------------------
-    */
+    /* ----------------------------------------------------------------------
+     * 4. FIND DRIVER IN DATABASE
+     *
+     * The drivers table uses `uid`.
+     * DO NOT use `firebase_uid`.
+     * ---------------------------------------------------------------------- */
 
     try {
 
@@ -214,15 +183,7 @@ async function authenticateDriver(
                 [firebaseUid],
             );
 
-        /*
-        |--------------------------------------------------------------------------
-        | 5. DRIVER DOES NOT EXIST
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            result.rows.length === 0
-        ) {
+        if (result.rows.length === 0) {
 
             console.warn(
                 `⚠️ No driver found for Firebase UID: ${firebaseUid}`,
@@ -239,25 +200,10 @@ async function authenticateDriver(
             return false;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 6. GET DRIVER
-        |--------------------------------------------------------------------------
-        */
-
         const driver =
             result.rows[0];
 
-        /*
-        |--------------------------------------------------------------------------
-        | 7. DRIVER MUST BE APPROVED
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            driver.status !==
-            'approved'
-        ) {
+        if (driver.status !== 'approved') {
 
             console.warn(
                 `⚠️ Driver ${driver.id} is not approved. Status: ${driver.status}`,
@@ -276,12 +222,6 @@ async function authenticateDriver(
             return false;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 8. ATTACH DRIVER INFORMATION
-        |--------------------------------------------------------------------------
-        */
-
         req.driverId =
             Number(driver.id);
 
@@ -291,12 +231,6 @@ async function authenticateDriver(
         return true;
 
     } catch (error: unknown) {
-
-        /*
-        |--------------------------------------------------------------------------
-        | DATABASE ERROR
-        |--------------------------------------------------------------------------
-        */
 
         console.error(
             '❌ Driver database lookup failed:',
@@ -334,12 +268,6 @@ async function getOrCreateWallet(
     client: any = pool,
 ) {
 
-    /*
-    |--------------------------------------------------------------------------
-    | FIND EXISTING WALLET
-    |--------------------------------------------------------------------------
-    */
-
     const existing =
         await client.query(
             `
@@ -363,17 +291,9 @@ async function getOrCreateWallet(
             [driverId],
         );
 
-    if (
-        existing.rows.length > 0
-    ) {
+    if (existing.rows.length > 0) {
         return existing.rows[0];
     }
-
-    /*
-    |--------------------------------------------------------------------------
-    | CREATE WALLET
-    |--------------------------------------------------------------------------
-    */
 
     const created =
         await client.query(
@@ -420,10 +340,8 @@ async function getOrCreateWallet(
 
 /* ==========================================================================
  * GET DRIVER WALLET
- * ==========================================================================
  *
  * GET /api/drivers/wallet
- *
  * ========================================================================== */
 
 router.get(
@@ -435,12 +353,6 @@ router.get(
 
         const authReq =
             req as AuthenticatedDriverRequest;
-
-        /*
-        |--------------------------------------------------------------------------
-        | AUTHENTICATE DRIVER
-        |--------------------------------------------------------------------------
-        */
 
         const authenticated =
             await authenticateDriver(
@@ -540,10 +452,8 @@ router.get(
 
 /* ==========================================================================
  * GET WALLET TRANSACTIONS
- * ==========================================================================
  *
  * GET /api/drivers/wallet/transactions
- *
  * ========================================================================== */
 
 router.get(
@@ -701,10 +611,15 @@ router.get(
 
 /* ==========================================================================
  * GET PAYMENT ACCOUNT
- * ==========================================================================
  *
  * GET /api/drivers/wallet/payment-account
  *
+ * Returns the payout account using SNAKE_CASE keys under `account`
+ * so the Flutter client can read:
+ *   _paymentAccount['mobile_network']
+ *   _paymentAccount['mobile_money_number']
+ *   _paymentAccount['account_name']
+ *   _paymentAccount['is_verified']
  * ========================================================================== */
 
 router.get(
@@ -751,13 +666,10 @@ router.get(
                     ],
                 );
 
-            if (
-                result.rows.length === 0
-            ) {
+            if (result.rows.length === 0) {
                 res.status(200).json({
                     success: true,
-                    paymentAccount:
-                        null,
+                    account: null,
                 });
 
                 return;
@@ -769,34 +681,34 @@ router.get(
             res.status(200).json({
                 success: true,
 
-                paymentAccount: {
+                account: {
                     id:
                         Number(account.id),
 
-                    driverId:
+                    driver_id:
                         Number(
                             account.driver_id,
                         ),
 
-                    mobileNetwork:
+                    mobile_network:
                         account.mobile_network,
 
-                    mobileNumber:
+                    mobile_money_number:
                         account.mobile_number,
 
-                    accountName:
+                    account_name:
                         account.account_name,
 
-                    isVerified:
+                    is_verified:
                         account.is_verified,
 
-                    isActive:
+                    is_active:
                         account.is_active,
 
-                    createdAt:
+                    created_at:
                         account.created_at,
 
-                    updatedAt:
+                    updated_at:
                         account.updated_at,
                 },
             });
@@ -828,10 +740,11 @@ router.get(
 
 /* ==========================================================================
  * CREATE / UPDATE PAYMENT ACCOUNT
- * ==========================================================================
  *
  * POST /api/drivers/wallet/payment-account
  *
+ * Accepts BOTH snake_case (what Flutter sends) and camelCase.
+ * `account_name` is optional.
  * ========================================================================== */
 
 router.post(
@@ -856,27 +769,34 @@ router.post(
 
         try {
 
-            const {
-                mobileNetwork,
-                mobileNumber,
-                accountName,
-            } = req.body;
-
             /*
-            |--------------------------------------------------------------------------
-            | VALIDATE REQUIRED FIELDS
-            |--------------------------------------------------------------------------
-            */
+             * Accept both shapes:
+             *   - snake_case (Flutter):  mobile_network, mobile_money_number, account_name
+             *   - camelCase  (legacy) :  mobileNetwork, mobileNumber, accountName
+             */
 
-            if (
-                !mobileNetwork ||
-                !mobileNumber ||
-                !accountName
-            ) {
+            const mobileNetwork =
+                req.body.mobileNetwork ??
+                req.body.mobile_network;
+
+            const mobileNumber =
+                req.body.mobileNumber ??
+                req.body.mobile_money_number;
+
+            const accountName =
+                req.body.accountName ??
+                req.body.account_name ??
+                null;
+
+            /* ----------------------------------------------------------------
+             * VALIDATE REQUIRED FIELDS
+             * ---------------------------------------------------------------- */
+
+            if (!mobileNetwork || !mobileNumber) {
                 res.status(400).json({
                     success: false,
                     error:
-                        'Mobile network, mobile number and account name are required',
+                        'Mobile network and mobile number are required',
                     code:
                         'PAYMENT_ACCOUNT_FIELDS_REQUIRED',
                 });
@@ -884,22 +804,18 @@ router.post(
                 return;
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | NORMALIZE PHONE NUMBER
-            |--------------------------------------------------------------------------
-            */
+            /* ----------------------------------------------------------------
+             * NORMALIZE PHONE NUMBER
+             * ---------------------------------------------------------------- */
 
             const phone =
                 String(
                     mobileNumber,
                 ).trim();
 
-            /*
-            |--------------------------------------------------------------------------
-            | GHANA PHONE VALIDATION
-            |--------------------------------------------------------------------------
-            */
+            /* ----------------------------------------------------------------
+             * GHANA PHONE VALIDATION
+             * ---------------------------------------------------------------- */
 
             if (
                 !/^(0\d{9}|\+233\d{9})$/.test(
@@ -917,11 +833,9 @@ router.post(
                 return;
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | VALIDATE NETWORK
-            |--------------------------------------------------------------------------
-            */
+            /* ----------------------------------------------------------------
+             * VALIDATE NETWORK
+             * ---------------------------------------------------------------- */
 
             const allowedNetworks = [
                 'MTN',
@@ -952,11 +866,9 @@ router.post(
                 return;
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | UPSERT PAYMENT ACCOUNT
-            |--------------------------------------------------------------------------
-            */
+            /* ----------------------------------------------------------------
+             * UPSERT PAYMENT ACCOUNT
+             * ---------------------------------------------------------------- */
 
             const result =
                 await pool.query(
@@ -999,9 +911,11 @@ router.post(
                         authReq.driverId,
                         normalizedNetwork,
                         phone,
-                        String(
-                            accountName,
-                        ).trim(),
+                        accountName === null
+                            ? null
+                            : String(
+                                accountName,
+                            ).trim(),
                     ],
                 );
 
@@ -1013,34 +927,34 @@ router.post(
                 message:
                     'Payment account saved successfully',
 
-                paymentAccount: {
+                account: {
                     id:
                         Number(account.id),
 
-                    driverId:
+                    driver_id:
                         Number(
                             account.driver_id,
                         ),
 
-                    mobileNetwork:
+                    mobile_network:
                         account.mobile_network,
 
-                    mobileNumber:
+                    mobile_money_number:
                         account.mobile_number,
 
-                    accountName:
+                    account_name:
                         account.account_name,
 
-                    isVerified:
+                    is_verified:
                         account.is_verified,
 
-                    isActive:
+                    is_active:
                         account.is_active,
 
-                    createdAt:
+                    created_at:
                         account.created_at,
 
-                    updatedAt:
+                    updated_at:
                         account.updated_at,
                 },
             });
@@ -1072,10 +986,8 @@ router.post(
 
 /* ==========================================================================
  * TOP UP WALLET
- * ==========================================================================
  *
  * POST /api/drivers/wallet/topup
- *
  * ========================================================================== */
 
 router.post(
@@ -1099,10 +1011,8 @@ router.post(
         }
 
         /*
-        |--------------------------------------------------------------------------
-        | PAYMENT PROVIDER NOT YET CONNECTED
-        |--------------------------------------------------------------------------
-        */
+         * PAYMENT PROVIDER NOT YET CONNECTED
+         */
 
         res.status(501).json({
             success: false,
@@ -1116,10 +1026,8 @@ router.post(
 
 /* ==========================================================================
  * WITHDRAW MONEY
- * ==========================================================================
  *
  * POST /api/drivers/wallet/withdraw
- *
  * ========================================================================== */
 
 router.post(
@@ -1145,11 +1053,9 @@ router.post(
         const amount =
             Number(req.body.amount);
 
-        /*
-        |--------------------------------------------------------------------------
-        | VALIDATE AMOUNT
-        |--------------------------------------------------------------------------
-        */
+        /* ----------------------------------------------------------------------
+         * VALIDATE AMOUNT
+         * ---------------------------------------------------------------------- */
 
         if (
             !Number.isFinite(amount) ||
@@ -1166,10 +1072,7 @@ router.post(
             return;
         }
 
-        if (
-            amount <
-            MINIMUM_WITHDRAWAL
-        ) {
+        if (amount < MINIMUM_WITHDRAWAL) {
             res.status(400).json({
                 success: false,
                 error:
@@ -1183,11 +1086,9 @@ router.post(
             return;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | CHECK PAYMENT ACCOUNT
-        |--------------------------------------------------------------------------
-        */
+        /* ----------------------------------------------------------------------
+         * CHECK PAYMENT ACCOUNT
+         * ---------------------------------------------------------------------- */
 
         try {
 
@@ -1210,9 +1111,7 @@ router.post(
                     ],
                 );
 
-            if (
-                paymentAccountResult.rows.length === 0
-            ) {
+            if (paymentAccountResult.rows.length === 0) {
                 res.status(400).json({
                     success: false,
                     error:
@@ -1227,9 +1126,7 @@ router.post(
             const paymentAccount =
                 paymentAccountResult.rows[0];
 
-            if (
-                !paymentAccount.is_active
-            ) {
+            if (!paymentAccount.is_active) {
                 res.status(400).json({
                     success: false,
                     error:
@@ -1241,9 +1138,7 @@ router.post(
                 return;
             }
 
-            if (
-                !paymentAccount.is_verified
-            ) {
+            if (!paymentAccount.is_verified) {
                 res.status(400).json({
                     success: false,
                     error:
@@ -1255,11 +1150,9 @@ router.post(
                 return;
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | START DATABASE TRANSACTION
-            |--------------------------------------------------------------------------
-            */
+            /* ----------------------------------------------------------------
+             * START DATABASE TRANSACTION
+             * ---------------------------------------------------------------- */
 
             const client =
                 await pool.connect();
@@ -1270,11 +1163,9 @@ router.post(
                     'BEGIN',
                 );
 
-                /*
-                |--------------------------------------------------------------------------
-                | LOCK WALLET
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * LOCK WALLET
+                 * ------------------------------------------------------------ */
 
                 let walletResult =
                     await client.query(
@@ -1298,15 +1189,11 @@ router.post(
                         ],
                     );
 
-                /*
-                |--------------------------------------------------------------------------
-                | CREATE WALLET IF MISSING
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * CREATE WALLET IF MISSING
+                 * ------------------------------------------------------------ */
 
-                if (
-                    walletResult.rows.length === 0
-                ) {
+                if (walletResult.rows.length === 0) {
 
                     await client.query(
                         `
@@ -1361,9 +1248,7 @@ router.post(
                         );
                 }
 
-                if (
-                    walletResult.rows.length === 0
-                ) {
+                if (walletResult.rows.length === 0) {
                     throw new Error(
                         'Unable to create or load driver wallet',
                     );
@@ -1390,16 +1275,11 @@ router.post(
                     currentBalance -
                     totalRequired;
 
-                /*
-                |--------------------------------------------------------------------------
-                | CHECK AVAILABLE BALANCE
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * CHECK AVAILABLE BALANCE
+                 * ------------------------------------------------------------ */
 
-                if (
-                    remainingBalance <
-                    minimumBalance
-                ) {
+                if (remainingBalance < minimumBalance) {
 
                     await client.query(
                         'ROLLBACK',
@@ -1422,11 +1302,9 @@ router.post(
                     return;
                 }
 
-                /*
-                |--------------------------------------------------------------------------
-                | UPDATE WALLET BALANCE
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * UPDATE WALLET BALANCE
+                 * ------------------------------------------------------------ */
 
                 const newBalance =
                     remainingBalance;
@@ -1448,11 +1326,9 @@ router.post(
                     ],
                 );
 
-                /*
-                |--------------------------------------------------------------------------
-                | CREATE WITHDRAWAL RECORD
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * CREATE WITHDRAWAL RECORD
+                 * ------------------------------------------------------------ */
 
                 const withdrawalResult =
                     await client.query(
@@ -1492,11 +1368,9 @@ router.post(
                         ],
                     );
 
-                /*
-                |--------------------------------------------------------------------------
-                | INSERT LEDGER TRANSACTION
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * INSERT LEDGER TRANSACTION
+                 * ------------------------------------------------------------ */
 
                 await client.query(
                     `
@@ -1534,11 +1408,9 @@ router.post(
                     ],
                 );
 
-                /*
-                |--------------------------------------------------------------------------
-                | COMMIT
-                |--------------------------------------------------------------------------
-                */
+                /* ------------------------------------------------------------
+                 * COMMIT
+                 * ------------------------------------------------------------ */
 
                 await client.query(
                     'COMMIT',
@@ -1609,9 +1481,7 @@ router.post(
                     await client.query(
                         'ROLLBACK',
                     );
-                } catch (
-                rollbackError
-                ) {
+                } catch (rollbackError) {
                     console.error(
                         '❌ Rollback failed:',
                         rollbackError,
@@ -1672,10 +1542,8 @@ router.post(
 
 /* ==========================================================================
  * GET WITHDRAWAL HISTORY
- * ==========================================================================
  *
  * GET /api/drivers/wallet/withdrawals
- *
  * ========================================================================== */
 
 router.get(
