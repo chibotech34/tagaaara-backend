@@ -2406,7 +2406,7 @@ router.post(
 | CANCEL RIDE
 |--------------------------------------------------------------------------
 |
-| IMPORTANT CHANGE:
+| IMPORTANT:
 |
 | We NO LONGER DELETE the ride.
 |
@@ -2465,13 +2465,28 @@ router.post(
                 `🚫 Cancelling ride ${rideId} by user ${uid}. Reason: ${reason}`
             );
 
-            await client.query(
-                'BEGIN'
-            );
+            await client.query('BEGIN');
 
             /*
             |--------------------------------------------------------------------------
             | LOCK RIDE
+            |--------------------------------------------------------------------------
+            |
+            | NOTE:
+            |
+            | `FOR UPDATE OF r` is REQUIRED here.
+            |
+            | The query joins public.passengers via a LEFT JOIN.
+            | PostgreSQL refuses plain `FOR UPDATE` when the query
+            | touches the nullable side of an outer join, and throws:
+            |
+            |   "FOR UPDATE cannot be applied to the nullable side
+            |    of an outer join"
+            |
+            | By scoping the lock to `r` (rides) only, we lock just the
+            | ride row — which is the only row we mutate. The passenger
+            | row is read-only (used for authorization).
+            |
             |--------------------------------------------------------------------------
             */
 
@@ -2509,7 +2524,7 @@ router.post(
 
                     LIMIT 1
 
-                    FOR UPDATE
+                    FOR UPDATE OF r
                     `,
                     [
                         rideId,
@@ -2808,10 +2823,25 @@ router.post(
                 error
             );
 
+            const dbError =
+                error as {
+                    code?: string;
+                    message?: string;
+                    detail?: string;
+                };
+
             return res.status(500).json({
                 success: false,
                 message:
                     'Server error while cancelling ride.',
+                code:
+                    dbError.code ??
+                    'CANCEL_RIDE_FAILED',
+                error:
+                    dbError.message ??
+                    'Unknown database error',
+                detail:
+                    dbError.detail ?? null,
             });
         } finally {
             client.release();
