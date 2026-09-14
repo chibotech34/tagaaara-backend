@@ -21,6 +21,7 @@ import {
 
 import passengerRoutes from './routes/passengerRoutes';
 import driverRoutes from './routes/driverRoutes';
+import driverWalletRoutes from './routes/driverWalletRoutes';
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
@@ -82,7 +83,10 @@ if (!process.env.FIREBASE_DATABASE_URL) {
 */
 
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    console.log(
+        `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`,
+    );
+
     next();
 });
 
@@ -273,6 +277,35 @@ app.use(
 app.use(
     '/api/drivers',
     driverRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| Driver Wallet Routes
+|--------------------------------------------------------------------------
+|
+| Driver wallet endpoints:
+|
+| GET  /api/drivers/wallet
+| GET  /api/drivers/transactions
+|
+| GET  /api/drivers/wallet/payment-account
+| POST /api/drivers/wallet/payment-account
+|
+| POST /api/drivers/wallet/topup
+|
+| POST /api/drivers/wallet/withdraw
+| GET  /api/drivers/wallet/withdrawals
+|
+| The wallet router handles driver Firebase authentication
+| internally, so it must be registered before adminAuth below.
+|
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/drivers',
+    driverWalletRoutes,
 );
 
 /*
@@ -1003,10 +1036,9 @@ app.post(
                 check.rows[0].status;
 
             if (
-                ![
-                    'pending',
-                    'under_review',
-                    'action_required',
+                [
+                    'approved',
+                    'rejected',
                 ].includes(
                     currentStatus,
                 )
