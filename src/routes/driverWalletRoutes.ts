@@ -1,3 +1,5 @@
+// src/routes/driverWalletRoutes.ts
+
 import {
     Router,
     Request,
@@ -9,11 +11,9 @@ import { firebaseAuth } from '../config/firebase';
 
 const router = Router();
 
-/*
-|--------------------------------------------------------------------------
-| Types
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * TYPES
+ * ========================================================================== */
 
 interface AuthenticatedDriverRequest
     extends Request {
@@ -21,115 +21,266 @@ interface AuthenticatedDriverRequest
     firebaseUid?: string;
 }
 
-/*
-|--------------------------------------------------------------------------
-| Constants
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * CONSTANTS
+ * ========================================================================== */
 
 const MINIMUM_WITHDRAWAL = 10.00;
-
 const WITHDRAWAL_FEE = 0.00;
 
-
-/*
-|--------------------------------------------------------------------------
-| Authentication
-|--------------------------------------------------------------------------
-|
-| We verify the Firebase ID token directly here.
-|
-| This keeps wallet authentication independent from
-| the admin authentication middleware in server.ts.
-|
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * AUTHENTICATE DRIVER
+ * ========================================================================== */
 
 async function authenticateDriver(
     req: AuthenticatedDriverRequest,
     res: Response,
 ): Promise<boolean> {
+
+    /*
+    |--------------------------------------------------------------------------
+    | 1. CHECK AUTHORIZATION HEADER
+    |--------------------------------------------------------------------------
+    */
+
+    const authHeader =
+        req.headers.authorization;
+
+    if (
+        !authHeader ||
+        !authHeader.startsWith('Bearer ')
+    ) {
+        res.status(401).json({
+            success: false,
+            error:
+                'Authentication token required',
+            code:
+                'AUTH_HEADER_MISSING',
+        });
+
+        return false;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 2. EXTRACT BEARER TOKEN
+    |--------------------------------------------------------------------------
+    */
+
+    const token =
+        authHeader
+            .substring('Bearer '.length)
+            .trim();
+
+    if (!token) {
+        res.status(401).json({
+            success: false,
+            error:
+                'Authentication token required',
+            code:
+                'AUTH_TOKEN_MISSING',
+        });
+
+        return false;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 3. VERIFY FIREBASE ID TOKEN
+    |--------------------------------------------------------------------------
+    */
+
+    let firebaseUid: string;
+
     try {
-        const authHeader =
-            req.headers.authorization;
-
-        if (
-            !authHeader ||
-            !authHeader.startsWith('Bearer ')
-        ) {
-            res.status(401).json({
-                success: false,
-                error:
-                    'Authentication token required',
-            });
-
-            return false;
-        }
-
-        const token =
-            authHeader.substring(7).trim();
-
-        if (!token) {
-            res.status(401).json({
-                success: false,
-                error:
-                    'Authentication token required',
-            });
-
-            return false;
-        }
-
         const decoded =
             await firebaseAuth.verifyIdToken(
                 token,
             );
 
-        const firebaseUid =
+        firebaseUid =
             decoded.uid;
+
+        if (!firebaseUid) {
+            res.status(401).json({
+                success: false,
+                error:
+                    'Firebase token does not contain a UID',
+                code:
+                    'AUTH_UID_MISSING',
+            });
+
+            return false;
+        }
+    } catch (error: unknown) {
+
+        console.error(
+            '❌ Firebase token verification failed:',
+            error,
+        );
+
+        const firebaseError =
+            error as {
+                code?: string;
+                message?: string;
+            };
+
+        /*
+        |--------------------------------------------------------------------------
+        | EXPIRED TOKEN
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            firebaseError.code ===
+            'auth/id-token-expired'
+        ) {
+            res.status(401).json({
+                success: false,
+                error:
+                    'Firebase ID token expired. Please refresh authentication.',
+                code:
+                    'AUTH_TOKEN_EXPIRED',
+            });
+
+            return false;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | REVOKED TOKEN
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            firebaseError.code ===
+            'auth/id-token-revoked'
+        ) {
+            res.status(401).json({
+                success: false,
+                error:
+                    'Firebase ID token has been revoked. Please sign in again.',
+                code:
+                    'AUTH_TOKEN_REVOKED',
+            });
+
+            return false;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | INVALID TOKEN
+        |--------------------------------------------------------------------------
+        */
+
+        res.status(401).json({
+            success: false,
+            error:
+                'Firebase authentication failed.',
+            code:
+                'AUTH_TOKEN_INVALID',
+        });
+
+        return false;
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | 4. FIND DRIVER IN DATABASE
+    |--------------------------------------------------------------------------
+    |
+    | IMPORTANT:
+    |
+    | The drivers table uses `uid`.
+    |
+    | DO NOT use `firebase_uid`.
+    |
+    |--------------------------------------------------------------------------
+    */
+
+    try {
 
         const result =
             await pool.query(
                 `
                 SELECT
                     id,
-                    firebase_uid,
+                    uid,
                     status
                 FROM public.drivers
-                WHERE firebase_uid = $1
+                WHERE uid = $1
                 LIMIT 1
                 `,
                 [firebaseUid],
             );
 
+        /*
+        |--------------------------------------------------------------------------
+        | 5. DRIVER DOES NOT EXIST
+        |--------------------------------------------------------------------------
+        */
+
         if (
             result.rows.length === 0
         ) {
+
+            console.warn(
+                `⚠️ No driver found for Firebase UID: ${firebaseUid}`,
+            );
+
             res.status(404).json({
                 success: false,
                 error:
                     'Driver account not found',
+                code:
+                    'DRIVER_NOT_FOUND',
             });
 
             return false;
         }
 
+        /*
+        |--------------------------------------------------------------------------
+        | 6. GET DRIVER
+        |--------------------------------------------------------------------------
+        */
+
         const driver =
             result.rows[0];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7. DRIVER MUST BE APPROVED
+        |--------------------------------------------------------------------------
+        */
 
         if (
             driver.status !==
             'approved'
         ) {
+
+            console.warn(
+                `⚠️ Driver ${driver.id} is not approved. Status: ${driver.status}`,
+            );
+
             res.status(403).json({
                 success: false,
                 error:
                     'Driver account is not approved',
+                code:
+                    'DRIVER_NOT_APPROVED',
                 status:
                     driver.status,
             });
 
             return false;
         }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 8. ATTACH DRIVER INFORMATION
+        |--------------------------------------------------------------------------
+        */
 
         req.driverId =
             Number(driver.id);
@@ -138,37 +289,73 @@ async function authenticateDriver(
             firebaseUid;
 
         return true;
+
     } catch (error: unknown) {
+
+        /*
+        |--------------------------------------------------------------------------
+        | DATABASE ERROR
+        |--------------------------------------------------------------------------
+        */
+
         console.error(
-            '❌ Driver wallet authentication error:',
+            '❌ Driver database lookup failed:',
             error,
         );
 
-        res.status(401).json({
+        const dbError =
+            error as {
+                code?: string;
+                message?: string;
+                detail?: string;
+                hint?: string;
+            };
+
+        res.status(500).json({
             success: false,
             error:
-                'Invalid or expired authentication token',
+                'Failed to load driver account',
+            code:
+                'DRIVER_LOOKUP_FAILED',
+            details:
+                dbError.message,
         });
 
         return false;
     }
 }
 
-
-/*
-|--------------------------------------------------------------------------
-| Get or Create Driver Wallet
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * GET OR CREATE DRIVER WALLET
+ * ========================================================================== */
 
 async function getOrCreateWallet(
     driverId: number,
-    client = pool,
+    client: any = pool,
 ) {
-    let result =
+
+    /*
+    |--------------------------------------------------------------------------
+    | FIND EXISTING WALLET
+    |--------------------------------------------------------------------------
+    */
+
+    const existing =
         await client.query(
             `
-            SELECT *
+            SELECT
+                id,
+                driver_id,
+                balance,
+                pending_balance,
+                total_earnings,
+                total_withdrawn,
+                total_commission_paid,
+                amount_owed,
+                minimum_balance,
+                last_transaction_at,
+                created_at,
+                updated_at
             FROM public.driver_wallets
             WHERE driver_id = $1
             LIMIT 1
@@ -177,16 +364,21 @@ async function getOrCreateWallet(
         );
 
     if (
-        result.rows.length > 0
+        existing.rows.length > 0
     ) {
-        return result.rows[0];
+        return existing.rows[0];
     }
 
-    result =
+    /*
+    |--------------------------------------------------------------------------
+    | CREATE WALLET
+    |--------------------------------------------------------------------------
+    */
+
+    const created =
         await client.query(
             `
-            INSERT INTO public.driver_wallets
-            (
+            INSERT INTO public.driver_wallets (
                 driver_id,
                 balance,
                 pending_balance,
@@ -196,8 +388,7 @@ async function getOrCreateWallet(
                 amount_owed,
                 minimum_balance
             )
-            VALUES
-            (
+            VALUES (
                 $1,
                 0.00,
                 0.00,
@@ -207,158 +398,210 @@ async function getOrCreateWallet(
                 0.00,
                 100.00
             )
-            RETURNING *
+            RETURNING
+                id,
+                driver_id,
+                balance,
+                pending_balance,
+                total_earnings,
+                total_withdrawn,
+                total_commission_paid,
+                amount_owed,
+                minimum_balance,
+                last_transaction_at,
+                created_at,
+                updated_at
             `,
             [driverId],
         );
 
-    return result.rows[0];
+    return created.rows[0];
 }
 
-
-/*
-|--------------------------------------------------------------------------
-| GET DRIVER WALLET
-|--------------------------------------------------------------------------
-|
-| GET /api/drivers/wallet
-|
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * GET DRIVER WALLET
+ * ==========================================================================
+ *
+ * GET /api/drivers/wallet
+ *
+ * ========================================================================== */
 
 router.get(
     '/wallet',
     async (
-        req: AuthenticatedDriverRequest,
+        req: Request,
         res: Response,
     ) => {
-        if (
-            !(await authenticateDriver(
-                req,
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        /*
+        |--------------------------------------------------------------------------
+        | AUTHENTICATE DRIVER
+        |--------------------------------------------------------------------------
+        */
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
                 res,
-            ))
-        ) {
+            );
+
+        if (!authenticated) {
             return;
         }
 
         try {
+
             const wallet =
                 await getOrCreateWallet(
-                    req.driverId!,
+                    authReq.driverId!,
                 );
 
-            return res.status(200).json({
+            res.status(200).json({
                 success: true,
+
                 wallet: {
-                    id: wallet.id,
+                    id:
+                        Number(wallet.id),
+
                     driverId:
-                        wallet.driver_id,
+                        Number(wallet.driver_id),
+
                     balance:
-                        Number(
-                            wallet.balance,
-                        ),
+                        Number(wallet.balance),
+
                     pendingBalance:
                         Number(
                             wallet.pending_balance,
                         ),
+
                     totalEarnings:
                         Number(
                             wallet.total_earnings,
                         ),
+
                     totalWithdrawn:
                         Number(
                             wallet.total_withdrawn,
                         ),
+
                     totalCommissionPaid:
                         Number(
                             wallet.total_commission_paid,
                         ),
+
                     amountOwed:
                         Number(
                             wallet.amount_owed,
                         ),
+
                     minimumBalance:
                         Number(
                             wallet.minimum_balance,
                         ),
+
                     lastTransactionAt:
                         wallet.last_transaction_at,
+
                     createdAt:
                         wallet.created_at,
+
                     updatedAt:
                         wallet.updated_at,
                 },
             });
+
         } catch (error: unknown) {
+
             console.error(
-                '❌ Get wallet error:',
+                '❌ Failed to load driver wallet:',
                 error,
             );
 
-            return res.status(500).json({
+            const dbError =
+                error as {
+                    message?: string;
+                };
+
+            res.status(500).json({
                 success: false,
                 error:
                     'Failed to load driver wallet',
+                code:
+                    'WALLET_LOAD_FAILED',
+                details:
+                    dbError.message,
             });
         }
     },
 );
 
-
-/*
-|--------------------------------------------------------------------------
-| GET WALLET TRANSACTIONS
-|--------------------------------------------------------------------------
-|
-| GET /api/drivers/transactions
-|
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * GET WALLET TRANSACTIONS
+ * ==========================================================================
+ *
+ * GET /api/drivers/wallet/transactions
+ *
+ * ========================================================================== */
 
 router.get(
-    '/transactions',
+    '/wallet/transactions',
     async (
-        req: AuthenticatedDriverRequest,
+        req: Request,
         res: Response,
     ) => {
-        if (
-            !(await authenticateDriver(
-                req,
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
                 res,
-            ))
-        ) {
+            );
+
+        if (!authenticated) {
             return;
         }
 
         try {
-            const limit = Math.min(
+
+            const limit =
+                Math.min(
+                    Math.max(
+                        Number(
+                            req.query.limit ||
+                            50,
+                        ),
+                        1,
+                    ),
+                    100,
+                );
+
+            const offset =
                 Math.max(
                     Number(
-                        req.query.limit,
-                    ) || 50,
-                    1,
-                ),
-                100,
-            );
-
-            const offset = Math.max(
-                Number(
-                    req.query.offset,
-                ) || 0,
-                0,
-            );
+                        req.query.offset ||
+                        0,
+                    ),
+                    0,
+                );
 
             const result =
                 await pool.query(
                     `
                     SELECT
                         id,
+                        wallet_id,
+                        driver_id,
                         transaction_type,
                         amount,
                         balance_before,
                         balance_after,
-                        description,
                         reference,
+                        description,
                         status,
                         metadata,
                         created_at
@@ -369,97 +612,123 @@ router.get(
                     OFFSET $3
                     `,
                     [
-                        req.driverId,
+                        authReq.driverId,
                         limit,
                         offset,
                     ],
                 );
 
-            return res.status(200).json({
+            res.status(200).json({
                 success: true,
                 transactions:
                     result.rows.map(
-                        (
-                            transaction,
-                        ) => ({
+                        (transaction) => ({
                             id:
-                                transaction.id,
+                                Number(
+                                    transaction.id,
+                                ),
+
+                            walletId:
+                                Number(
+                                    transaction.wallet_id,
+                                ),
+
+                            driverId:
+                                Number(
+                                    transaction.driver_id,
+                                ),
+
                             transactionType:
                                 transaction.transaction_type,
+
                             amount:
                                 Number(
                                     transaction.amount,
                                 ),
+
                             balanceBefore:
                                 Number(
                                     transaction.balance_before,
                                 ),
+
                             balanceAfter:
                                 Number(
                                     transaction.balance_after,
                                 ),
-                            description:
-                                transaction.description,
+
                             reference:
                                 transaction.reference,
+
+                            description:
+                                transaction.description,
+
                             status:
                                 transaction.status,
+
                             metadata:
                                 transaction.metadata,
+
                             createdAt:
                                 transaction.created_at,
                         }),
                     ),
-                pagination: {
-                    limit,
-                    offset,
-                    count:
-                        result.rows
-                            .length,
-                },
             });
+
         } catch (error: unknown) {
+
             console.error(
-                '❌ Get wallet transactions error:',
+                '❌ Failed to load wallet transactions:',
                 error,
             );
 
-            return res.status(500).json({
+            const dbError =
+                error as {
+                    message?: string;
+                };
+
+            res.status(500).json({
                 success: false,
                 error:
                     'Failed to load wallet transactions',
+                code:
+                    'TRANSACTIONS_LOAD_FAILED',
+                details:
+                    dbError.message,
             });
         }
     },
 );
 
-
-/*
-|--------------------------------------------------------------------------
-| GET PAYMENT ACCOUNT
-|--------------------------------------------------------------------------
-|
-| GET /api/drivers/wallet/payment-account
-|
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * GET PAYMENT ACCOUNT
+ * ==========================================================================
+ *
+ * GET /api/drivers/wallet/payment-account
+ *
+ * ========================================================================== */
 
 router.get(
     '/wallet/payment-account',
     async (
-        req: AuthenticatedDriverRequest,
+        req: Request,
         res: Response,
     ) => {
-        if (
-            !(await authenticateDriver(
-                req,
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
                 res,
-            ))
-        ) {
+            );
+
+        if (!authenticated) {
             return;
         }
 
         try {
+
             const result =
                 await pool.query(
                     `
@@ -467,7 +736,7 @@ router.get(
                         id,
                         driver_id,
                         mobile_network,
-                        mobile_money_number,
+                        mobile_number,
                         account_name,
                         is_verified,
                         is_active,
@@ -477,169 +746,230 @@ router.get(
                     WHERE driver_id = $1
                     LIMIT 1
                     `,
-                    [req.driverId],
+                    [
+                        authReq.driverId,
+                    ],
                 );
 
             if (
                 result.rows.length === 0
             ) {
-                return res.status(200).json({
+                res.status(200).json({
                     success: true,
                     paymentAccount:
                         null,
                 });
+
+                return;
             }
 
             const account =
                 result.rows[0];
 
-            return res.status(200).json({
+            res.status(200).json({
                 success: true,
+
                 paymentAccount: {
-                    id: account.id,
+                    id:
+                        Number(account.id),
+
                     driverId:
-                        account.driver_id,
+                        Number(
+                            account.driver_id,
+                        ),
+
                     mobileNetwork:
                         account.mobile_network,
-                    mobileMoneyNumber:
-                        account.mobile_money_number,
+
+                    mobileNumber:
+                        account.mobile_number,
+
                     accountName:
                         account.account_name,
+
                     isVerified:
                         account.is_verified,
+
                     isActive:
                         account.is_active,
+
                     createdAt:
                         account.created_at,
+
                     updatedAt:
                         account.updated_at,
                 },
             });
+
         } catch (error: unknown) {
+
             console.error(
-                '❌ Get payment account error:',
+                '❌ Failed to load payment account:',
                 error,
             );
 
-            return res.status(500).json({
+            const dbError =
+                error as {
+                    message?: string;
+                };
+
+            res.status(500).json({
                 success: false,
                 error:
                     'Failed to load payment account',
+                code:
+                    'PAYMENT_ACCOUNT_LOAD_FAILED',
+                details:
+                    dbError.message,
             });
         }
     },
 );
 
-
-/*
-|--------------------------------------------------------------------------
-| CREATE / UPDATE PAYMENT ACCOUNT
-|--------------------------------------------------------------------------
-|
-| POST /api/drivers/wallet/payment-account
-|
-|--------------------------------------------------------------------------
-*/
+/* ==========================================================================
+ * CREATE / UPDATE PAYMENT ACCOUNT
+ * ==========================================================================
+ *
+ * POST /api/drivers/wallet/payment-account
+ *
+ * ========================================================================== */
 
 router.post(
     '/wallet/payment-account',
     async (
-        req: AuthenticatedDriverRequest,
+        req: Request,
         res: Response,
     ) => {
-        if (
-            !(await authenticateDriver(
-                req,
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
                 res,
-            ))
-        ) {
+            );
+
+        if (!authenticated) {
             return;
         }
 
-        const {
-            mobileNetwork,
-            mobileMoneyNumber,
-            accountName,
-        } = req.body ?? {};
-
-        const network =
-            String(
-                mobileNetwork || '',
-            ).trim();
-
-        const phone =
-            String(
-                mobileMoneyNumber || '',
-            ).trim();
-
-        const name =
-            accountName
-                ? String(
-                    accountName,
-                ).trim()
-                : null;
-
-        if (!network) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    'Mobile network is required',
-            });
-        }
-
-        if (!phone) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    'Mobile Money number is required',
-            });
-        }
-
-        if (
-            !/^(0\d{9}|\+233\d{9})$/.test(
-                phone,
-            )
-        ) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    'Invalid Ghana Mobile Money number',
-            });
-        }
-
-        const allowedNetworks = [
-            'MTN',
-            'Telecel',
-            'AirtelTigo',
-        ];
-
-        if (
-            !allowedNetworks.includes(
-                network,
-            )
-        ) {
-            return res.status(400).json({
-                success: false,
-                error:
-                    'Unsupported mobile network',
-            });
-        }
-
         try {
+
+            const {
+                mobileNetwork,
+                mobileNumber,
+                accountName,
+            } = req.body;
+
+            /*
+            |--------------------------------------------------------------------------
+            | VALIDATE REQUIRED FIELDS
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+                !mobileNetwork ||
+                !mobileNumber ||
+                !accountName
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Mobile network, mobile number and account name are required',
+                    code:
+                        'PAYMENT_ACCOUNT_FIELDS_REQUIRED',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | NORMALIZE PHONE NUMBER
+            |--------------------------------------------------------------------------
+            */
+
+            const phone =
+                String(
+                    mobileNumber,
+                ).trim();
+
+            /*
+            |--------------------------------------------------------------------------
+            | GHANA PHONE VALIDATION
+            |--------------------------------------------------------------------------
+            */
+
+            if (
+                !/^(0\d{9}|\+233\d{9})$/.test(
+                    phone,
+                )
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Invalid Ghana mobile number',
+                    code:
+                        'INVALID_MOBILE_NUMBER',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | VALIDATE NETWORK
+            |--------------------------------------------------------------------------
+            */
+
+            const allowedNetworks = [
+                'MTN',
+                'Telecel',
+                'AirtelTigo',
+                'AT',
+                'Vodafone',
+            ];
+
+            const normalizedNetwork =
+                String(
+                    mobileNetwork,
+                ).trim();
+
+            if (
+                !allowedNetworks.includes(
+                    normalizedNetwork,
+                )
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Invalid mobile network',
+                    code:
+                        'INVALID_MOBILE_NETWORK',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | UPSERT PAYMENT ACCOUNT
+            |--------------------------------------------------------------------------
+            */
+
             const result =
                 await pool.query(
                     `
-                    INSERT INTO public.driver_payment_accounts
-                    (
+                    INSERT INTO public.driver_payment_accounts (
                         driver_id,
                         mobile_network,
-                        mobile_money_number,
+                        mobile_number,
                         account_name,
                         is_verified,
                         is_active
                     )
-                    VALUES
-                    (
+                    VALUES (
                         $1,
                         $2,
                         $3,
@@ -649,453 +979,76 @@ router.post(
                     )
                     ON CONFLICT (driver_id)
                     DO UPDATE SET
-                        mobile_network =
-                            EXCLUDED.mobile_network,
-                        mobile_money_number =
-                            EXCLUDED.mobile_money_number,
-                        account_name =
-                            EXCLUDED.account_name,
-                        is_active =
-                            true,
-                        is_verified =
-                            false,
-                        updated_at =
-                            CURRENT_TIMESTAMP
-                    RETURNING *
+                        mobile_network = EXCLUDED.mobile_network,
+                        mobile_number = EXCLUDED.mobile_number,
+                        account_name = EXCLUDED.account_name,
+                        is_active = true,
+                        updated_at = NOW()
+                    RETURNING
+                        id,
+                        driver_id,
+                        mobile_network,
+                        mobile_number,
+                        account_name,
+                        is_verified,
+                        is_active,
+                        created_at,
+                        updated_at
                     `,
                     [
-                        req.driverId,
-                        network,
+                        authReq.driverId,
+                        normalizedNetwork,
                         phone,
-                        name,
+                        String(
+                            accountName,
+                        ).trim(),
                     ],
                 );
 
             const account =
                 result.rows[0];
 
-            return res.status(200).json({
+            res.status(200).json({
                 success: true,
                 message:
                     'Payment account saved successfully',
+
                 paymentAccount: {
-                    id: account.id,
+                    id:
+                        Number(account.id),
+
+                    driverId:
+                        Number(
+                            account.driver_id,
+                        ),
+
                     mobileNetwork:
                         account.mobile_network,
-                    mobileMoneyNumber:
-                        account.mobile_money_number,
+
+                    mobileNumber:
+                        account.mobile_number,
+
                     accountName:
                         account.account_name,
+
                     isVerified:
                         account.is_verified,
+
                     isActive:
                         account.is_active,
+
+                    createdAt:
+                        account.created_at,
+
+                    updatedAt:
+                        account.updated_at,
                 },
             });
+
         } catch (error: unknown) {
-            console.error(
-                '❌ Save payment account error:',
-                error,
-            );
-
-            return res.status(500).json({
-                success: false,
-                error:
-                    'Failed to save payment account',
-            });
-        }
-    },
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| TOP UP
-|--------------------------------------------------------------------------
-|
-| IMPORTANT:
-|
-| This endpoint DOES NOT directly increase the wallet.
-|
-| A real payment provider must confirm the payment first.
-|
-|--------------------------------------------------------------------------
-*/
-
-router.post(
-    '/wallet/topup',
-    async (
-        req: AuthenticatedDriverRequest,
-        res: Response,
-    ) => {
-        if (
-            !(await authenticateDriver(
-                req,
-                res,
-            ))
-        ) {
-            return;
-        }
-
-        return res.status(501).json({
-            success: false,
-            error:
-                'Wallet top-up is not enabled. A verified payment provider transaction is required.',
-        });
-    },
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| WITHDRAW
-|--------------------------------------------------------------------------
-|
-| POST /api/drivers/wallet/withdraw
-|
-|--------------------------------------------------------------------------
-*/
-
-router.post(
-    '/wallet/withdraw',
-    async (
-        req: AuthenticatedDriverRequest,
-        res: Response,
-    ) => {
-        if (
-            !(await authenticateDriver(
-                req,
-                res,
-            ))
-        ) {
-            return;
-        }
-
-        const client =
-            await pool.connect();
-
-        try {
-            const requestedAmount =
-                Number(
-                    req.body?.amount,
-                );
-
-            if (
-                !Number.isFinite(
-                    requestedAmount,
-                ) ||
-                requestedAmount <= 0
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        'A valid withdrawal amount is required',
-                });
-            }
-
-            if (
-                requestedAmount <
-                MINIMUM_WITHDRAWAL
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        `Minimum withdrawal amount is GH₵${MINIMUM_WITHDRAWAL.toFixed(2)}`,
-                });
-            }
-
-            const paymentResult =
-                await client.query(
-                    `
-                    SELECT *
-                    FROM public.driver_payment_accounts
-                    WHERE driver_id = $1
-                      AND is_active = true
-                    LIMIT 1
-                    `,
-                    [req.driverId],
-                );
-
-            if (
-                paymentResult.rows.length ===
-                0
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        'Please add an active Mobile Money payment account before withdrawing',
-                });
-            }
-
-            const paymentAccount =
-                paymentResult.rows[0];
-
-            if (
-                !paymentAccount.is_verified
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        'Your Mobile Money payment account has not been verified',
-                });
-            }
-
-            await client.query(
-                'BEGIN',
-            );
-
-            /*
-             * Lock wallet row.
-             *
-             * This is critical.
-             *
-             * Without FOR UPDATE, two withdrawal requests
-             * arriving at nearly the same time could both
-             * see the same balance.
-             */
-
-            const walletResult =
-                await client.query(
-                    `
-                    SELECT *
-                    FROM public.driver_wallets
-                    WHERE driver_id = $1
-                    FOR UPDATE
-                    `,
-                    [req.driverId],
-                );
-
-            if (
-                walletResult.rows.length ===
-                0
-            ) {
-                await client.query(
-                    `
-                    INSERT INTO public.driver_wallets
-                    (
-                        driver_id
-                    )
-                    VALUES ($1)
-                    `,
-                    [req.driverId],
-                );
-            }
-
-            const lockedWalletResult =
-                await client.query(
-                    `
-                    SELECT *
-                    FROM public.driver_wallets
-                    WHERE driver_id = $1
-                    FOR UPDATE
-                    `,
-                    [req.driverId],
-                );
-
-            const wallet =
-                lockedWalletResult
-                    .rows[0];
-
-            const balance =
-                Number(
-                    wallet.balance,
-                );
-
-            const minimumBalance =
-                Number(
-                    wallet.minimum_balance,
-                );
-
-            const availableAfterWithdrawal =
-                balance -
-                requestedAmount -
-                WITHDRAWAL_FEE;
-
-            if (
-                availableAfterWithdrawal <
-                minimumBalance
-            ) {
-                await client.query(
-                    'ROLLBACK',
-                );
-
-                return res.status(400).json({
-                    success: false,
-                    error:
-                        `Insufficient withdrawable balance. You must maintain at least GH₵${minimumBalance.toFixed(2)} in your wallet.`,
-                    balance,
-                    minimumBalance,
-                });
-            }
-
-            const reference =
-                `WD-${Date.now()}-${req.driverId}`;
-
-            const netAmount =
-                requestedAmount -
-                WITHDRAWAL_FEE;
-
-            /*
-             * Deduct immediately and create a pending
-             * withdrawal.
-             *
-             * If the payment provider later fails,
-             * an admin/provider callback should reverse
-             * this transaction.
-             */
-
-            const newBalance =
-                balance -
-                requestedAmount -
-                WITHDRAWAL_FEE;
-
-            await client.query(
-                `
-                UPDATE public.driver_wallets
-                SET
-                    balance = $1,
-                    total_withdrawn =
-                        total_withdrawn + $2,
-                    last_transaction_at =
-                        CURRENT_TIMESTAMP,
-                    updated_at =
-                        CURRENT_TIMESTAMP
-                WHERE id = $3
-                `,
-                [
-                    newBalance,
-                    requestedAmount,
-                    wallet.id,
-                ],
-            );
-
-            const withdrawalResult =
-                await client.query(
-                    `
-                    INSERT INTO public.driver_wallet_withdrawals
-                    (
-                        driver_id,
-                        wallet_id,
-                        payment_account_id,
-                        amount,
-                        fee,
-                        net_amount,
-                        mobile_network,
-                        mobile_money_number,
-                        account_name,
-                        status,
-                        reference
-                    )
-                    VALUES
-                    (
-                        $1,
-                        $2,
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
-                        $8,
-                        $9,
-                        'pending',
-                        $10
-                    )
-                    RETURNING *
-                    `,
-                    [
-                        req.driverId,
-                        wallet.id,
-                        paymentAccount.id,
-                        requestedAmount,
-                        WITHDRAWAL_FEE,
-                        netAmount,
-                        paymentAccount.mobile_network,
-                        paymentAccount.mobile_money_number,
-                        paymentAccount.account_name,
-                        reference,
-                    ],
-                );
-
-            await client.query(
-                `
-                INSERT INTO public.driver_wallet_transactions
-                (
-                    driver_id,
-                    wallet_id,
-                    transaction_type,
-                    amount,
-                    balance_before,
-                    balance_after,
-                    description,
-                    reference,
-                    status,
-                    metadata
-                )
-                VALUES
-                (
-                    $1,
-                    $2,
-                    'withdrawal',
-                    $3,
-                    $4,
-                    $5,
-                    $6,
-                    $7,
-                    'pending',
-                    $8
-                )
-                `,
-                [
-                    req.driverId,
-                    wallet.id,
-                    requestedAmount,
-                    balance,
-                    newBalance,
-                    'Driver wallet withdrawal',
-                    reference,
-                    JSON.stringify({
-                        withdrawalId:
-                            withdrawalResult
-                                .rows[0]
-                                .id,
-                        fee:
-                            WITHDRAWAL_FEE,
-                        netAmount,
-                    }),
-                ],
-            );
-
-            await client.query(
-                'COMMIT',
-            );
-
-            return res.status(201).json({
-                success: true,
-                message:
-                    'Withdrawal request created successfully',
-                withdrawal: {
-                    id:
-                        withdrawalResult
-                            .rows[0]
-                            .id,
-                    amount:
-                        requestedAmount,
-                    fee:
-                        WITHDRAWAL_FEE,
-                    netAmount,
-                    status:
-                        'pending',
-                    reference,
-                    newBalance,
-                },
-            });
-        } catch (error: unknown) {
-            await client.query(
-                'ROLLBACK',
-            );
 
             console.error(
-                '❌ Withdrawal error:',
+                '❌ Failed to save payment account:',
                 error,
             );
 
@@ -1104,126 +1057,756 @@ router.post(
                     message?: string;
                 };
 
-            return res.status(500).json({
+            res.status(500).json({
                 success: false,
                 error:
-                    dbError.message ||
-                    'Failed to process withdrawal',
+                    'Failed to save payment account',
+                code:
+                    'PAYMENT_ACCOUNT_SAVE_FAILED',
+                details:
+                    dbError.message,
             });
-        } finally {
-            client.release();
         }
     },
 );
 
+/* ==========================================================================
+ * TOP UP WALLET
+ * ==========================================================================
+ *
+ * POST /api/drivers/wallet/topup
+ *
+ * ========================================================================== */
 
-/*
-|--------------------------------------------------------------------------
-| GET WITHDRAWALS
-|--------------------------------------------------------------------------
-|
-| GET /api/drivers/wallet/withdrawals
-|
-|--------------------------------------------------------------------------
-*/
+router.post(
+    '/wallet/topup',
+    async (
+        req: Request,
+        res: Response,
+    ) => {
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
+                res,
+            );
+
+        if (!authenticated) {
+            return;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | PAYMENT PROVIDER NOT YET CONNECTED
+        |--------------------------------------------------------------------------
+        */
+
+        res.status(501).json({
+            success: false,
+            error:
+                'Wallet top-up is not yet available. A verified payment provider must be connected first.',
+            code:
+                'TOPUP_NOT_IMPLEMENTED',
+        });
+    },
+);
+
+/* ==========================================================================
+ * WITHDRAW MONEY
+ * ==========================================================================
+ *
+ * POST /api/drivers/wallet/withdraw
+ *
+ * ========================================================================== */
+
+router.post(
+    '/wallet/withdraw',
+    async (
+        req: Request,
+        res: Response,
+    ) => {
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
+                res,
+            );
+
+        if (!authenticated) {
+            return;
+        }
+
+        const amount =
+            Number(req.body.amount);
+
+        /*
+        |--------------------------------------------------------------------------
+        | VALIDATE AMOUNT
+        |--------------------------------------------------------------------------
+        */
+
+        if (
+            !Number.isFinite(amount) ||
+            amount <= 0
+        ) {
+            res.status(400).json({
+                success: false,
+                error:
+                    'A valid withdrawal amount is required',
+                code:
+                    'INVALID_WITHDRAWAL_AMOUNT',
+            });
+
+            return;
+        }
+
+        if (
+            amount <
+            MINIMUM_WITHDRAWAL
+        ) {
+            res.status(400).json({
+                success: false,
+                error:
+                    `Minimum withdrawal amount is GH₵${MINIMUM_WITHDRAWAL.toFixed(2)}`,
+                code:
+                    'MINIMUM_WITHDRAWAL_NOT_MET',
+                minimumAmount:
+                    MINIMUM_WITHDRAWAL,
+            });
+
+            return;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | CHECK PAYMENT ACCOUNT
+        |--------------------------------------------------------------------------
+        */
+
+        try {
+
+            const paymentAccountResult =
+                await pool.query(
+                    `
+                    SELECT
+                        id,
+                        mobile_network,
+                        mobile_number,
+                        account_name,
+                        is_verified,
+                        is_active
+                    FROM public.driver_payment_accounts
+                    WHERE driver_id = $1
+                    LIMIT 1
+                    `,
+                    [
+                        authReq.driverId,
+                    ],
+                );
+
+            if (
+                paymentAccountResult.rows.length === 0
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Please add a payment account before requesting a withdrawal',
+                    code:
+                        'PAYMENT_ACCOUNT_REQUIRED',
+                });
+
+                return;
+            }
+
+            const paymentAccount =
+                paymentAccountResult.rows[0];
+
+            if (
+                !paymentAccount.is_active
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Your payment account is inactive',
+                    code:
+                        'PAYMENT_ACCOUNT_INACTIVE',
+                });
+
+                return;
+            }
+
+            if (
+                !paymentAccount.is_verified
+            ) {
+                res.status(400).json({
+                    success: false,
+                    error:
+                        'Your payment account must be verified before withdrawal',
+                    code:
+                        'PAYMENT_ACCOUNT_NOT_VERIFIED',
+                });
+
+                return;
+            }
+
+            /*
+            |--------------------------------------------------------------------------
+            | START DATABASE TRANSACTION
+            |--------------------------------------------------------------------------
+            */
+
+            const client =
+                await pool.connect();
+
+            try {
+
+                await client.query(
+                    'BEGIN',
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | LOCK WALLET
+                |--------------------------------------------------------------------------
+                */
+
+                let walletResult =
+                    await client.query(
+                        `
+                        SELECT
+                            id,
+                            driver_id,
+                            balance,
+                            pending_balance,
+                            total_earnings,
+                            total_withdrawn,
+                            total_commission_paid,
+                            amount_owed,
+                            minimum_balance
+                        FROM public.driver_wallets
+                        WHERE driver_id = $1
+                        FOR UPDATE
+                        `,
+                        [
+                            authReq.driverId,
+                        ],
+                    );
+
+                /*
+                |--------------------------------------------------------------------------
+                | CREATE WALLET IF MISSING
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    walletResult.rows.length === 0
+                ) {
+
+                    await client.query(
+                        `
+                        INSERT INTO public.driver_wallets (
+                            driver_id,
+                            balance,
+                            pending_balance,
+                            total_earnings,
+                            total_withdrawn,
+                            total_commission_paid,
+                            amount_owed,
+                            minimum_balance
+                        )
+                        VALUES (
+                            $1,
+                            0.00,
+                            0.00,
+                            0.00,
+                            0.00,
+                            0.00,
+                            0.00,
+                            100.00
+                        )
+                        ON CONFLICT (driver_id)
+                        DO NOTHING
+                        `,
+                        [
+                            authReq.driverId,
+                        ],
+                    );
+
+                    walletResult =
+                        await client.query(
+                            `
+                            SELECT
+                                id,
+                                driver_id,
+                                balance,
+                                pending_balance,
+                                total_earnings,
+                                total_withdrawn,
+                                total_commission_paid,
+                                amount_owed,
+                                minimum_balance
+                            FROM public.driver_wallets
+                            WHERE driver_id = $1
+                            FOR UPDATE
+                            `,
+                            [
+                                authReq.driverId,
+                            ],
+                        );
+                }
+
+                if (
+                    walletResult.rows.length === 0
+                ) {
+                    throw new Error(
+                        'Unable to create or load driver wallet',
+                    );
+                }
+
+                const wallet =
+                    walletResult.rows[0];
+
+                const currentBalance =
+                    Number(
+                        wallet.balance,
+                    );
+
+                const minimumBalance =
+                    Number(
+                        wallet.minimum_balance,
+                    );
+
+                const totalRequired =
+                    amount +
+                    WITHDRAWAL_FEE;
+
+                const remainingBalance =
+                    currentBalance -
+                    totalRequired;
+
+                /*
+                |--------------------------------------------------------------------------
+                | CHECK AVAILABLE BALANCE
+                |--------------------------------------------------------------------------
+                */
+
+                if (
+                    remainingBalance <
+                    minimumBalance
+                ) {
+
+                    await client.query(
+                        'ROLLBACK',
+                    );
+
+                    res.status(400).json({
+                        success: false,
+                        error:
+                            `Insufficient available balance. You must maintain a minimum balance of GH₵${minimumBalance.toFixed(2)}.`,
+                        code:
+                            'INSUFFICIENT_BALANCE',
+                        currentBalance,
+                        requestedAmount:
+                            amount,
+                        withdrawalFee:
+                            WITHDRAWAL_FEE,
+                        minimumBalance,
+                    });
+
+                    return;
+                }
+
+                /*
+                |--------------------------------------------------------------------------
+                | UPDATE WALLET BALANCE
+                |--------------------------------------------------------------------------
+                */
+
+                const newBalance =
+                    remainingBalance;
+
+                await client.query(
+                    `
+                    UPDATE public.driver_wallets
+                    SET
+                        balance = $1,
+                        total_withdrawn =
+                            total_withdrawn + $2,
+                        updated_at = NOW()
+                    WHERE driver_id = $3
+                    `,
+                    [
+                        newBalance,
+                        amount,
+                        authReq.driverId,
+                    ],
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | CREATE WITHDRAWAL RECORD
+                |--------------------------------------------------------------------------
+                */
+
+                const withdrawalResult =
+                    await client.query(
+                        `
+                        INSERT INTO public.driver_wallet_withdrawals (
+                            driver_id,
+                            amount,
+                            fee,
+                            total_amount,
+                            payment_account_id,
+                            status
+                        )
+                        VALUES (
+                            $1,
+                            $2,
+                            $3,
+                            $4,
+                            $5,
+                            'pending'
+                        )
+                        RETURNING
+                            id,
+                            driver_id,
+                            amount,
+                            fee,
+                            total_amount,
+                            payment_account_id,
+                            status,
+                            created_at
+                        `,
+                        [
+                            authReq.driverId,
+                            amount,
+                            WITHDRAWAL_FEE,
+                            totalRequired,
+                            paymentAccount.id,
+                        ],
+                    );
+
+                /*
+                |--------------------------------------------------------------------------
+                | INSERT LEDGER TRANSACTION
+                |--------------------------------------------------------------------------
+                */
+
+                await client.query(
+                    `
+                    INSERT INTO public.driver_wallet_transactions (
+                        wallet_id,
+                        driver_id,
+                        transaction_type,
+                        amount,
+                        balance_before,
+                        balance_after,
+                        reference,
+                        description,
+                        status
+                    )
+                    VALUES (
+                        $1,
+                        $2,
+                        'withdrawal',
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        'pending'
+                    )
+                    `,
+                    [
+                        wallet.id,
+                        authReq.driverId,
+                        amount,
+                        currentBalance,
+                        newBalance,
+                        `WD-${withdrawalResult.rows[0].id}`,
+                        'Driver wallet withdrawal',
+                    ],
+                );
+
+                /*
+                |--------------------------------------------------------------------------
+                | COMMIT
+                |--------------------------------------------------------------------------
+                */
+
+                await client.query(
+                    'COMMIT',
+                );
+
+                const withdrawal =
+                    withdrawalResult.rows[0];
+
+                res.status(201).json({
+                    success: true,
+
+                    message:
+                        'Withdrawal request submitted successfully',
+
+                    withdrawal: {
+                        id:
+                            Number(
+                                withdrawal.id,
+                            ),
+
+                        driverId:
+                            Number(
+                                withdrawal.driver_id,
+                            ),
+
+                        amount:
+                            Number(
+                                withdrawal.amount,
+                            ),
+
+                        fee:
+                            Number(
+                                withdrawal.fee,
+                            ),
+
+                        totalAmount:
+                            Number(
+                                withdrawal.total_amount,
+                            ),
+
+                        paymentAccountId:
+                            Number(
+                                withdrawal.payment_account_id,
+                            ),
+
+                        status:
+                            withdrawal.status,
+
+                        createdAt:
+                            withdrawal.created_at,
+                    },
+
+                    wallet: {
+                        previousBalance:
+                            currentBalance,
+
+                        newBalance:
+                            newBalance,
+
+                        minimumBalance:
+                            minimumBalance,
+                    },
+                });
+
+            } catch (error: unknown) {
+
+                try {
+                    await client.query(
+                        'ROLLBACK',
+                    );
+                } catch (
+                rollbackError
+                ) {
+                    console.error(
+                        '❌ Rollback failed:',
+                        rollbackError,
+                    );
+                }
+
+                console.error(
+                    '❌ Withdrawal transaction failed:',
+                    error,
+                );
+
+                const dbError =
+                    error as {
+                        message?: string;
+                        code?: string;
+                        detail?: string;
+                    };
+
+                res.status(500).json({
+                    success: false,
+                    error:
+                        'Failed to process withdrawal',
+                    code:
+                        'WITHDRAWAL_FAILED',
+                    details:
+                        dbError.message,
+                });
+
+            } finally {
+
+                client.release();
+            }
+
+        } catch (error: unknown) {
+
+            console.error(
+                '❌ Failed to process withdrawal:',
+                error,
+            );
+
+            const dbError =
+                error as {
+                    message?: string;
+                };
+
+            res.status(500).json({
+                success: false,
+                error:
+                    'Failed to process withdrawal',
+                code:
+                    'WITHDRAWAL_FAILED',
+                details:
+                    dbError.message,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
+ * GET WITHDRAWAL HISTORY
+ * ==========================================================================
+ *
+ * GET /api/drivers/wallet/withdrawals
+ *
+ * ========================================================================== */
 
 router.get(
     '/wallet/withdrawals',
     async (
-        req: AuthenticatedDriverRequest,
+        req: Request,
         res: Response,
     ) => {
-        if (
-            !(await authenticateDriver(
-                req,
+
+        const authReq =
+            req as AuthenticatedDriverRequest;
+
+        const authenticated =
+            await authenticateDriver(
+                authReq,
                 res,
-            ))
-        ) {
+            );
+
+        if (!authenticated) {
             return;
         }
 
         try {
+
             const result =
                 await pool.query(
                     `
                     SELECT
                         id,
+                        driver_id,
                         amount,
                         fee,
-                        net_amount,
-                        mobile_network,
-                        mobile_money_number,
-                        account_name,
+                        total_amount,
+                        payment_account_id,
                         status,
-                        reference,
+                        provider_reference,
                         failure_reason,
-                        processed_at,
                         created_at,
-                        updated_at
+                        processed_at
                     FROM public.driver_wallet_withdrawals
                     WHERE driver_id = $1
                     ORDER BY created_at DESC
-                    LIMIT 100
                     `,
-                    [req.driverId],
+                    [
+                        authReq.driverId,
+                    ],
                 );
 
-            return res.status(200).json({
+            res.status(200).json({
                 success: true,
+
                 withdrawals:
                     result.rows.map(
-                        (
-                            withdrawal,
-                        ) => ({
+                        (withdrawal) => ({
                             id:
-                                withdrawal.id,
+                                Number(
+                                    withdrawal.id,
+                                ),
+
+                            driverId:
+                                Number(
+                                    withdrawal.driver_id,
+                                ),
+
                             amount:
                                 Number(
                                     withdrawal.amount,
                                 ),
+
                             fee:
                                 Number(
                                     withdrawal.fee,
                                 ),
-                            netAmount:
+
+                            totalAmount:
                                 Number(
-                                    withdrawal.net_amount,
+                                    withdrawal.total_amount,
                                 ),
-                            mobileNetwork:
-                                withdrawal.mobile_network,
-                            mobileMoneyNumber:
-                                withdrawal.mobile_money_number,
-                            accountName:
-                                withdrawal.account_name,
+
+                            paymentAccountId:
+                                withdrawal.payment_account_id
+                                    ? Number(
+                                        withdrawal.payment_account_id,
+                                    )
+                                    : null,
+
                             status:
                                 withdrawal.status,
-                            reference:
-                                withdrawal.reference,
+
+                            providerReference:
+                                withdrawal.provider_reference,
+
                             failureReason:
                                 withdrawal.failure_reason,
-                            processedAt:
-                                withdrawal.processed_at,
+
                             createdAt:
                                 withdrawal.created_at,
-                            updatedAt:
-                                withdrawal.updated_at,
+
+                            processedAt:
+                                withdrawal.processed_at,
                         }),
                     ),
             });
+
         } catch (error: unknown) {
+
             console.error(
-                '❌ Get withdrawals error:',
+                '❌ Failed to load withdrawal history:',
                 error,
             );
 
-            return res.status(500).json({
+            const dbError =
+                error as {
+                    message?: string;
+                };
+
+            res.status(500).json({
                 success: false,
                 error:
-                    'Failed to load withdrawals',
+                    'Failed to load withdrawal history',
+                code:
+                    'WITHDRAWALS_LOAD_FAILED',
+                details:
+                    dbError.message,
             });
         }
     },
 );
 
+/* ==========================================================================
+ * EXPORT ROUTER
+ * ========================================================================== */
 
 export default router;
