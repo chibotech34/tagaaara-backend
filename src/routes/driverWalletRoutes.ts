@@ -37,10 +37,6 @@ async function authenticateDriver(
     res: Response,
 ): Promise<boolean> {
 
-    /* ----------------------------------------------------------------------
-     * 1. CHECK AUTHORIZATION HEADER
-     * ---------------------------------------------------------------------- */
-
     const authHeader =
         req.headers.authorization;
 
@@ -59,10 +55,6 @@ async function authenticateDriver(
         return false;
     }
 
-    /* ----------------------------------------------------------------------
-     * 2. EXTRACT BEARER TOKEN
-     * ---------------------------------------------------------------------- */
-
     const token =
         authHeader
             .substring('Bearer '.length)
@@ -79,10 +71,6 @@ async function authenticateDriver(
 
         return false;
     }
-
-    /* ----------------------------------------------------------------------
-     * 3. VERIFY FIREBASE ID TOKEN
-     * ---------------------------------------------------------------------- */
 
     let firebaseUid: string;
 
@@ -159,13 +147,6 @@ async function authenticateDriver(
 
         return false;
     }
-
-    /* ----------------------------------------------------------------------
-     * 4. FIND DRIVER IN DATABASE
-     *
-     * The drivers table uses `uid`.
-     * DO NOT use `firebase_uid`.
-     * ---------------------------------------------------------------------- */
 
     try {
 
@@ -613,13 +594,6 @@ router.get(
  * GET PAYMENT ACCOUNT
  *
  * GET /api/drivers/wallet/payment-account
- *
- * Returns the payout account using SNAKE_CASE keys under `account`
- * so the Flutter client can read:
- *   _paymentAccount['mobile_network']
- *   _paymentAccount['mobile_money_number']
- *   _paymentAccount['account_name']
- *   _paymentAccount['is_verified']
  * ========================================================================== */
 
 router.get(
@@ -742,9 +716,6 @@ router.get(
  * CREATE / UPDATE PAYMENT ACCOUNT
  *
  * POST /api/drivers/wallet/payment-account
- *
- * Accepts BOTH snake_case (what Flutter sends) and camelCase.
- * `account_name` is optional.
  * ========================================================================== */
 
 router.post(
@@ -769,12 +740,6 @@ router.post(
 
         try {
 
-            /*
-             * Accept both shapes:
-             *   - snake_case (Flutter):  mobile_network, mobile_money_number, account_name
-             *   - camelCase  (legacy) :  mobileNetwork, mobileNumber, accountName
-             */
-
             const mobileNetwork =
                 req.body.mobileNetwork ??
                 req.body.mobile_network;
@@ -788,10 +753,6 @@ router.post(
                 req.body.account_name ??
                 null;
 
-            /* ----------------------------------------------------------------
-             * VALIDATE REQUIRED FIELDS
-             * ---------------------------------------------------------------- */
-
             if (!mobileNetwork || !mobileNumber) {
                 res.status(400).json({
                     success: false,
@@ -804,18 +765,10 @@ router.post(
                 return;
             }
 
-            /* ----------------------------------------------------------------
-             * NORMALIZE PHONE NUMBER
-             * ---------------------------------------------------------------- */
-
             const phone =
                 String(
                     mobileNumber,
                 ).trim();
-
-            /* ----------------------------------------------------------------
-             * GHANA PHONE VALIDATION
-             * ---------------------------------------------------------------- */
 
             if (
                 !/^(0\d{9}|\+233\d{9})$/.test(
@@ -832,10 +785,6 @@ router.post(
 
                 return;
             }
-
-            /* ----------------------------------------------------------------
-             * VALIDATE NETWORK
-             * ---------------------------------------------------------------- */
 
             const allowedNetworks = [
                 'MTN',
@@ -865,10 +814,6 @@ router.post(
 
                 return;
             }
-
-            /* ----------------------------------------------------------------
-             * UPSERT PAYMENT ACCOUNT
-             * ---------------------------------------------------------------- */
 
             const result =
                 await pool.query(
@@ -1010,10 +955,6 @@ router.post(
             return;
         }
 
-        /*
-         * PAYMENT PROVIDER NOT YET CONNECTED
-         */
-
         res.status(501).json({
             success: false,
             error:
@@ -1028,6 +969,17 @@ router.post(
  * WITHDRAW MONEY
  *
  * POST /api/drivers/wallet/withdraw
+ *
+ * Writes to public.driver_withdrawals (the real table).
+ *
+ * Columns per actual schema:
+ *   id, driver_id, wallet_id, amount, fee, net_amount,
+ *   mobile_network, mobile_money_number, status,
+ *   failure_reason, withdrawal_reference, transaction_id,
+ *   created_at, updated_at
+ *
+ * transaction_id is left NULL — driver_transactions ledger is not
+ * yet wired up. The FK is nullable so this is valid.
  * ========================================================================== */
 
 router.post(
@@ -1052,10 +1004,6 @@ router.post(
 
         const amount =
             Number(req.body.amount);
-
-        /* ----------------------------------------------------------------------
-         * VALIDATE AMOUNT
-         * ---------------------------------------------------------------------- */
 
         if (
             !Number.isFinite(amount) ||
@@ -1086,11 +1034,11 @@ router.post(
             return;
         }
 
-        /* ----------------------------------------------------------------------
-         * CHECK PAYMENT ACCOUNT
-         * ---------------------------------------------------------------------- */
-
         try {
+
+            /* ----------------------------------------------------------------
+             * PAYMENT ACCOUNT CHECK
+             * ---------------------------------------------------------------- */
 
             const paymentAccountResult =
                 await pool.query(
@@ -1151,7 +1099,7 @@ router.post(
             }
 
             /* ----------------------------------------------------------------
-             * START DATABASE TRANSACTION
+             * TRANSACTION
              * ---------------------------------------------------------------- */
 
             const client =
@@ -1188,10 +1136,6 @@ router.post(
                             authReq.driverId,
                         ],
                     );
-
-                /* ------------------------------------------------------------
-                 * CREATE WALLET IF MISSING
-                 * ------------------------------------------------------------ */
 
                 if (walletResult.rows.length === 0) {
 
@@ -1267,16 +1211,15 @@ router.post(
                         wallet.minimum_balance,
                     );
 
-                const totalRequired =
-                    amount +
-                    WITHDRAWAL_FEE;
+                const netAmount =
+                    amount - WITHDRAWAL_FEE;
 
                 const remainingBalance =
                     currentBalance -
-                    totalRequired;
+                    amount;
 
                 /* ------------------------------------------------------------
-                 * CHECK AVAILABLE BALANCE
+                 * BALANCE CHECK
                  * ------------------------------------------------------------ */
 
                 if (remainingBalance < minimumBalance) {
@@ -1316,6 +1259,7 @@ router.post(
                         balance = $1,
                         total_withdrawn =
                             total_withdrawn + $2,
+                        last_transaction_at = NOW(),
                         updated_at = NOW()
                     WHERE driver_id = $3
                     `,
@@ -1327,19 +1271,32 @@ router.post(
                 );
 
                 /* ------------------------------------------------------------
-                 * CREATE WITHDRAWAL RECORD
+                 * INSERT WITHDRAWAL ROW
+                 *
+                 * driver_withdrawals is the real table.
+                 * withdrawal_reference is NOT NULL + UNIQUE, so we
+                 * generate it here before insert.
                  * ------------------------------------------------------------ */
+
+                const withdrawalReference =
+                    `WD-${Date.now()}-${Math.random()
+                        .toString(36)
+                        .slice(2, 8)
+                        .toUpperCase()}`;
 
                 const withdrawalResult =
                     await client.query(
                         `
-                        INSERT INTO public.driver_wallet_withdrawals (
+                        INSERT INTO public.driver_withdrawals (
                             driver_id,
+                            wallet_id,
                             amount,
                             fee,
-                            total_amount,
-                            payment_account_id,
-                            status
+                            net_amount,
+                            mobile_network,
+                            mobile_money_number,
+                            status,
+                            withdrawal_reference
                         )
                         VALUES (
                             $1,
@@ -1347,70 +1304,37 @@ router.post(
                             $3,
                             $4,
                             $5,
-                            'pending'
+                            $6,
+                            $7,
+                            'pending',
+                            $8
                         )
                         RETURNING
                             id,
                             driver_id,
+                            wallet_id,
                             amount,
                             fee,
-                            total_amount,
-                            payment_account_id,
+                            net_amount,
+                            mobile_network,
+                            mobile_money_number,
                             status,
-                            created_at
+                            failure_reason,
+                            withdrawal_reference,
+                            created_at,
+                            updated_at
                         `,
                         [
                             authReq.driverId,
+                            wallet.id,
                             amount,
                             WITHDRAWAL_FEE,
-                            totalRequired,
-                            paymentAccount.id,
+                            netAmount,
+                            paymentAccount.mobile_network,
+                            paymentAccount.mobile_number,
+                            withdrawalReference,
                         ],
                     );
-
-                /* ------------------------------------------------------------
-                 * INSERT LEDGER TRANSACTION
-                 * ------------------------------------------------------------ */
-
-                await client.query(
-                    `
-                    INSERT INTO public.driver_wallet_transactions (
-                        wallet_id,
-                        driver_id,
-                        transaction_type,
-                        amount,
-                        balance_before,
-                        balance_after,
-                        reference,
-                        description,
-                        status
-                    )
-                    VALUES (
-                        $1,
-                        $2,
-                        'withdrawal',
-                        $3,
-                        $4,
-                        $5,
-                        $6,
-                        $7,
-                        'pending'
-                    )
-                    `,
-                    [
-                        wallet.id,
-                        authReq.driverId,
-                        amount,
-                        currentBalance,
-                        newBalance,
-                        `WD-${withdrawalResult.rows[0].id}`,
-                        'Driver wallet withdrawal',
-                    ],
-                );
-
-                /* ------------------------------------------------------------
-                 * COMMIT
-                 * ------------------------------------------------------------ */
 
                 await client.query(
                     'COMMIT',
@@ -1427,13 +1351,16 @@ router.post(
 
                     withdrawal: {
                         id:
-                            Number(
-                                withdrawal.id,
-                            ),
+                            Number(withdrawal.id),
 
-                        driverId:
+                        driver_id:
                             Number(
                                 withdrawal.driver_id,
+                            ),
+
+                        wallet_id:
+                            Number(
+                                withdrawal.wallet_id,
                             ),
 
                         amount:
@@ -1446,21 +1373,31 @@ router.post(
                                 withdrawal.fee,
                             ),
 
-                        totalAmount:
+                        net_amount:
                             Number(
-                                withdrawal.total_amount,
+                                withdrawal.net_amount,
                             ),
 
-                        paymentAccountId:
-                            Number(
-                                withdrawal.payment_account_id,
-                            ),
+                        mobile_network:
+                            withdrawal.mobile_network,
+
+                        mobile_money_number:
+                            withdrawal.mobile_money_number,
 
                         status:
                             withdrawal.status,
 
-                        createdAt:
+                        failure_reason:
+                            withdrawal.failure_reason,
+
+                        withdrawal_reference:
+                            withdrawal.withdrawal_reference,
+
+                        created_at:
                             withdrawal.created_at,
+
+                        updated_at:
+                            withdrawal.updated_at,
                     },
 
                     wallet: {
@@ -1544,6 +1481,10 @@ router.post(
  * GET WITHDRAWAL HISTORY
  *
  * GET /api/drivers/wallet/withdrawals
+ *
+ * Reads directly from public.driver_withdrawals (the real table).
+ * Every column the Flutter DriverWithdrawal model expects is on
+ * that table already — no join needed.
  * ========================================================================== */
 
 router.get(
@@ -1574,16 +1515,19 @@ router.get(
                     SELECT
                         id,
                         driver_id,
+                        wallet_id,
                         amount,
                         fee,
-                        total_amount,
-                        payment_account_id,
+                        net_amount,
+                        mobile_network,
+                        mobile_money_number,
                         status,
-                        provider_reference,
                         failure_reason,
+                        withdrawal_reference,
+                        transaction_id,
                         created_at,
-                        processed_at
-                    FROM public.driver_wallet_withdrawals
+                        updated_at
+                    FROM public.driver_withdrawals
                     WHERE driver_id = $1
                     ORDER BY created_at DESC
                     `,
@@ -1597,53 +1541,51 @@ router.get(
 
                 withdrawals:
                     result.rows.map(
-                        (withdrawal) => ({
+                        (w: any) => ({
                             id:
-                                Number(
-                                    withdrawal.id,
-                                ),
+                                Number(w.id),
 
-                            driverId:
-                                Number(
-                                    withdrawal.driver_id,
-                                ),
+                            driver_id:
+                                Number(w.driver_id),
+
+                            wallet_id:
+                                Number(w.wallet_id),
 
                             amount:
-                                Number(
-                                    withdrawal.amount,
-                                ),
+                                Number(w.amount),
 
                             fee:
-                                Number(
-                                    withdrawal.fee,
-                                ),
+                                Number(w.fee),
 
-                            totalAmount:
-                                Number(
-                                    withdrawal.total_amount,
-                                ),
+                            net_amount:
+                                Number(w.net_amount),
 
-                            paymentAccountId:
-                                withdrawal.payment_account_id
-                                    ? Number(
-                                        withdrawal.payment_account_id,
-                                    )
-                                    : null,
+                            mobile_network:
+                                w.mobile_network,
+
+                            mobile_money_number:
+                                w.mobile_money_number,
 
                             status:
-                                withdrawal.status,
+                                w.status,
 
-                            providerReference:
-                                withdrawal.provider_reference,
+                            failure_reason:
+                                w.failure_reason,
 
-                            failureReason:
-                                withdrawal.failure_reason,
+                            // NOT NULL on the table — always present.
+                            withdrawal_reference:
+                                w.withdrawal_reference,
 
-                            createdAt:
-                                withdrawal.created_at,
+                            transaction_id:
+                                w.transaction_id != null
+                                    ? Number(w.transaction_id)
+                                    : null,
 
-                            processedAt:
-                                withdrawal.processed_at,
+                            created_at:
+                                w.created_at,
+
+                            updated_at:
+                                w.updated_at,
                         }),
                     ),
             });
@@ -1658,7 +1600,20 @@ router.get(
             const dbError =
                 error as {
                     message?: string;
+                    code?: string;
+                    detail?: string;
+                    hint?: string;
                 };
+
+            console.error(
+                'Withdrawals DB error:',
+                {
+                    code: dbError.code,
+                    message: dbError.message,
+                    detail: dbError.detail,
+                    hint: dbError.hint,
+                },
+            );
 
             res.status(500).json({
                 success: false,
