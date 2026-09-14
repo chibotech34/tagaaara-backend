@@ -687,6 +687,11 @@ router.get(
 |
 | :id → numeric PK from public.drivers.id
 |
+| NOTE:
+| `public.rides.driver_id` stores the Firebase UID (text), NOT the
+| numeric driver PK. We therefore resolve the driver's UID first and
+| filter rides on that.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -756,13 +761,17 @@ router.get(
 
             /*
             |--------------------------------------------------------------------------
-            | Get driver ride statistics
-            |--------------------------------------------------------------------------
-            |
             | IMPORTANT:
-            | The rides table uses `distance`, NOT `distance_km`.
+            | `public.rides.driver_id` holds the Firebase UID (text).
+            | Use the driver's UID here, not the numeric PK.
             |
+            | The rides table uses `distance` (not `distance_km`) and
+            | `completed_at` for the completion timestamp.
+            |--------------------------------------------------------------------------
             */
+
+            const driverUid =
+                driverCheck.rows[0].uid as string;
 
             const stats =
                 await pool.query(
@@ -804,7 +813,7 @@ router.get(
                     FROM public.rides
                     WHERE driver_id = $1
                     `,
-                    [id],
+                    [driverUid],
                 );
 
             const row = stats.rows[0] || {};
@@ -872,6 +881,30 @@ router.get(
 |
 | :uid → Firebase UID (public.drivers.uid)
 |
+| NOTE:
+| `public.rides` schema (relevant columns):
+|   id                  integer
+|   passenger_id        integer
+|   driver_id           text        ← Firebase UID, NOT numeric PK
+|   pickup              geometry(Point,4326)
+|   destination         geometry(Point,4326)
+|   pickup_address      text
+|   destination_address text
+|   distance            numeric(10,2)
+|   duration            integer       ← NOT duration_min
+|   fare                numeric(10,2)
+|   driver_earnings     numeric(10,2)
+|   tegaara_commission  numeric(10,2)
+|   ride_type           varchar(50)
+|   payment_method      varchar(30)
+|   payment_status      varchar(20)
+|   status              varchar(30)
+|   requested_at        timestamptz
+|   completed_at        timestamptz
+|
+| We expose `pickup_lat/lng` and `dest_lat/lng` in the JSON response
+| by projecting the PostGIS geometry with ST_Y (lat) and ST_X (lng).
+|
 |--------------------------------------------------------------------------
 */
 
@@ -903,7 +936,7 @@ router.get(
         try {
             /*
             |--------------------------------------------------------------------------
-            | Find driver
+            | Find driver (confirms the driver row exists)
             |--------------------------------------------------------------------------
             */
 
@@ -928,17 +961,19 @@ router.get(
                 });
             }
 
-            const driverId =
-                driverResult.rows[0].id;
-
             /*
             |--------------------------------------------------------------------------
             | Find active ride
             |--------------------------------------------------------------------------
             |
-            | IMPORTANT:
-            | The rides table uses `distance`, NOT `distance_km`.
+            | We filter on the Firebase UID (text), because
+            | `rides.driver_id` stores the UID — not the numeric PK.
             |
+            | The geometry columns `pickup` / `destination` are exposed
+            | as pickup_lat / pickup_lng / dest_lat / dest_lng.
+            |
+            | `duration` is the real column (integer, minutes).
+            |--------------------------------------------------------------------------
             */
 
             const activeRide =
@@ -951,18 +986,17 @@ router.get(
                         r.status,
 
                         r.pickup_address,
-                        r.pickup_lat,
-                        r.pickup_lng,
+                        ST_Y(r.pickup::geometry)      AS pickup_lat,
+                        ST_X(r.pickup::geometry)      AS pickup_lng,
 
                         r.destination_address,
-                        r.dest_lat,
-                        r.dest_lng,
+                        ST_Y(r.destination::geometry) AS dest_lat,
+                        ST_X(r.destination::geometry) AS dest_lng,
 
                         r.ride_type,
 
                         r.distance,
-
-                        r.duration_min,
+                        r.duration,
 
                         r.fare,
                         r.driver_earnings,
@@ -1002,7 +1036,7 @@ router.get(
 
                     LIMIT 1
                     `,
-                    [driverId],
+                    [uid],
                 );
 
             if (activeRide.rows.length === 0) {
