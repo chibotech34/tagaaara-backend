@@ -144,10 +144,6 @@ const getAuthenticatedUid = (
 |--------------------------------------------------------------------------
 | Helper: Normalise a route param
 |--------------------------------------------------------------------------
-|
-| Newer @types/express infer `req.params.x` as `string | string[]`.
-| This helper narrows it back to a plain `string`.
-|
 */
 
 const normaliseParam = (
@@ -683,8 +679,11 @@ router.get(
 | GET /api/drivers/:id/stats
 |--------------------------------------------------------------------------
 |
-| Returns today's earnings, total trips, completed trips, and distance
-| travelled today for the given driver.
+| Returns:
+| - today's earnings
+| - total trips
+| - completed trips
+| - today's completed distance
 |
 | :id → numeric PK from public.drivers.id
 |
@@ -722,17 +721,27 @@ router.get(
         }
 
         try {
-            // Ensure the numeric id belongs to the authenticated user.
+            /*
+            |--------------------------------------------------------------------------
+            | Verify that the driver ID belongs to the authenticated Firebase UID
+            |--------------------------------------------------------------------------
+            */
+
             const driverCheck =
                 await pool.query(
                     `
-                    SELECT id, uid
+                    SELECT
+                        id,
+                        uid
                     FROM public.drivers
                     WHERE id = $1
                       AND uid = $2
                     LIMIT 1
                     `,
-                    [id, authenticatedUid],
+                    [
+                        id,
+                        authenticatedUid,
+                    ],
                 );
 
             if (driverCheck.rows.length === 0) {
@@ -740,12 +749,21 @@ router.get(
                     success: false,
                     message:
                         'Driver not found or does not belong to authenticated user.',
-                    code: 'DRIVER_NOT_FOUND',
+                    code:
+                        'DRIVER_NOT_FOUND',
                 });
             }
 
-            // Aggregate stats from the rides table.
-            // Adjust column names here if your schema differs.
+            /*
+            |--------------------------------------------------------------------------
+            | Get driver ride statistics
+            |--------------------------------------------------------------------------
+            |
+            | IMPORTANT:
+            | The rides table uses `distance`, NOT `distance_km`.
+            |
+            */
+
             const stats =
                 await pool.query(
                     `
@@ -776,7 +794,7 @@ router.get(
                                 CASE
                                     WHEN status = 'completed'
                                      AND completed_at >= CURRENT_DATE
-                                    THEN distance_km
+                                    THEN distance
                                     ELSE 0
                                 END
                             ),
@@ -793,15 +811,19 @@ router.get(
 
             return res.status(200).json({
                 success: true,
+
                 today_earnings: Number(
                     row.today_earnings ?? 0,
                 ),
+
                 total_trips: Number(
                     row.total_trips ?? 0,
                 ),
+
                 completed_trips: Number(
                     row.completed_trips ?? 0,
                 ),
+
                 distance_today: Number(
                     row.distance_today ?? 0,
                 ),
@@ -812,11 +834,30 @@ router.get(
                 error,
             );
 
+            const dbError =
+                error as {
+                    code?: string;
+                    message?: string;
+                    detail?: string;
+                    hint?: string;
+                };
+
+            console.error(
+                'Stats database error:',
+                {
+                    code: dbError.code,
+                    message: dbError.message,
+                    detail: dbError.detail,
+                    hint: dbError.hint,
+                },
+            );
+
             return res.status(500).json({
                 success: false,
                 message:
                     'Failed to fetch driver stats.',
-                code: 'STATS_FETCH_FAILED',
+                code:
+                    'STATS_FETCH_FAILED',
             });
         }
     },
@@ -830,10 +871,6 @@ router.get(
 | Returns the driver's currently assigned ride, if any.
 |
 | :uid → Firebase UID (public.drivers.uid)
-|
-| Response:
-|   200 { success: true, ride: {...} }  when an active ride exists
-|   200 { success: true, ride: null }   when there is no active ride
 |
 |--------------------------------------------------------------------------
 */
@@ -864,6 +901,12 @@ router.get(
         }
 
         try {
+            /*
+            |--------------------------------------------------------------------------
+            | Find driver
+            |--------------------------------------------------------------------------
+            */
+
             const driverResult =
                 await pool.query(
                     `
@@ -880,16 +923,24 @@ router.get(
                     success: false,
                     message:
                         'Driver not found.',
-                    code: 'DRIVER_NOT_FOUND',
+                    code:
+                        'DRIVER_NOT_FOUND',
                 });
             }
 
             const driverId =
                 driverResult.rows[0].id;
 
-            // Active statuses only. 'requested' is intentionally
-            // excluded so the driver is not pulled into the active
-            // ride screen before accepting a request.
+            /*
+            |--------------------------------------------------------------------------
+            | Find active ride
+            |--------------------------------------------------------------------------
+            |
+            | IMPORTANT:
+            | The rides table uses `distance`, NOT `distance_km`.
+            |
+            */
+
             const activeRide =
                 await pool.query(
                     `
@@ -898,45 +949,63 @@ router.get(
                         r.driver_id,
                         r.passenger_id,
                         r.status,
+
                         r.pickup_address,
                         r.pickup_lat,
                         r.pickup_lng,
+
                         r.destination_address,
                         r.dest_lat,
                         r.dest_lng,
+
                         r.ride_type,
-                        r.distance_km,
+
+                        r.distance,
+
                         r.duration_min,
+
                         r.fare,
                         r.driver_earnings,
                         r.tegaara_commission,
+
                         r.payment_method,
                         r.payment_status,
+
                         r.requested_at,
 
-                        p.full_name         AS passenger_name,
-                        p.profile_photo_url AS passenger_photo_url,
-                        p.rating            AS passenger_rating,
-                        p.total_rides       AS passenger_rides
+                        p.full_name
+                            AS passenger_name,
+
+                        p.profile_photo_url
+                            AS passenger_photo_url,
+
+                        p.rating
+                            AS passenger_rating,
+
+                        p.total_rides
+                            AS passenger_rides
 
                     FROM public.rides r
+
                     LEFT JOIN public.passengers p
                         ON p.id = r.passenger_id
+
                     WHERE r.driver_id = $1
+
                       AND r.status IN (
                           'accepted',
                           'arrived',
                           'started'
                       )
+
                     ORDER BY r.requested_at DESC
+
                     LIMIT 1
                     `,
                     [driverId],
                 );
 
             if (activeRide.rows.length === 0) {
-                // 200 with ride: null so the client can treat this
-                // as "no active ride" instead of an error.
                 return res.status(200).json({
                     success: true,
                     ride: null,
@@ -945,7 +1014,8 @@ router.get(
 
             return res.status(200).json({
                 success: true,
-                ride: activeRide.rows[0],
+                ride:
+                    activeRide.rows[0],
             });
         } catch (error: unknown) {
             console.error(
@@ -953,11 +1023,30 @@ router.get(
                 error,
             );
 
+            const dbError =
+                error as {
+                    code?: string;
+                    message?: string;
+                    detail?: string;
+                    hint?: string;
+                };
+
+            console.error(
+                'Current ride database error:',
+                {
+                    code: dbError.code,
+                    message: dbError.message,
+                    detail: dbError.detail,
+                    hint: dbError.hint,
+                },
+            );
+
             return res.status(500).json({
                 success: false,
                 message:
                     'Failed to fetch current ride.',
-                code: 'CURRENT_RIDE_FETCH_FAILED',
+                code:
+                    'CURRENT_RIDE_FETCH_FAILED',
             });
         }
     },
@@ -1114,9 +1203,11 @@ router.post(
                     latitude:
                         result.rows[0]
                             .current_latitude,
+
                     longitude:
                         result.rows[0]
                             .current_longitude,
+
                     updatedAt:
                         result.rows[0]
                             .last_location_update,
@@ -1302,15 +1393,19 @@ router.post(
                     id:
                         result.rows[0]
                             .id,
+
                     uid:
                         result.rows[0]
                             .uid,
+
                     status:
                         result.rows[0]
                             .status,
+
                     isOnline:
                         result.rows[0]
                             .is_online,
+
                     isAvailable:
                         result.rows[0]
                             .is_available,
@@ -1454,13 +1549,14 @@ router.get(
 | GET /api/drivers/nearby
 |--------------------------------------------------------------------------
 |
-| Returns online, available drivers within a radius (in meters).
+| Returns online, available drivers within a radius.
+|
 | Query parameters:
-|   - lat (required): passenger's current latitude
-|   - lng (required): passenger's current longitude
-|   - radius (optional, default: 5000): search radius in meters
-|   - onlyOnline (optional, default: true): filter by is_online = true
-|   - onlyAvailable (optional, default: true): filter by is_available = true
+|   - lat (required)
+|   - lng (required)
+|   - radius (optional, default: 5000)
+|   - onlyOnline (optional, default: true)
+|   - onlyAvailable (optional, default: true)
 |
 |--------------------------------------------------------------------------
 */
@@ -1486,13 +1582,19 @@ router.get(
                     success: false,
                     message:
                         'Missing required query parameters: lat and lng',
-                    code: 'MISSING_PARAMETERS',
+                    code:
+                        'MISSING_PARAMETERS',
                 });
             }
 
-            const latitude = Number(lat);
-            const longitude = Number(lng);
-            const searchRadius = Number(radius);
+            const latitude =
+                Number(lat);
+
+            const longitude =
+                Number(lng);
+
+            const searchRadius =
+                Number(radius);
 
             if (
                 !Number.isFinite(latitude) ||
@@ -1503,25 +1605,28 @@ router.get(
                     success: false,
                     message:
                         'Invalid numeric values for lat, lng, or radius',
-                    code: 'INVALID_PARAMETERS',
+                    code:
+                        'INVALID_PARAMETERS',
                 });
             }
 
-            // Build WHERE clause with optional filters.
             const conditions: string[] = [
-                "status = 'approved'", // Only approved drivers
+                "status = 'approved'",
             ];
+
             const values: any[] = [
                 longitude,
                 latitude,
                 searchRadius,
             ];
+
             let paramIndex = 4;
 
             if (onlyOnline === 'true') {
                 conditions.push(
                     `is_online = $${paramIndex++}`,
                 );
+
                 values.push(true);
             }
 
@@ -1529,12 +1634,14 @@ router.get(
                 conditions.push(
                     `is_available = $${paramIndex++}`,
                 );
+
                 values.push(true);
             }
 
-            const whereClause = `WHERE ${conditions.join(
-                ' AND ',
-            )}`;
+            const whereClause =
+                `WHERE ${conditions.join(
+                    ' AND ',
+                )}`;
 
             const query = `
                 SELECT
@@ -1553,37 +1660,51 @@ router.get(
                     rating,
                     current_latitude,
                     current_longitude,
+
                     ROUND(
                         ST_Distance(
                             location,
                             ST_SetSRID(
-                                ST_MakePoint($1, $2),
+                                ST_MakePoint(
+                                    $1,
+                                    $2
+                                ),
                                 4326
                             )::geography
                         )
                     ) AS distance_meters
+
                 FROM public.drivers
+
                 ${whereClause}
+
                 AND ST_DWithin(
                     location,
                     ST_SetSRID(
-                        ST_MakePoint($1, $2),
+                        ST_MakePoint(
+                            $1,
+                            $2
+                        ),
                         4326
                     )::geography,
                     $3
                 )
+
                 ORDER BY distance_meters ASC
+
                 LIMIT 50;
             `;
 
-            const result = await pool.query(
-                query,
-                values,
-            );
+            const result =
+                await pool.query(
+                    query,
+                    values,
+                );
 
             return res.status(200).json({
                 success: true,
-                drivers: result.rows,
+                drivers:
+                    result.rows,
             });
         } catch (error: unknown) {
             console.error(
@@ -1595,7 +1716,8 @@ router.get(
                 success: false,
                 message:
                     'Failed to fetch nearby drivers',
-                code: 'NEARBY_DRIVERS_FAILED',
+                code:
+                    'NEARBY_DRIVERS_FAILED',
             });
         }
     },
