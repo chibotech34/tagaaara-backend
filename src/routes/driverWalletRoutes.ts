@@ -594,6 +594,17 @@ router.get(
  * GET PAYMENT ACCOUNT
  *
  * GET /api/drivers/wallet/payment-account
+ *
+ * SCHEMA-AGNOSTIC: selects * and flattens in JS, so a mismatched
+ * column name (network vs mobile_network, momo_number vs
+ * mobile_number, etc.) cannot 500 the endpoint. Always returns the
+ * shape the Flutter client reads:
+ *
+ *   account.mobile_network
+ *   account.mobile_money_number
+ *   account.account_name
+ *   account.is_verified
+ *   account.is_active
  * ========================================================================== */
 
 router.get(
@@ -621,16 +632,7 @@ router.get(
             const result =
                 await pool.query(
                     `
-                    SELECT
-                        id,
-                        driver_id,
-                        mobile_network,
-                        mobile_number,
-                        account_name,
-                        is_verified,
-                        is_active,
-                        created_at,
-                        updated_at
+                    SELECT *
                     FROM public.driver_payment_accounts
                     WHERE driver_id = $1
                     LIMIT 1
@@ -649,41 +651,78 @@ router.get(
                 return;
             }
 
-            const account =
+            const a: any =
                 result.rows[0];
+
+            /*
+             * Normalise into the shape Flutter reads. Any of these
+             * fallback chains may win, depending on the actual
+             * column names in the schema.
+             */
+
+            const mobileNetwork =
+                a.mobile_network ??
+                a.network ??
+                a.provider ??
+                a.momo_network ??
+                null;
+
+            const mobileMoneyNumber =
+                a.mobile_money_number ??
+                a.mobile_number ??
+                a.momo_number ??
+                a.phone_number ??
+                a.phone ??
+                null;
+
+            const accountName =
+                a.account_name ??
+                a.holder_name ??
+                a.name ??
+                null;
+
+            const isVerified =
+                a.is_verified ??
+                a.verified ??
+                false;
+
+            const isActive =
+                a.is_active ??
+                a.active ??
+                true;
 
             res.status(200).json({
                 success: true,
 
                 account: {
                     id:
-                        Number(account.id),
+                        Number(a.id),
 
                     driver_id:
-                        Number(
-                            account.driver_id,
-                        ),
+                        Number(a.driver_id),
 
                     mobile_network:
-                        account.mobile_network,
+                        mobileNetwork,
 
                     mobile_money_number:
-                        account.mobile_number,
+                        mobileMoneyNumber,
 
                     account_name:
-                        account.account_name,
+                        accountName,
 
                     is_verified:
-                        account.is_verified,
+                        isVerified,
 
                     is_active:
-                        account.is_active,
+                        isActive,
 
                     created_at:
-                        account.created_at,
+                        a.created_at ??
+                        null,
 
                     updated_at:
-                        account.updated_at,
+                        a.updated_at ??
+                        null,
                 },
             });
 
@@ -696,8 +735,21 @@ router.get(
 
             const dbError =
                 error as {
+                    code?: string;
                     message?: string;
+                    detail?: string;
+                    hint?: string;
                 };
+
+            console.error(
+                'Payment account DB error:',
+                {
+                    code: dbError.code,
+                    message: dbError.message,
+                    detail: dbError.detail,
+                    hint: dbError.hint,
+                },
+            );
 
             res.status(500).json({
                 success: false,
@@ -716,6 +768,11 @@ router.get(
  * CREATE / UPDATE PAYMENT ACCOUNT
  *
  * POST /api/drivers/wallet/payment-account
+ *
+ * Accepts both snake_case (Flutter) and camelCase. Currently inserts
+ * using mobile_network / mobile_number / account_name / is_verified /
+ * is_active. If the deployed schema uses different column names,
+ * this handler will need to be rewritten against those names.
  * ========================================================================== */
 
 router.post(
@@ -841,16 +898,7 @@ router.post(
                         account_name = EXCLUDED.account_name,
                         is_active = true,
                         updated_at = NOW()
-                    RETURNING
-                        id,
-                        driver_id,
-                        mobile_network,
-                        mobile_number,
-                        account_name,
-                        is_verified,
-                        is_active,
-                        created_at,
-                        updated_at
+                    RETURNING *
                     `,
                     [
                         authReq.driverId,
@@ -864,8 +912,29 @@ router.post(
                     ],
                 );
 
-            const account =
+            const a: any =
                 result.rows[0];
+
+            const mobileNetworkOut =
+                a.mobile_network ??
+                a.network ??
+                a.provider ??
+                a.momo_network ??
+                null;
+
+            const mobileMoneyNumberOut =
+                a.mobile_money_number ??
+                a.mobile_number ??
+                a.momo_number ??
+                a.phone_number ??
+                a.phone ??
+                null;
+
+            const accountNameOut =
+                a.account_name ??
+                a.holder_name ??
+                a.name ??
+                null;
 
             res.status(200).json({
                 success: true,
@@ -874,33 +943,37 @@ router.post(
 
                 account: {
                     id:
-                        Number(account.id),
+                        Number(a.id),
 
                     driver_id:
-                        Number(
-                            account.driver_id,
-                        ),
+                        Number(a.driver_id),
 
                     mobile_network:
-                        account.mobile_network,
+                        mobileNetworkOut,
 
                     mobile_money_number:
-                        account.mobile_number,
+                        mobileMoneyNumberOut,
 
                     account_name:
-                        account.account_name,
+                        accountNameOut,
 
                     is_verified:
-                        account.is_verified,
+                        a.is_verified ??
+                        a.verified ??
+                        false,
 
                     is_active:
-                        account.is_active,
+                        a.is_active ??
+                        a.active ??
+                        true,
 
                     created_at:
-                        account.created_at,
+                        a.created_at ??
+                        null,
 
                     updated_at:
-                        account.updated_at,
+                        a.updated_at ??
+                        null,
                 },
             });
 
@@ -913,8 +986,21 @@ router.post(
 
             const dbError =
                 error as {
+                    code?: string;
                     message?: string;
+                    detail?: string;
+                    hint?: string;
                 };
+
+            console.error(
+                'Payment account save DB error:',
+                {
+                    code: dbError.code,
+                    message: dbError.message,
+                    detail: dbError.detail,
+                    hint: dbError.hint,
+                },
+            );
 
             res.status(500).json({
                 success: false,
@@ -971,15 +1057,6 @@ router.post(
  * POST /api/drivers/wallet/withdraw
  *
  * Writes to public.driver_withdrawals (the real table).
- *
- * Columns per actual schema:
- *   id, driver_id, wallet_id, amount, fee, net_amount,
- *   mobile_network, mobile_money_number, status,
- *   failure_reason, withdrawal_reference, transaction_id,
- *   created_at, updated_at
- *
- * transaction_id is left NULL — driver_transactions ledger is not
- * yet wired up. The FK is nullable so this is valid.
  * ========================================================================== */
 
 router.post(
@@ -1043,13 +1120,7 @@ router.post(
             const paymentAccountResult =
                 await pool.query(
                     `
-                    SELECT
-                        id,
-                        mobile_network,
-                        mobile_number,
-                        account_name,
-                        is_verified,
-                        is_active
+                    SELECT *
                     FROM public.driver_payment_accounts
                     WHERE driver_id = $1
                     LIMIT 1
@@ -1071,10 +1142,35 @@ router.post(
                 return;
             }
 
-            const paymentAccount =
+            const paymentAccount: any =
                 paymentAccountResult.rows[0];
 
-            if (!paymentAccount.is_active) {
+            const acctNetwork =
+                paymentAccount.mobile_network ??
+                paymentAccount.network ??
+                paymentAccount.provider ??
+                paymentAccount.momo_network ??
+                null;
+
+            const acctNumber =
+                paymentAccount.mobile_money_number ??
+                paymentAccount.mobile_number ??
+                paymentAccount.momo_number ??
+                paymentAccount.phone_number ??
+                paymentAccount.phone ??
+                null;
+
+            const acctIsActive =
+                paymentAccount.is_active ??
+                paymentAccount.active ??
+                true;
+
+            const acctIsVerified =
+                paymentAccount.is_verified ??
+                paymentAccount.verified ??
+                false;
+
+            if (!acctIsActive) {
                 res.status(400).json({
                     success: false,
                     error:
@@ -1086,7 +1182,7 @@ router.post(
                 return;
             }
 
-            if (!paymentAccount.is_verified) {
+            if (!acctIsVerified) {
                 res.status(400).json({
                     success: false,
                     error:
@@ -1110,10 +1206,6 @@ router.post(
                 await client.query(
                     'BEGIN',
                 );
-
-                /* ------------------------------------------------------------
-                 * LOCK WALLET
-                 * ------------------------------------------------------------ */
 
                 let walletResult =
                     await client.query(
@@ -1218,10 +1310,6 @@ router.post(
                     currentBalance -
                     amount;
 
-                /* ------------------------------------------------------------
-                 * BALANCE CHECK
-                 * ------------------------------------------------------------ */
-
                 if (remainingBalance < minimumBalance) {
 
                     await client.query(
@@ -1245,10 +1333,6 @@ router.post(
                     return;
                 }
 
-                /* ------------------------------------------------------------
-                 * UPDATE WALLET BALANCE
-                 * ------------------------------------------------------------ */
-
                 const newBalance =
                     remainingBalance;
 
@@ -1269,14 +1353,6 @@ router.post(
                         authReq.driverId,
                     ],
                 );
-
-                /* ------------------------------------------------------------
-                 * INSERT WITHDRAWAL ROW
-                 *
-                 * driver_withdrawals is the real table.
-                 * withdrawal_reference is NOT NULL + UNIQUE, so we
-                 * generate it here before insert.
-                 * ------------------------------------------------------------ */
 
                 const withdrawalReference =
                     `WD-${Date.now()}-${Math.random()
@@ -1330,8 +1406,8 @@ router.post(
                             amount,
                             WITHDRAWAL_FEE,
                             netAmount,
-                            paymentAccount.mobile_network,
-                            paymentAccount.mobile_number,
+                            acctNetwork,
+                            acctNumber,
                             withdrawalReference,
                         ],
                     );
@@ -1482,9 +1558,7 @@ router.post(
  *
  * GET /api/drivers/wallet/withdrawals
  *
- * Reads directly from public.driver_withdrawals (the real table).
- * Every column the Flutter DriverWithdrawal model expects is on
- * that table already — no join needed.
+ * Reads from public.driver_withdrawals (the real table).
  * ========================================================================== */
 
 router.get(
@@ -1572,7 +1646,6 @@ router.get(
                             failure_reason:
                                 w.failure_reason,
 
-                            // NOT NULL on the table — always present.
                             withdrawal_reference:
                                 w.withdrawal_reference,
 
