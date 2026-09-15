@@ -93,20 +93,6 @@ function toNumber(
 |--------------------------------------------------------------------------
 | DRIVER AVAILABILITY HELPER
 |--------------------------------------------------------------------------
-|
-| A driver is available for a NEW ride only when:
-|
-|   status       = approved
-|   is_online    = true
-|   is_available = true
-|
-| After a ride is completed/cancelled:
-|
-|   is_available = true
-|
-| ONLY if the driver is still approved and online.
-|
-|--------------------------------------------------------------------------
 */
 
 async function restoreDriverAvailability(
@@ -233,6 +219,11 @@ async function sendFcmNotification(
 |--------------------------------------------------------------------------
 | Notify Nearby Drivers
 |--------------------------------------------------------------------------
+|
+| Only drivers whose wallet balance is >= the wallet's own
+| minimum_balance are notified. Under-funded drivers are silently
+| skipped so they never see a request they cannot accept.
+|
 */
 
 async function notifyNearbyDrivers(
@@ -256,8 +247,15 @@ async function notifyNearbyDrivers(
                 d.uid,
                 ft.token
             FROM public.drivers d
+
+            -- Only notify drivers whose wallet is funded enough.
+            INNER JOIN public.driver_wallets dw
+                ON dw.driver_id = d.id
+               AND dw.balance >= dw.minimum_balance
+
             INNER JOIN public.fcm_tokens ft
                 ON ft.user_id = d.uid
+
             WHERE d.is_online = true
               AND d.is_available = true
               AND d.status = 'approved'
@@ -291,7 +289,7 @@ async function notifyNearbyDrivers(
 
         if (tokens.length === 0) {
             console.log(
-                `ℹ️ No nearby drivers with FCM tokens for ride ${rideId}`
+                `ℹ️ No nearby funded drivers with FCM tokens for ride ${rideId}`
             );
             return;
         }
@@ -1007,12 +1005,14 @@ router.get(
 |
 | 1. Lock driver
 | 2. Verify driver is available
-| 3. Claim ride only if still requested
-| 4. Set driver_id
-| 5. Set status = accepted
+| 3. Verify wallet balance >= wallet.minimum_balance
+| 4. Claim ride only if still requested
+| 5. Set driver_id + status = accepted
 | 6. Set is_available = false
 |
-|--------------------------------------------------------------------------
+| Returns 402 INSUFFICIENT_WALLET_BALANCE when the driver's wallet
+| is under-funded so the client can prompt a top-up.
+|
 */
 
 router.post(
@@ -1058,15 +1058,16 @@ router.post(
             await client.query('BEGIN');
 
             /*
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             | LOCK DRIVER
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             */
 
             const driverResult =
                 await client.query(
                     `
                     SELECT
+                        id,
                         uid,
                         full_name,
                         profile_photo_url,
@@ -1122,9 +1123,100 @@ router.post(
             }
 
             /*
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
+            | WALLET GATE
+            |------------------------------------------------------------------
+            |
+            | The DB trigger `enforce_driver_minimum_balance` would also
+            | block the UPDATE below, but it raises a generic
+            | `check_violation` that the client would surface as a
+            | "Server error".
+            |
+            | We check explicitly here so we can return a structured 402
+            | with the exact shortfall. The client uses this to open the
+            | "Fund your wallet" dialog.
+            |
+            */
+
+            const walletResult =
+                await client.query(
+                    `
+                    SELECT
+                        id,
+                        balance,
+                        minimum_balance
+                    FROM public.driver_wallets
+                    WHERE driver_id = $1
+                    FOR UPDATE
+                    `,
+                    [driver.id]
+                );
+
+            if (
+                walletResult.rows.length === 0
+            ) {
+                await client.query(
+                    'ROLLBACK'
+                );
+
+                return res.status(402).json({
+                    success: false,
+                    code: 'WALLET_NOT_FOUND',
+                    message:
+                        'Your driver wallet has not been created yet. ' +
+                        'Please open your wallet and top up before accepting rides.',
+                });
+            }
+
+            const wallet =
+                walletResult.rows[0];
+
+            const walletBalance =
+                Number(wallet.balance);
+
+            const walletMinimum =
+                Number(wallet.minimum_balance);
+
+            if (
+                !Number.isFinite(walletBalance) ||
+                !Number.isFinite(walletMinimum) ||
+                walletBalance < walletMinimum
+            ) {
+                await client.query(
+                    'ROLLBACK'
+                );
+
+                const shortfall =
+                    Number(
+                        Math.max(
+                            0,
+                            walletMinimum - walletBalance
+                        ).toFixed(2)
+                    );
+
+                return res.status(402).json({
+                    success: false,
+                    code: 'INSUFFICIENT_WALLET_BALANCE',
+                    message:
+                        `You need at least GH₵${walletMinimum.toFixed(2)} ` +
+                        `in your wallet to accept a ride. Top up ` +
+                        `GH₵${shortfall.toFixed(2)} and try again.`,
+                    balance: walletBalance,
+                    minimum_balance: walletMinimum,
+                    shortfall,
+                });
+            }
+
+            /*
+            |------------------------------------------------------------------
             | CLAIM RIDE
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
+            |
+            | NOTE: driver_earnings / tegaara_commission are stamped by the
+            | BEFORE INSERT OR UPDATE trigger `enforce_flat_commission`
+            | (flat GH₵2 commission). We intentionally do NOT overwrite
+            | them here so the trigger is the single source of truth.
+            |
             */
 
             const updateResult =
@@ -1134,19 +1226,7 @@ router.post(
 
                     SET
                         driver_id = $1::text,
-                        status = 'accepted',
-
-                        driver_earnings =
-                            ROUND(
-                                (fare * 0.80)::numeric,
-                                2
-                            ),
-
-                        tegaara_commission =
-                            ROUND(
-                                (fare * 0.20)::numeric,
-                                2
-                            )
+                        status    = 'accepted'
 
                     WHERE id = $2::integer
 
@@ -1177,9 +1257,9 @@ router.post(
             }
 
             /*
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             | DRIVER IS NOW BUSY
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             */
 
             await client.query(
@@ -1196,9 +1276,9 @@ router.post(
             );
 
             /*
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             | GET ACCEPTED RIDE
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             */
 
             const rideResult =
@@ -1289,9 +1369,9 @@ router.post(
             );
 
             /*
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             | NOTIFY PASSENGER
-            |--------------------------------------------------------------------------
+            |------------------------------------------------------------------
             */
 
             try {
@@ -1479,10 +1559,39 @@ router.post(
                 error
             );
 
+            const dbError =
+                error as {
+                    code?: string;
+                    message?: string;
+                    detail?: string;
+                };
+
+            /*
+             * Belt-and-braces: if the DB trigger still fired for any
+             * reason, surface the same 402 shape so the client can
+             * show the fund-wallet dialog.
+             */
+            if (dbError.code === '23514') {
+                return res.status(402).json({
+                    success: false,
+                    code: 'INSUFFICIENT_WALLET_BALANCE',
+                    message:
+                        'Insufficient wallet balance. Please top up your wallet before accepting a ride.',
+                });
+            }
+
             return res.status(500).json({
                 success: false,
                 message:
                     'Server error while accepting ride.',
+                code:
+                    dbError.code ??
+                    'ACCEPT_RIDE_FAILED',
+                error:
+                    dbError.message ??
+                    'Unknown database error',
+                detail:
+                    dbError.detail ?? null,
             });
         } finally {
             client.release();
@@ -1493,16 +1602,6 @@ router.post(
 /*
 |--------------------------------------------------------------------------
 | CURRENT DRIVER RIDE
-|--------------------------------------------------------------------------
-|
-| Used by the driver app to resume an accepted ride after the app
-| was closed and reopened.
-|
-| IMPORTANT: when the driver profile does not exist we return 200
-| with `ride: null`, NOT 404. This lets the Flutter resume helper
-| treat "driver has no ride" and "driver record missing" the same
-| way, without having to special-case a 404.
-|
 |--------------------------------------------------------------------------
 */
 
@@ -1555,7 +1654,6 @@ router.get(
                     [authenticatedUid]
                 );
 
-            // Driver profile missing → treat as "no active ride".
             if (
                 driverResult.rows.length === 0
             ) {
@@ -2084,12 +2182,6 @@ router.post(
 
             await client.query('BEGIN');
 
-            /*
-            |--------------------------------------------------------------------------
-            | LOCK DRIVER
-            |--------------------------------------------------------------------------
-            */
-
             const driverResult =
                 await client.query(
                     `
@@ -2119,12 +2211,6 @@ router.post(
                         'Driver not found.',
                 });
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | START RIDE
-            |--------------------------------------------------------------------------
-            */
 
             const result =
                 await client.query(
@@ -2166,12 +2252,6 @@ router.post(
                         'Ride not found or cannot be started.',
                 });
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | DRIVER REMAINS BUSY
-            |--------------------------------------------------------------------------
-            */
 
             await client.query(
                 `
@@ -2225,12 +2305,14 @@ router.post(
 | COMPLETE RIDE
 |--------------------------------------------------------------------------
 |
-| Driver becomes available again ONLY when:
+| When the status flips to 'completed':
 |
-|   status = approved
-|   is_online = true
+|   • trigger trg_charge_driver_commission deducts GH₵2.00
+|     from the driver wallet and credits pending_balance with
+|     the driver_earnings.
+|   • trigger trg_notify_passenger_ride_finished fires the
+|     passenger alert.
 |
-|--------------------------------------------------------------------------
 */
 
 router.post(
@@ -2273,12 +2355,6 @@ router.post(
                 'BEGIN'
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | LOCK DRIVER
-            |--------------------------------------------------------------------------
-            */
-
             const driverResult =
                 await client.query(
                     `
@@ -2308,12 +2384,6 @@ router.post(
                         'Driver not found.',
                 });
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | COMPLETE RIDE
-            |--------------------------------------------------------------------------
-            */
 
             const result =
                 await client.query(
@@ -2357,12 +2427,6 @@ router.post(
                         'Ride not found or cannot be completed.',
                 });
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | RESTORE DRIVER AVAILABILITY
-            |--------------------------------------------------------------------------
-            */
 
             await restoreDriverAvailability(
                 client,
@@ -2410,14 +2474,6 @@ router.post(
 /*
 |--------------------------------------------------------------------------
 | CANCEL RIDE
-|--------------------------------------------------------------------------
-|
-| We NO LONGER DELETE the ride. Instead:
-|
-|   status = cancelled
-|
-| This preserves ride history and prevents missing ride records.
-|
 |--------------------------------------------------------------------------
 */
 
@@ -2468,19 +2524,6 @@ router.post(
             );
 
             await client.query('BEGIN');
-
-            /*
-            |--------------------------------------------------------------------------
-            | LOCK RIDE
-            |--------------------------------------------------------------------------
-            |
-            | `FOR UPDATE OF r` scopes the lock to the rides row only,
-            | since the query joins public.passengers via a LEFT JOIN
-            | and PostgreSQL refuses plain FOR UPDATE on the nullable
-            | side of an outer join.
-            |
-            |--------------------------------------------------------------------------
-            */
 
             const rideResult =
                 await client.query(
@@ -2547,22 +2590,10 @@ router.post(
             const driverFirebaseUid =
                 ride.driver_id;
 
-            /*
-            |--------------------------------------------------------------------------
-            | DETERMINE WHO CANCELLED
-            |--------------------------------------------------------------------------
-            */
-
             const cancelledBy =
                 driverFirebaseUid === uid
                     ? 'driver'
                     : 'passenger';
-
-            /*
-            |--------------------------------------------------------------------------
-            | UPDATE RIDE
-            |--------------------------------------------------------------------------
-            */
 
             const updateResult =
                 await client.query(
@@ -2597,12 +2628,6 @@ router.post(
                 });
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | RESTORE DRIVER AVAILABILITY
-            |--------------------------------------------------------------------------
-            */
-
             if (driverFirebaseUid) {
                 await restoreDriverAvailability(
                     client,
@@ -2614,20 +2639,8 @@ router.post(
                 'COMMIT'
             );
 
-            /*
-            |--------------------------------------------------------------------------
-            | NOTIFICATIONS
-            |--------------------------------------------------------------------------
-            */
-
             const notificationPromises:
                 Promise<void>[] = [];
-
-            /*
-            |--------------------------------------------------------------------------
-            | PASSENGER NOTIFICATION
-            |--------------------------------------------------------------------------
-            */
 
             if (
                 passengerFirebaseUid &&
@@ -2701,12 +2714,6 @@ router.post(
                     );
                 }
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | DRIVER NOTIFICATION
-            |--------------------------------------------------------------------------
-            */
 
             if (
                 driverFirebaseUid &&
