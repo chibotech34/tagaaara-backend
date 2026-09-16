@@ -219,11 +219,6 @@ async function sendFcmNotification(
 |--------------------------------------------------------------------------
 | Notify Nearby Drivers
 |--------------------------------------------------------------------------
-|
-| Only drivers whose wallet balance is >= the wallet's own
-| minimum_balance are notified. Under-funded drivers are silently
-| skipped so they never see a request they cannot accept.
-|
 */
 
 async function notifyNearbyDrivers(
@@ -1006,20 +1001,16 @@ router.get(
 |
 | `lat` / `lng` are OPTIONAL. If they are missing or invalid, the route
 | falls back to the driver's stored `current_latitude` /
-| `current_longitude` (kept fresh by the app while the driver is
-| online). The client therefore only needs to be online — it does not
-| have to pass coordinates explicitly.
+| `current_longitude`.
 |
-| If neither the query params nor the stored location are usable, the
-| route returns 400 with a clear message instead of a generic error.
+| SELF-HEALING:
 |
-| Response shape (matches the Flutter parser):
-|
-|   { success: true, rides: [ { rideId, ... }, ... ] }
-|
-| IMPORTANT: This route MUST be declared before `GET /rides/:rideId`
-| so that Express does not match the literal segment "pending" as an
-| `:rideId` parameter (which would return 400 "Invalid ride ID.").
+|   `is_available` is flipped to false the moment a driver accepts a
+|   ride. If the client ever drops offline or crashes mid-ride, the
+|   flag can stay false forever and the driver never sees new
+|   requests. This handler therefore checks whether the driver has
+|   any active (accepted/started) ride; if not, it restores
+|   `is_available = true` before serving the queue.
 |
 */
 
@@ -1040,7 +1031,6 @@ router.get(
                 });
             }
 
-            // Pull the driver row including the last-known location.
             const driverResult = await pool.query(
                 `
                 SELECT
@@ -1067,15 +1057,65 @@ router.get(
 
             const driver = driverResult.rows[0];
 
-            if (
-                driver.status !== 'approved' ||
-                !driver.is_online ||
-                !driver.is_available
-            ) {
+            if (driver.status !== 'approved' || !driver.is_online) {
+                console.log(
+                    `ℹ️ Pending rides: driver ${uid} not eligible ` +
+                    `(status=${driver.status}, is_online=${driver.is_online})`
+                );
+
                 return res.status(200).json({
                     success: true,
                     rides: [],
                 });
+            }
+
+            /*
+            |------------------------------------------------------------------
+            | SELF-HEAL is_available
+            |------------------------------------------------------------------
+            | Only restore if the driver has no active ride.
+            */
+
+            if (!driver.is_available) {
+                const activeRide = await pool.query(
+                    `
+                    SELECT id
+                    FROM public.rides
+                    WHERE driver_id = $1::text
+                      AND status IN ('accepted', 'started')
+                    LIMIT 1
+                    `,
+                    [uid]
+                );
+
+                if (activeRide.rows.length === 0) {
+                    await pool.query(
+                        `
+                        UPDATE public.drivers
+                        SET
+                            is_available = true,
+                            updated_at = NOW()
+                        WHERE uid = $1::text
+                        `,
+                        [uid]
+                    );
+
+                    driver.is_available = true;
+
+                    console.log(
+                        `🔧 Auto-restored is_available for driver ${uid}`
+                    );
+                } else {
+                    console.log(
+                        `ℹ️ Pending rides: driver ${uid} has active ride ` +
+                        `${activeRide.rows[0].id}; skipping`
+                    );
+
+                    return res.status(200).json({
+                        success: true,
+                        rides: [],
+                    });
+                }
             }
 
             // Resolve lat/lng: query param first, then stored location.
@@ -1095,6 +1135,11 @@ router.get(
                 lng < -180 ||
                 lng > 180
             ) {
+                console.log(
+                    `ℹ️ Pending rides: driver ${uid} has no usable location ` +
+                    `(lat=${lat}, lng=${lng})`
+                );
+
                 return res.status(400).json({
                     success: false,
                     message:
@@ -1109,7 +1154,6 @@ router.get(
                 radiusKm = 10;
             }
 
-            // Cap at 50 km to keep the query cheap.
             radiusKm = Math.min(radiusKm, 50);
 
             const radiusMeters = radiusKm * 1000;
@@ -1223,6 +1267,12 @@ router.get(
                 [lat, lng, radiusMeters]
             );
 
+            console.log(
+                `📋 Pending rides for driver ${uid}: ` +
+                `${result.rows.length} found ` +
+                `(lat=${lat}, lng=${lng}, radiusKm=${radiusKm})`
+            );
+
             return res.status(200).json({
                 success: true,
                 rides: result.rows,
@@ -1246,19 +1296,6 @@ router.get(
 |--------------------------------------------------------------------------
 | ACCEPT RIDE
 |--------------------------------------------------------------------------
-|
-| ATOMIC:
-|
-| 1. Lock driver
-| 2. Verify driver is available
-| 3. Verify wallet balance >= wallet.minimum_balance
-| 4. Claim ride only if still requested
-| 5. Set driver_id + status = accepted
-| 6. Set is_available = false
-|
-| Returns 402 INSUFFICIENT_WALLET_BALANCE when the driver's wallet
-| is under-funded so the client can prompt a top-up.
-|
 */
 
 router.post(
@@ -1302,12 +1339,6 @@ router.post(
             );
 
             await client.query('BEGIN');
-
-            /*
-            |------------------------------------------------------------------
-            | LOCK DRIVER
-            |------------------------------------------------------------------
-            */
 
             const driverResult =
                 await client.query(
@@ -1367,12 +1398,6 @@ router.post(
                         'Driver is not available.',
                 });
             }
-
-            /*
-            |------------------------------------------------------------------
-            | WALLET GATE
-            |------------------------------------------------------------------
-            */
 
             const walletResult =
                 await client.query(
@@ -1443,18 +1468,6 @@ router.post(
                 });
             }
 
-            /*
-            |------------------------------------------------------------------
-            | CLAIM RIDE
-            |------------------------------------------------------------------
-            |
-            | NOTE: driver_earnings / tegaara_commission are stamped by the
-            | BEFORE INSERT OR UPDATE trigger `enforce_flat_commission`
-            | (flat GH₵2 commission). We intentionally do NOT overwrite
-            | them here so the trigger is the single source of truth.
-            |
-            */
-
             const updateResult =
                 await client.query(
                     `
@@ -1492,12 +1505,6 @@ router.post(
                 });
             }
 
-            /*
-            |------------------------------------------------------------------
-            | DRIVER IS NOW BUSY
-            |------------------------------------------------------------------
-            */
-
             await client.query(
                 `
                 UPDATE public.drivers
@@ -1510,12 +1517,6 @@ router.post(
                 `,
                 [uid]
             );
-
-            /*
-            |------------------------------------------------------------------
-            | GET ACCEPTED RIDE
-            |------------------------------------------------------------------
-            */
 
             const rideResult =
                 await client.query(
@@ -1603,12 +1604,6 @@ router.post(
             console.log(
                 `✅ Driver ${uid} accepted ride ${rideId}`
             );
-
-            /*
-            |------------------------------------------------------------------
-            | NOTIFY PASSENGER
-            |------------------------------------------------------------------
-            */
 
             try {
                 const passengerTokenResult =
@@ -1802,11 +1797,6 @@ router.post(
                     detail?: string;
                 };
 
-            /*
-             * Belt-and-braces: if the DB trigger still fired for any
-             * reason, surface the same 402 shape so the client can
-             * show the fund-wallet dialog.
-             */
             if (dbError.code === '23514') {
                 return res.status(402).json({
                     success: false,
@@ -2540,15 +2530,6 @@ router.post(
 |--------------------------------------------------------------------------
 | COMPLETE RIDE
 |--------------------------------------------------------------------------
-|
-| When the status flips to 'completed':
-|
-|   • trigger trg_charge_driver_commission deducts GH₵2.00
-|     from the driver wallet and credits pending_balance with
-|     the driver_earnings.
-|   • trigger trg_notify_passenger_ride_finished fires the
-|     passenger alert.
-|
 */
 
 router.post(
