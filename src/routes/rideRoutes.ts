@@ -219,6 +219,11 @@ async function sendFcmNotification(
 |--------------------------------------------------------------------------
 | Notify Nearby Drivers
 |--------------------------------------------------------------------------
+|
+| Only drivers whose wallet balance is >= the wallet's own
+| minimum_balance are notified. Under-funded drivers are silently
+| skipped so they never see a request they cannot accept.
+|
 */
 
 async function notifyNearbyDrivers(
@@ -999,32 +1004,22 @@ router.get(
 |
 |   GET /rides/pending?driverId=<uid>&lat=<>&lng=<>&radiusKm=<>
 |
-| IMPORTANT: This route MUST be declared before `GET /rides/:rideId`
-| so that Express does not match the literal segment "pending" as an
-| `:rideId` parameter (which would return 400 "Invalid ride ID.").
+| `lat` / `lng` are OPTIONAL. If they are missing or invalid, the route
+| falls back to the driver's stored `current_latitude` /
+| `current_longitude` (kept fresh by the app while the driver is
+| online). The client therefore only needs to be online — it does not
+| have to pass coordinates explicitly.
+|
+| If neither the query params nor the stored location are usable, the
+| route returns 400 with a clear message instead of a generic error.
 |
 | Response shape (matches the Flutter parser):
 |
-|   {
-|     success: true,
-|     rides: [
-|       {
-|         rideId, passengerId, driverId,
-|         pickupAddress, destinationAddress,
-|         pickupLat, pickupLng, destLat, destLng,
-|         distanceKm, durationMin, fare,
-|         paymentMethod, paymentStatus,
-|         status, rideType, requestedAt,
-|         passengerName, passengerPhotoUrl,
-|         passengerRating, passengerRides,
-|         distanceToPickupKm
-|       }, ...
-|     ]
-|   }
+|   { success: true, rides: [ { rideId, ... }, ... ] }
 |
-| The Flutter client only needs the driver to be authenticated; the
-| driverId query param is accepted for symmetry, but the actual
-| driver is resolved from the Firebase token.
+| IMPORTANT: This route MUST be declared before `GET /rides/:rideId`
+| so that Express does not match the literal segment "pending" as an
+| `:rideId` parameter (which would return 400 "Invalid ride ID.").
 |
 */
 
@@ -1036,77 +1031,41 @@ router.get(
         res: Response
     ) => {
         try {
-            const uid =
-                getAuthenticatedUid(req);
+            const uid = getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message:
-                        'Unauthenticated.',
+                    message: 'Unauthenticated.',
                 });
             }
 
-            const lat =
-                Number(req.query.lat);
+            // Pull the driver row including the last-known location.
+            const driverResult = await pool.query(
+                `
+                SELECT
+                    uid,
+                    full_name,
+                    status,
+                    is_online,
+                    is_available,
+                    current_latitude,
+                    current_longitude
+                FROM public.drivers
+                WHERE uid = $1::text
+                LIMIT 1
+                `,
+                [uid]
+            );
 
-            const lng =
-                Number(req.query.lng);
-
-            let radiusKm =
-                Number(req.query.radiusKm);
-
-            if (
-                !Number.isFinite(lat) ||
-                !Number.isFinite(lng)
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        'Valid lat and lng are required.',
-                });
-            }
-
-            if (
-                !Number.isFinite(radiusKm) ||
-                radiusKm <= 0
-            ) {
-                radiusKm = 10;
-            }
-
-            // Cap at 50 km to keep the query cheap.
-            radiusKm = Math.min(radiusKm, 50);
-
-            const radiusMeters = radiusKm * 1000;
-
-            const driverResult =
-                await pool.query(
-                    `
-                    SELECT
-                        uid,
-                        full_name,
-                        status,
-                        is_online,
-                        is_available
-                    FROM public.drivers
-                    WHERE uid = $1::text
-                    LIMIT 1
-                    `,
-                    [uid]
-                );
-
-            if (
-                driverResult.rows.length === 0
-            ) {
+            if (driverResult.rows.length === 0) {
                 return res.status(404).json({
                     success: false,
-                    message:
-                        'Driver profile not found.',
+                    message: 'Driver profile not found.',
                 });
             }
 
-            const driver =
-                driverResult.rows[0];
+            const driver = driverResult.rows[0];
 
             if (
                 driver.status !== 'approved' ||
@@ -1119,119 +1078,150 @@ router.get(
                 });
             }
 
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        r.id
-                            AS "rideId",
+            // Resolve lat/lng: query param first, then stored location.
+            let lat = Number(req.query.lat);
+            let lng = Number(req.query.lng);
 
-                        r.passenger_id
-                            AS "passengerId",
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                lat = Number(driver.current_latitude);
+                lng = Number(driver.current_longitude);
+            }
 
-                        r.driver_id
-                            AS "driverId",
+            if (
+                !Number.isFinite(lat) ||
+                !Number.isFinite(lng) ||
+                lat < -90 ||
+                lat > 90 ||
+                lng < -180 ||
+                lng > 180
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Your current location is unavailable. ' +
+                        'Please enable GPS and go online before fetching pending rides.',
+                });
+            }
 
-                        r.pickup_address
-                            AS "pickupAddress",
+            let radiusKm = Number(req.query.radiusKm);
 
-                        r.destination_address
-                            AS "destinationAddress",
+            if (!Number.isFinite(radiusKm) || radiusKm <= 0) {
+                radiusKm = 10;
+            }
 
-                        ST_Y(r.pickup)
-                            AS "pickupLat",
+            // Cap at 50 km to keep the query cheap.
+            radiusKm = Math.min(radiusKm, 50);
 
-                        ST_X(r.pickup)
-                            AS "pickupLng",
+            const radiusMeters = radiusKm * 1000;
 
-                        ST_Y(r.destination)
-                            AS "destLat",
+            const result = await pool.query(
+                `
+                SELECT
+                    r.id
+                        AS "rideId",
 
-                        ST_X(r.destination)
-                            AS "destLng",
+                    r.passenger_id
+                        AS "passengerId",
 
-                        r.distance
-                            AS "distanceKm",
+                    r.driver_id
+                        AS "driverId",
 
-                        r.duration
-                            AS "durationMin",
+                    r.pickup_address
+                        AS "pickupAddress",
 
-                        r.fare,
+                    r.destination_address
+                        AS "destinationAddress",
 
-                        r.payment_method
-                            AS "paymentMethod",
+                    ST_Y(r.pickup)
+                        AS "pickupLat",
 
-                        r.payment_status
-                            AS "paymentStatus",
+                    ST_X(r.pickup)
+                        AS "pickupLng",
 
-                        r.status,
+                    ST_Y(r.destination)
+                        AS "destLat",
 
-                        r.ride_type
-                            AS "rideType",
+                    ST_X(r.destination)
+                        AS "destLng",
 
-                        r.requested_at
-                            AS "requestedAt",
+                    r.distance
+                        AS "distanceKm",
 
-                        p.full_name
-                            AS "passengerName",
+                    r.duration
+                        AS "durationMin",
 
-                        p.profile_photo_url
-                            AS "passengerPhotoUrl",
+                    r.fare,
 
-                        5.0
-                            AS "passengerRating",
+                    r.payment_method
+                        AS "paymentMethod",
 
-                        0
-                            AS "passengerRides",
+                    r.payment_status
+                        AS "paymentStatus",
 
-                        ST_Distance(
-                            r.pickup::geography,
+                    r.status,
 
-                            ST_SetSRID(
-                                ST_MakePoint(
-                                    $2::double precision,
-                                    $1::double precision
-                                ),
-                                4326
-                            )::geography
-                        ) / 1000.0
-                            AS "distanceToPickupKm"
+                    r.ride_type
+                        AS "rideType",
 
-                    FROM public.rides r
+                    r.requested_at
+                        AS "requestedAt",
 
-                    INNER JOIN public.passengers p
-                        ON p.id = r.passenger_id
+                    p.full_name
+                        AS "passengerName",
 
-                    WHERE r.status = 'requested'
+                    p.profile_photo_url
+                        AS "passengerPhotoUrl",
 
-                      AND r.driver_id IS NULL
+                    5.0
+                        AS "passengerRating",
 
-                      AND ST_DWithin(
-                            r.pickup::geography,
+                    0
+                        AS "passengerRides",
 
-                            ST_SetSRID(
-                                ST_MakePoint(
-                                    $2::double precision,
-                                    $1::double precision
-                                ),
-                                4326
-                            )::geography,
+                    ST_Distance(
+                        r.pickup::geography,
 
-                            $3::double precision
-                      )
+                        ST_SetSRID(
+                            ST_MakePoint(
+                                $2::double precision,
+                                $1::double precision
+                            ),
+                            4326
+                        )::geography
+                    ) / 1000.0
+                        AS "distanceToPickupKm"
 
-                    ORDER BY
-                        "distanceToPickupKm" ASC,
-                        r.requested_at ASC
+                FROM public.rides r
 
-                    LIMIT 20
-                    `,
-                    [
-                        lat,
-                        lng,
-                        radiusMeters,
-                    ]
-                );
+                INNER JOIN public.passengers p
+                    ON p.id = r.passenger_id
+
+                WHERE r.status = 'requested'
+
+                  AND r.driver_id IS NULL
+
+                  AND ST_DWithin(
+                        r.pickup::geography,
+
+                        ST_SetSRID(
+                            ST_MakePoint(
+                                $2::double precision,
+                                $1::double precision
+                            ),
+                            4326
+                        )::geography,
+
+                        $3::double precision
+                  )
+
+                ORDER BY
+                    "distanceToPickupKm" ASC,
+                    r.requested_at ASC
+
+                LIMIT 20
+                `,
+                [lat, lng, radiusMeters]
+            );
 
             return res.status(200).json({
                 success: true,
@@ -1256,6 +1246,19 @@ router.get(
 |--------------------------------------------------------------------------
 | ACCEPT RIDE
 |--------------------------------------------------------------------------
+|
+| ATOMIC:
+|
+| 1. Lock driver
+| 2. Verify driver is available
+| 3. Verify wallet balance >= wallet.minimum_balance
+| 4. Claim ride only if still requested
+| 5. Set driver_id + status = accepted
+| 6. Set is_available = false
+|
+| Returns 402 INSUFFICIENT_WALLET_BALANCE when the driver's wallet
+| is under-funded so the client can prompt a top-up.
+|
 */
 
 router.post(
@@ -1300,7 +1303,11 @@ router.post(
 
             await client.query('BEGIN');
 
-            /* LOCK DRIVER */
+            /*
+            |------------------------------------------------------------------
+            | LOCK DRIVER
+            |------------------------------------------------------------------
+            */
 
             const driverResult =
                 await client.query(
@@ -1361,7 +1368,11 @@ router.post(
                 });
             }
 
-            /* WALLET GATE */
+            /*
+            |------------------------------------------------------------------
+            | WALLET GATE
+            |------------------------------------------------------------------
+            */
 
             const walletResult =
                 await client.query(
@@ -1432,7 +1443,17 @@ router.post(
                 });
             }
 
-            /* CLAIM RIDE */
+            /*
+            |------------------------------------------------------------------
+            | CLAIM RIDE
+            |------------------------------------------------------------------
+            |
+            | NOTE: driver_earnings / tegaara_commission are stamped by the
+            | BEFORE INSERT OR UPDATE trigger `enforce_flat_commission`
+            | (flat GH₵2 commission). We intentionally do NOT overwrite
+            | them here so the trigger is the single source of truth.
+            |
+            */
 
             const updateResult =
                 await client.query(
@@ -1471,7 +1492,11 @@ router.post(
                 });
             }
 
-            /* DRIVER IS NOW BUSY */
+            /*
+            |------------------------------------------------------------------
+            | DRIVER IS NOW BUSY
+            |------------------------------------------------------------------
+            */
 
             await client.query(
                 `
@@ -1486,7 +1511,11 @@ router.post(
                 [uid]
             );
 
-            /* GET ACCEPTED RIDE */
+            /*
+            |------------------------------------------------------------------
+            | GET ACCEPTED RIDE
+            |------------------------------------------------------------------
+            */
 
             const rideResult =
                 await client.query(
@@ -1575,7 +1604,11 @@ router.post(
                 `✅ Driver ${uid} accepted ride ${rideId}`
             );
 
-            /* NOTIFY PASSENGER */
+            /*
+            |------------------------------------------------------------------
+            | NOTIFY PASSENGER
+            |------------------------------------------------------------------
+            */
 
             try {
                 const passengerTokenResult =
@@ -1769,6 +1802,11 @@ router.post(
                     detail?: string;
                 };
 
+            /*
+             * Belt-and-braces: if the DB trigger still fired for any
+             * reason, surface the same 402 shape so the client can
+             * show the fund-wallet dialog.
+             */
             if (dbError.code === '23514') {
                 return res.status(402).json({
                     success: false,
@@ -2502,6 +2540,15 @@ router.post(
 |--------------------------------------------------------------------------
 | COMPLETE RIDE
 |--------------------------------------------------------------------------
+|
+| When the status flips to 'completed':
+|
+|   • trigger trg_charge_driver_commission deducts GH₵2.00
+|     from the driver wallet and credits pending_balance with
+|     the driver_earnings.
+|   • trigger trg_notify_passenger_ride_finished fires the
+|     passenger alert.
+|
 */
 
 router.post(
