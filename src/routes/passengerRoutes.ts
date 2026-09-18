@@ -2028,21 +2028,18 @@ router.post(
 /* ==========================================================================
  * POST /api/passengers/wallet/pay
  *
- * Debits the passenger wallet, credits the driver wallet (if a driver
- * is assigned), marks the ride as paid, and writes a `ride_payment`
- * transaction row.
+ * Debits the passenger wallet, marks the ride paid, and clears the
+ * pending-earning state on the driver wallet (moves the driver's
+ * `pending_balance` portion into their withdrawable `balance`).
  *
- * FIXES APPLIED
- * -------------
- * 1. transaction.type is now 'ride_payment' (was 'payment'), which
- *    matches the CHECK constraint / enum used everywhere else.
- * 2. Amount is taken from rides.fare — the client-supplied amount is
- *    only used as a sanity check.
- * 3. rides.payment_status is set to 'paid' so downstream screens see it.
- * 4. Driver wallet is credited (previously the driver never saw money).
- * 5. Response now surfaces the real Postgres error so the Flutter
- *    snackbar can show something more useful than
- *    "Failed to process wallet payment".
+ * The DB trigger `charge_driver_commission` already runs on the
+ * `completed` transition and does:
+ *    driver_wallets.balance          -= tegaara_commission
+ *    driver_wallets.pending_balance  += driver_earnings
+ *    + inserts 'commission' and 'ride_earning' rows in driver_transactions
+ *
+ * This endpoint therefore only *settles* that pending earning into
+ * withdrawable balance once the passenger actually pays.
  * ========================================================================== */
 
 router.post(
@@ -2128,7 +2125,9 @@ router.post(
                     driver_id,
                     fare,
                     status,
-                    payment_status
+                    payment_status,
+                    driver_earnings,
+                    tegaara_commission
                 FROM public.rides
                 WHERE id = $1
                   AND passenger_id = $2
@@ -2152,10 +2151,21 @@ router.post(
 
             const ride = rideResult.rows[0];
 
-            /* --------------------------------------------------------------
-             * IDEMPOTENCY — reject if already paid
-             * -------------------------------------------------------------- */
+            /* ---- Guard: only completed rides are payable --------------- */
+            if (ride.status !== 'completed') {
+                await client.query('ROLLBACK');
+                transactionStarted = false;
+                client.release();
 
+                return res.status(409).json({
+                    success: false,
+                    message: 'Only completed rides can be paid for.',
+                    code: 'RIDE_NOT_COMPLETED',
+                    status: ride.status,
+                });
+            }
+
+            /* ---- Guard: idempotency ------------------------------------ */
             if (ride.payment_status === 'paid') {
                 await client.query('ROLLBACK');
                 transactionStarted = false;
@@ -2169,10 +2179,7 @@ router.post(
                 });
             }
 
-            /* --------------------------------------------------------------
-             * RESOLVE AUTHORITATIVE AMOUNT (from DB)
-             * -------------------------------------------------------------- */
-
+            /* ---- Resolve authoritative amount -------------------------- */
             const amount = Number(ride.fare);
 
             if (!Number.isFinite(amount) || amount <= 0) {
@@ -2248,10 +2255,6 @@ router.post(
             const balanceAfter = balanceBefore - amount;
             const totalSpent = Number(wallet.total_spent) + amount;
 
-            /* --------------------------------------------------------------
-             * UPDATE PASSENGER WALLET
-             * -------------------------------------------------------------- */
-
             const updatedWalletResult = await client.query(
                 `
                 UPDATE public.wallets
@@ -2275,9 +2278,7 @@ router.post(
             );
 
             /* --------------------------------------------------------------
-             * INSERT PASSENGER TRANSACTION
-             *
-             * type = 'ride_payment'   <-- FIX (was 'payment')
+             * PASSENGER TRANSACTION
              * -------------------------------------------------------------- */
 
             const transactionResult = await client.query(
@@ -2351,10 +2352,17 @@ router.post(
             );
 
             /* --------------------------------------------------------------
-             * CREDIT DRIVER WALLET (if a driver is assigned)
+             * SETTLE DRIVER WALLET
+             *
+             * The completion trigger already added driver_earnings to
+             * driver_wallets.pending_balance. Now that the passenger has
+             * actually paid, release that pending amount into the
+             * driver's withdrawable balance and record the settlement.
              * -------------------------------------------------------------- */
 
-            if (ride.driver_id) {
+            const driverEarnings = Number(ride.driver_earnings) || 0;
+
+            if (ride.driver_id && driverEarnings > 0) {
                 const driverResult = await client.query(
                     `
                     SELECT id
@@ -2372,7 +2380,8 @@ router.post(
                         `
                         SELECT
                             id,
-                            balance
+                            balance,
+                            pending_balance
                         FROM public.driver_wallets
                         WHERE driver_id = $1
                         FOR UPDATE
@@ -2381,46 +2390,104 @@ router.post(
                     );
 
                     if (driverWalletResult.rows.length > 0) {
-                        const driverWallet = driverWalletResult.rows[0];
-                        const driverBalanceBefore = Number(
-                            driverWallet.balance,
+                        const dw = driverWalletResult.rows[0];
+                        const pendingBefore = Number(dw.pending_balance);
+                        const settleAmount = Math.min(
+                            pendingBefore,
+                            driverEarnings,
                         );
+                        const driverBalanceBefore = Number(dw.balance);
                         const driverBalanceAfter =
-                            driverBalanceBefore + amount;
+                            driverBalanceBefore + settleAmount;
+                        const pendingAfter = pendingBefore - settleAmount;
 
                         await client.query(
                             `
                             UPDATE public.driver_wallets
                             SET
                                 balance = $1,
+                                pending_balance = $2,
+                                last_transaction_at = NOW(),
                                 updated_at = NOW()
-                            WHERE id = $2
+                            WHERE id = $3
                             `,
-                            [driverBalanceAfter, driverWallet.id],
+                            [
+                                driverBalanceAfter,
+                                pendingAfter,
+                                dw.id,
+                            ],
+                        );
+
+                        await client.query(
+                            `
+                            INSERT INTO public.driver_transactions (
+                                driver_id,
+                                wallet_id,
+                                ride_id,
+                                amount,
+                                type,
+                                status,
+                                balance_before,
+                                balance_after,
+                                transaction_reference,
+                                description,
+                                metadata,
+                                created_at,
+                                updated_at
+                            )
+                            VALUES (
+                                $1,
+                                $2,
+                                $3,
+                                $4,
+                                'ride_earning',
+                                'completed',
+                                $5,
+                                $6,
+                                'SETTLE-' || $3 || '-' ||
+                                    extract(epoch from now())::bigint,
+                                $7,
+                                $8::jsonb,
+                                NOW(),
+                                NOW()
+                            )
+                            `,
+                            [
+                                driverId,
+                                dw.id,
+                                rideId,
+                                settleAmount,
+                                driverBalanceBefore,
+                                driverBalanceAfter,
+                                `Ride payment settled for ride #${rideId}`,
+                                JSON.stringify({
+                                    ride_id: rideId,
+                                    passenger_id: passengerId,
+                                    settled_amount: settleAmount,
+                                    pending_before: pendingBefore,
+                                    pending_after: pendingAfter,
+                                }),
+                            ],
                         );
 
                         console.log(
-                            `💵 Driver ${ride.driver_id} credited ` +
-                            `GH₵${amount.toFixed(2)} ` +
+                            `💵 Driver ${ride.driver_id} settled ` +
+                            `GH₵${settleAmount.toFixed(2)} ` +
                             `(balance: ${driverBalanceBefore.toFixed(2)} -> ` +
-                            `${driverBalanceAfter.toFixed(2)})`,
-                        );
-                    } else {
-                        console.warn(
-                            `⚠️ Driver wallet missing for driver_id=${ride.driver_id}; ` +
-                            `ride ${rideId} payment credited to passenger only.`,
+                            `${driverBalanceAfter.toFixed(2)}, ` +
+                            `pending: ${pendingBefore.toFixed(2)} -> ` +
+                            `${pendingAfter.toFixed(2)})`,
                         );
                     }
-                } else {
-                    console.warn(
-                        `⚠️ Driver row not found for uid=${ride.driver_id}; ` +
-                        `ride ${rideId} payment credited to passenger only.`,
-                    );
                 }
             }
 
             /* --------------------------------------------------------------
-             * MARK RIDE AS PAID
+             * MARK RIDE PAID
+             *
+             * NOTE: `updated_at` is deliberately omitted from this
+             * UPDATE because the `rides` table does not have that column.
+             * If you add it later, you can append `, updated_at = NOW()`.
              * -------------------------------------------------------------- */
 
             await client.query(
@@ -2428,7 +2495,7 @@ router.post(
                 UPDATE public.rides
                 SET
                     payment_status = 'paid',
-                    updated_at = NOW()
+                    paid_at = NOW()
                 WHERE id = $1
                 `,
                 [rideId],
@@ -2452,6 +2519,11 @@ router.post(
                 message: 'Ride payment completed successfully.',
                 wallet: updatedWalletResult.rows[0],
                 transaction: transactionResult.rows[0],
+                ride: {
+                    id: rideId,
+                    payment_status: 'paid',
+                    status: ride.status,
+                },
             });
         } catch (error: unknown) {
             if (transactionStarted) {
