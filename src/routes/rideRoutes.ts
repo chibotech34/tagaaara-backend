@@ -554,6 +554,7 @@ router.post(
                       AND status IN (
                           'requested',
                           'accepted',
+                          'arrived',
                           'started'
                       )
                     ORDER BY requested_at DESC
@@ -1009,7 +1010,7 @@ router.get(
 |   ride. If the client ever drops offline or crashes mid-ride, the
 |   flag can stay false forever and the driver never sees new
 |   requests. This handler therefore checks whether the driver has
-|   any active (accepted/started) ride; if not, it restores
+|   any active (accepted/arrived/started) ride; if not, it restores
 |   `is_available = true` before serving the queue.
 |
 */
@@ -1082,7 +1083,7 @@ router.get(
                     SELECT id
                     FROM public.rides
                     WHERE driver_id = $1::text
-                      AND status IN ('accepted', 'started')
+                      AND status IN ('accepted', 'arrived', 'started')
                     LIMIT 1
                     `,
                     [uid]
@@ -1827,6 +1828,223 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
+| MARK ARRIVED AT PICKUP  (NEW)
+|--------------------------------------------------------------------------
+|
+| Driver lifecycle step 2 of 3:
+|
+|   accepted  →  arrived  →  started  →  completed
+|
+| Previously the client would try to move straight from `accepted` to
+| `started`, but the START RIDE endpoint guarded on `status = 'accepted'`
+| and there was no route that accepted `arrived` at all. Both are fixed:
+|
+|   • POST /rides/:rideId/arrived   (this route)
+|   • POST /rides/:rideId/start     (now accepts accepted OR arrived)
+|
+*/
+
+router.post(
+    '/rides/:rideId/arrived',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        const client =
+            await pool.connect();
+
+        try {
+            const rideId =
+                Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid ride ID.',
+                });
+            }
+
+            const uid =
+                getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Unauthenticated.',
+                });
+            }
+
+            console.log(
+                `📍 Mark arrived: ride=${rideId}, driverUID=${uid}`
+            );
+
+            await client.query('BEGIN');
+
+            const driverResult =
+                await client.query(
+                    `
+                    SELECT
+                        uid,
+                        status,
+                        is_online,
+                        is_available
+                    FROM public.drivers
+                    WHERE uid = $1::text
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
+                    [uid]
+                );
+
+            if (
+                driverResult.rows.length === 0
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    success: false,
+                    message: 'Driver not found.',
+                });
+            }
+
+            const result =
+                await client.query(
+                    `
+                    UPDATE public.rides
+
+                    SET
+                        status = 'arrived'
+
+                    WHERE id = $1::integer
+
+                      AND driver_id = $2::text
+
+                      AND status = 'accepted'
+
+                    RETURNING
+                        id,
+                        driver_id,
+                        status
+                    `,
+                    [rideId, uid]
+                );
+
+            if (
+                result.rows.length === 0
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        'Ride not found or cannot be marked as arrived.',
+                });
+            }
+
+            await client.query('COMMIT');
+
+            console.log(
+                `✅ Ride ${rideId} marked arrived by driver ${uid}`
+            );
+
+            /*
+            |------------------------------------------------------------------
+            | Best-effort passenger push notification
+            |------------------------------------------------------------------
+            */
+            try {
+                const passengerTokenResult =
+                    await pool.query(
+                        `
+                        SELECT ft.token
+
+                        FROM public.fcm_tokens ft
+
+                        INNER JOIN public.passengers p
+                            ON p.firebase_uid =
+                               ft.user_id
+
+                        INNER JOIN public.rides r
+                            ON r.passenger_id = p.id
+
+                        WHERE r.id = $1
+
+                          AND ft.token IS NOT NULL
+
+                        ORDER BY
+                            ft.updated_at DESC NULLS LAST
+
+                        LIMIT 1
+                        `,
+                        [rideId]
+                    );
+
+                const passengerToken =
+                    passengerTokenResult
+                        .rows[0]?.token;
+
+                if (passengerToken) {
+                    await sendFcmNotification(
+                        passengerToken,
+
+                        'Driver Has Arrived',
+
+                        'Your driver has arrived at the pickup location.',
+
+                        {
+                            role: 'passenger',
+                            notificationType:
+                                'ride_arrived',
+                            targetScreen:
+                                'track_ride',
+                            rideId:
+                                String(rideId),
+                            status: 'arrived',
+                        }
+                    );
+                }
+            } catch (
+            notificationError
+            ) {
+                console.error(
+                    '❌ Passenger arrived notification failed:',
+                    notificationError
+                );
+            }
+
+            return res.status(200).json({
+                success: true,
+                ride: result.rows[0],
+                message:
+                    'Marked as arrived at pickup.',
+            });
+        } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (_) { }
+
+            console.error(
+                '❌ Mark arrived error:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Server error while marking ride as arrived.',
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
 | CURRENT DRIVER RIDE
 |--------------------------------------------------------------------------
 */
@@ -1963,6 +2181,7 @@ router.get(
 
                       AND r.status IN (
                           'accepted',
+                          'arrived',
                           'started'
                       )
 
@@ -2368,6 +2587,10 @@ router.get(
 |--------------------------------------------------------------------------
 | START RIDE
 |--------------------------------------------------------------------------
+|
+| Accepts either `accepted` (driver skipped the arrived step) or
+| `arrived` (normal flow). Both transitions move the ride to `started`.
+|
 */
 
 router.post(
@@ -2451,8 +2674,10 @@ router.post(
                       AND driver_id =
                           $2::text
 
-                      AND status =
-                          'accepted'
+                      AND status IN (
+                          'accepted',
+                          'arrived'
+                      )
 
                     RETURNING
                         id,
@@ -2494,6 +2719,10 @@ router.post(
 
             await client.query(
                 'COMMIT'
+            );
+
+            console.log(
+                `✅ Ride ${rideId} started by driver ${uid}`
             );
 
             return res.status(200).json({
@@ -3058,6 +3287,268 @@ router.post(
                     'Unknown database error',
                 detail:
                     dbError.detail ?? null,
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GENERIC RIDE STATUS UPDATE  (NEW)
+|--------------------------------------------------------------------------
+|
+| Single endpoint that handles the full driver lifecycle, so the Flutter
+| client's `RideService.updateRideStatus(rideId, status)` no longer needs
+| to know which specific route to hit. It works regardless of whether the
+| client jumps straight from `accepted` to `started` or goes through the
+| `arrived` step.
+|
+| Allowed transitions:
+|
+|   arrived   from accepted
+|   started   from accepted | arrived
+|   completed from started
+|
+*/
+
+const DRIVER_STATUS_TRANSITIONS: Record<string, string[]> = {
+    arrived: ['accepted'],
+    started: ['accepted', 'arrived'],
+    completed: ['started'],
+};
+
+router.post(
+    '/rides/:rideId/status',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        const client = await pool.connect();
+
+        try {
+            const rideId =
+                Number(req.params.rideId);
+
+            if (
+                !Number.isInteger(rideId) ||
+                rideId <= 0
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid ride ID.',
+                });
+            }
+
+            const uid = getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Unauthenticated.',
+                });
+            }
+
+            const nextStatus = String(
+                req.body?.status ?? ''
+            )
+                .trim()
+                .toLowerCase();
+
+            const allowedFrom =
+                DRIVER_STATUS_TRANSITIONS[nextStatus];
+
+            if (!allowedFrom) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid status. Allowed: arrived, started, completed.',
+                });
+            }
+
+            await client.query('BEGIN');
+
+            const driverResult =
+                await client.query(
+                    `
+                    SELECT uid
+                    FROM public.drivers
+                    WHERE uid = $1::text
+                    LIMIT 1
+                    FOR UPDATE
+                    `,
+                    [uid]
+                );
+
+            if (
+                driverResult.rows.length === 0
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    success: false,
+                    message: 'Driver not found.',
+                });
+            }
+
+            const isCompleted =
+                nextStatus === 'completed';
+
+            const result =
+                await client.query(
+                    `
+                    UPDATE public.rides
+
+                    SET
+                        status = $1::varchar,
+                        completed_at =
+                            CASE
+                                WHEN $1::varchar = 'completed'
+                                THEN NOW()
+                                ELSE completed_at
+                            END
+
+                    WHERE id = $2::integer
+
+                      AND driver_id = $3::text
+
+                      AND status = ANY($4::varchar[])
+
+                    RETURNING
+                        id,
+                        driver_id,
+                        status,
+                        completed_at
+                    `,
+                    [
+                        nextStatus,
+                        rideId,
+                        uid,
+                        allowedFrom,
+                    ]
+                );
+
+            if (
+                result.rows.length === 0
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(409).json({
+                    success: false,
+                    message: `Ride cannot be marked as ${nextStatus}.`,
+                });
+            }
+
+            if (isCompleted) {
+                await restoreDriverAvailability(
+                    client,
+                    uid
+                );
+            }
+
+            await client.query('COMMIT');
+
+            console.log(
+                `✅ Ride ${rideId} status → ${nextStatus} (driver ${uid})`
+            );
+
+            /*
+            |------------------------------------------------------------------
+            | Best-effort passenger notification for arrived / started
+            |------------------------------------------------------------------
+            */
+            if (!isCompleted) {
+                try {
+                    const passengerTokenResult =
+                        await pool.query(
+                            `
+                            SELECT ft.token
+
+                            FROM public.fcm_tokens ft
+
+                            INNER JOIN public.passengers p
+                                ON p.firebase_uid =
+                                   ft.user_id
+
+                            INNER JOIN public.rides r
+                                ON r.passenger_id = p.id
+
+                            WHERE r.id = $1
+
+                              AND ft.token IS NOT NULL
+
+                            ORDER BY
+                                ft.updated_at DESC NULLS LAST
+
+                            LIMIT 1
+                            `,
+                            [rideId]
+                        );
+
+                    const passengerToken =
+                        passengerTokenResult
+                            .rows[0]?.token;
+
+                    if (passengerToken) {
+                        const title =
+                            nextStatus === 'arrived'
+                                ? 'Driver Has Arrived'
+                                : 'Ride Started';
+
+                        const body =
+                            nextStatus === 'arrived'
+                                ? 'Your driver has arrived at the pickup location.'
+                                : 'Your ride has started. Enjoy your trip!';
+
+                        await sendFcmNotification(
+                            passengerToken,
+                            title,
+                            body,
+                            {
+                                role: 'passenger',
+                                notificationType:
+                                    nextStatus === 'arrived'
+                                        ? 'ride_arrived'
+                                        : 'ride_started',
+                                targetScreen:
+                                    'track_ride',
+                                rideId:
+                                    String(rideId),
+                                status: nextStatus,
+                            }
+                        );
+                    }
+                } catch (
+                notificationError
+                ) {
+                    console.error(
+                        '❌ Passenger status notification failed:',
+                        notificationError
+                    );
+                }
+            }
+
+            return res.status(200).json({
+                success: true,
+                ride: result.rows[0],
+                message: `Ride marked as ${nextStatus}.`,
+            });
+        } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (_) { }
+
+            console.error(
+                '❌ Update ride status error:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Server error while updating ride status.',
             });
         } finally {
             client.release();
