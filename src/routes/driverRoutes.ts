@@ -5,6 +5,9 @@ import {
     NextFunction,
 } from 'express';
 
+import multer from 'multer';
+import { createClient } from '@supabase/supabase-js';
+
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
@@ -112,18 +115,65 @@ const verifyFirebaseToken = async (
 |--------------------------------------------------------------------------
 */
 
-const getAuthenticatedUid = (
-    req: AuthenticatedRequest,
-): string | null => {
+const getAuthenticatedUid = (req: AuthenticatedRequest): string | null => {
     return req.decodedToken?.uid || null;
 };
 
-const normaliseParam = (
-    value: string | string[] | undefined,
-): string => {
+const normaliseParam = (value: string | string[] | undefined): string => {
     if (value === undefined) return '';
     return Array.isArray(value) ? value[0] ?? '' : value;
 };
+
+/*
+|--------------------------------------------------------------------------
+| Supabase Storage client (server-side)
+|--------------------------------------------------------------------------
+*/
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_DRIVER_BUCKET =
+    process.env.SUPABASE_DRIVER_BUCKET || 'driver-assets';
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.warn(
+        '⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — image upload will fail.',
+    );
+}
+
+const supabaseAdmin = createClient(
+    SUPABASE_URL ?? '',
+    SUPABASE_SERVICE_ROLE_KEY ?? '',
+    { auth: { persistSession: false } },
+);
+
+/*
+|--------------------------------------------------------------------------
+| Multer (in-memory) — streams straight to Supabase Storage
+|--------------------------------------------------------------------------
+*/
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+    fileFilter: (_req, file, cb) => {
+        const ok = /^image\/(jpeg|jpg|png|webp)$/i.test(file.mimetype);
+        if (!ok) {
+            cb(new Error('Only JPEG, PNG or WebP images are allowed.'));
+            return;
+        }
+        cb(null, true);
+    },
+});
+
+const ALLOWED_IMAGE_FIELDS = new Set([
+    'profile_photo_url',
+    'vehicle_photo_url',
+    'license_photo_url',
+    'registration_doc_url',
+    'insurance_doc_url',
+    'inspection_doc_url',
+]);
 
 /*
 |--------------------------------------------------------------------------
@@ -293,6 +343,170 @@ router.post(
                 success: false,
                 message: 'Registration failed due to a server error.',
                 code: 'DB_INSERT_FAILED',
+            });
+        }
+    },
+);
+
+/*
+|--------------------------------------------------------------------------
+| POST /api/drivers/upload-image
+|--------------------------------------------------------------------------
+|
+| Multipart body:
+|   field_name = profile_photo_url | vehicle_photo_url | license_photo_url |
+|                registration_doc_url | insurance_doc_url | inspection_doc_url
+|   file       = <binary>
+|
+| Stores the file in Supabase Storage and updates the driver row with the
+| public URL. Returns the refreshed driver row.
+|
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+    '/upload-image',
+    verifyFirebaseToken,
+    upload.single('file'),
+    async (req: AuthenticatedRequest, res: Response) => {
+        try {
+            const uid = getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
+
+            const fieldName = String(
+                (req.body?.field_name ?? '').toString().trim(),
+            );
+
+            if (!fieldName || !ALLOWED_IMAGE_FIELDS.has(fieldName)) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Invalid or missing field_name. Allowed: ' +
+                        Array.from(ALLOWED_IMAGE_FIELDS).join(', '),
+                    code: 'INVALID_FIELD_NAME',
+                });
+            }
+
+            const file = req.file;
+
+            if (!file) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'No file uploaded. Expected multipart field "file".',
+                    code: 'FILE_MISSING',
+                });
+            }
+
+            // Confirm the driver exists and get its numeric PK.
+            const driverLookup = await pool.query(
+                `SELECT id FROM public.drivers WHERE uid = $1 LIMIT 1`,
+                [uid],
+            );
+
+            if (driverLookup.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Driver not found.',
+                    code: 'DRIVER_NOT_FOUND',
+                });
+            }
+
+            const driverId: number = driverLookup.rows[0].id;
+
+            // Derive extension.
+            const ext = (() => {
+                const original = file.originalname || '';
+                const dot = original.lastIndexOf('.');
+                if (dot >= 0) return original.slice(dot + 1).toLowerCase();
+                if (file.mimetype === 'image/png') return 'png';
+                if (file.mimetype === 'image/webp') return 'webp';
+                return 'jpg';
+            })();
+
+            const objectPath = `drivers/${driverId}/${fieldName}-${Date.now()}.${ext}`;
+
+            // Upload to Supabase Storage.
+            const { error: uploadError } = await supabaseAdmin.storage
+                .from(SUPABASE_DRIVER_BUCKET)
+                .upload(objectPath, file.buffer, {
+                    contentType: file.mimetype,
+                    upsert: true,
+                });
+
+            if (uploadError) {
+                console.error('❌ Supabase upload error:', uploadError);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Image upload failed.',
+                    code: 'STORAGE_UPLOAD_FAILED',
+                    error: uploadError.message,
+                });
+            }
+
+            // Public URL (bucket must be public).
+            const { data: urlData } = supabaseAdmin.storage
+                .from(SUPABASE_DRIVER_BUCKET)
+                .getPublicUrl(objectPath);
+
+            const publicUrl = urlData?.publicUrl;
+
+            if (!publicUrl) {
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to resolve public URL for uploaded image.',
+                    code: 'STORAGE_URL_FAILED',
+                });
+            }
+
+            // fieldName is whitelisted above, so interpolation is safe.
+            const updated = await pool.query(
+                `
+                UPDATE public.drivers
+                SET ${fieldName} = $1, updated_at = NOW()
+                WHERE uid = $2
+                RETURNING *
+                `,
+                [publicUrl, uid],
+            );
+
+            if (updated.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Driver not found after update.',
+                    code: 'DRIVER_NOT_FOUND',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                message: 'Image uploaded successfully.',
+                url: publicUrl,
+                driver: updated.rows[0],
+            });
+        } catch (error: unknown) {
+            console.error('❌ Upload driver image error:', error);
+
+            const err = error as { message?: string; code?: string };
+
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                return res.status(413).json({
+                    success: false,
+                    message: 'File too large. Maximum size is 10 MB.',
+                    code: 'FILE_TOO_LARGE',
+                });
+            }
+
+            return res.status(500).json({
+                success: false,
+                message: err.message || 'Failed to upload image.',
+                code: 'IMAGE_UPLOAD_FAILED',
             });
         }
     },
@@ -601,13 +815,6 @@ router.get(
 /*
 |--------------------------------------------------------------------------
 | GET /api/drivers/:id/stats
-|--------------------------------------------------------------------------
-|
-| :id → numeric PK from public.drivers.id
-|
-| NOTE: `public.rides.driver_id` stores the Firebase UID (text), NOT
-| the numeric driver PK. We resolve the driver's UID first.
-|
 |--------------------------------------------------------------------------
 */
 
@@ -1010,16 +1217,6 @@ router.post(
 |--------------------------------------------------------------------------
 | PATCH /api/drivers/:uid
 |--------------------------------------------------------------------------
-|
-| Partial update of editable driver profile fields.
-|
-| Only whitelisted columns are accepted. Returns the updated driver.
-|
-| Special handling:
-|   - is_online: true   → requires status = 'approved'
-|   - is_online: false  → forces is_available = false
-|
-|--------------------------------------------------------------------------
 */
 
 router.patch(
@@ -1045,6 +1242,8 @@ router.patch(
             'gender',
             'date_of_birth',
             'national_id',
+            'license_number',
+            'license_expiry_date',
             'home_address',
             'region',
             'district',
@@ -1056,6 +1255,10 @@ router.patch(
             'registration_number',
             'profile_photo_url',
             'vehicle_photo_url',
+            'license_photo_url',
+            'registration_doc_url',
+            'insurance_doc_url',
+            'inspection_doc_url',
             'is_online',
             'is_available',
         ] as const;
@@ -1162,10 +1365,6 @@ router.patch(
 /*
 |--------------------------------------------------------------------------
 | DELETE /api/drivers/account
-|--------------------------------------------------------------------------
-|
-| Hard-deletes the authenticated driver's row from public.drivers.
-|
 |--------------------------------------------------------------------------
 */
 

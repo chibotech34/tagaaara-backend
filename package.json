@@ -8,18 +8,21 @@
     "dev": "nodemon --exec ts-node src/server.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.116.0",
     "@zavudev/sdk": "^0.56.0",
     "axios": "^1.19.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "firebase-admin": "^14.2.0",
+    "multer": "^2.4.0",
     "pg": "^8.23.0",
     "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.2.0",
     "@types/node": "^26.2.0",
     "@types/pg": "^8.21.0",
     "nodemon": "^3.1.14",
