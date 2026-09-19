@@ -1295,6 +1295,122 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
+| GET RIDE HISTORY (driver)  ⟵ NEW
+|--------------------------------------------------------------------------
+|
+| Returns completed + cancelled rides for the authenticated driver.
+| Must be registered BEFORE `/rides/:rideId` so that `/rides/history`
+| is not swallowed by the `:rideId` param route.
+|
+| Query params:
+|   limit   (default 50, max 100)
+|   offset  (default 0)
+|
+*/
+
+router.get(
+    '/rides/history',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        try {
+            const uid = getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Unauthenticated.',
+                });
+            }
+
+            let limit = Number(req.query.limit);
+            if (!Number.isFinite(limit) || limit <= 0) limit = 50;
+            limit = Math.min(limit, 100);
+
+            let offset = Number(req.query.offset);
+            if (!Number.isFinite(offset) || offset < 0) offset = 0;
+
+            const result = await pool.query(
+                `
+                SELECT
+                    r.id                       AS "rideId",
+                    r.passenger_id             AS "passengerId",
+                    r.driver_id                AS "driverId",
+
+                    r.pickup_address           AS "pickupAddress",
+                    r.destination_address      AS "destinationAddress",
+
+                    ST_Y(r.pickup)             AS "pickupLat",
+                    ST_X(r.pickup)             AS "pickupLng",
+                    ST_Y(r.destination)        AS "destLat",
+                    ST_X(r.destination)        AS "destLng",
+
+                    r.distance                 AS "distanceKm",
+                    r.duration                 AS "durationMin",
+                    r.fare,
+
+                    r.driver_earnings          AS "driverEarnings",
+                    r.tegaara_commission       AS "tegaaraCommission",
+
+                    r.payment_method           AS "paymentMethod",
+                    r.payment_status           AS "paymentStatus",
+
+                    r.status,
+                    r.ride_type                AS "rideType",
+
+                    r.requested_at             AS "requestedAt",
+                    r.completed_at             AS "completedAt",
+
+                    p.full_name                AS "passengerName",
+                    p.profile_photo_url        AS "passengerPhotoUrl",
+
+                    COALESCE(p.rating, 5.0)    AS "passengerRating",
+                    COALESCE(p.total_rides, 0) AS "passengerRides"
+
+                FROM public.rides r
+
+                LEFT JOIN public.passengers p
+                    ON p.id = r.passenger_id
+
+                WHERE r.driver_id = $1::text
+                  AND r.status IN ('completed', 'cancelled')
+
+                ORDER BY
+                    COALESCE(r.completed_at, r.requested_at)
+                    DESC NULLS LAST
+
+                LIMIT $2 OFFSET $3
+                `,
+                [uid, limit, offset]
+            );
+
+            console.log(
+                `📜 Ride history for driver ${uid}: ${result.rows.length} row(s)`
+            );
+
+            return res.status(200).json({
+                success: true,
+                rides: result.rows,
+            });
+        } catch (error) {
+            console.error(
+                '❌ Ride history error:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Server error while fetching ride history.',
+            });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
 | ACCEPT RIDE
 |--------------------------------------------------------------------------
 */
@@ -1828,20 +1944,8 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| MARK ARRIVED AT PICKUP  (NEW)
+| MARK ARRIVED AT PICKUP
 |--------------------------------------------------------------------------
-|
-| Driver lifecycle step 2 of 3:
-|
-|   accepted  →  arrived  →  started  →  completed
-|
-| Previously the client would try to move straight from `accepted` to
-| `started`, but the START RIDE endpoint guarded on `status = 'accepted'`
-| and there was no route that accepted `arrived` at all. Both are fixed:
-|
-|   • POST /rides/:rideId/arrived   (this route)
-|   • POST /rides/:rideId/start     (now accepts accepted OR arrived)
-|
 */
 
 router.post(
@@ -1951,11 +2055,6 @@ router.post(
                 `✅ Ride ${rideId} marked arrived by driver ${uid}`
             );
 
-            /*
-            |------------------------------------------------------------------
-            | Best-effort passenger push notification
-            |------------------------------------------------------------------
-            */
             try {
                 const passengerTokenResult =
                     await pool.query(
@@ -2587,10 +2686,6 @@ router.get(
 |--------------------------------------------------------------------------
 | START RIDE
 |--------------------------------------------------------------------------
-|
-| Accepts either `accepted` (driver skipped the arrived step) or
-| `arrived` (normal flow). Both transitions move the ride to `started`.
-|
 */
 
 router.post(
@@ -3296,21 +3391,8 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| GENERIC RIDE STATUS UPDATE  (NEW)
+| GENERIC RIDE STATUS UPDATE
 |--------------------------------------------------------------------------
-|
-| Single endpoint that handles the full driver lifecycle, so the Flutter
-| client's `RideService.updateRideStatus(rideId, status)` no longer needs
-| to know which specific route to hit. It works regardless of whether the
-| client jumps straight from `accepted` to `started` or goes through the
-| `arrived` step.
-|
-| Allowed transitions:
-|
-|   arrived   from accepted
-|   started   from accepted | arrived
-|   completed from started
-|
 */
 
 const DRIVER_STATUS_TRANSITIONS: Record<string, string[]> = {
@@ -3454,11 +3536,6 @@ router.post(
                 `✅ Ride ${rideId} status → ${nextStatus} (driver ${uid})`
             );
 
-            /*
-            |------------------------------------------------------------------
-            | Best-effort passenger notification for arrived / started
-            |------------------------------------------------------------------
-            */
             if (!isCompleted) {
                 try {
                     const passengerTokenResult =
