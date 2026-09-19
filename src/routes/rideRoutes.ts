@@ -1295,12 +1295,21 @@ router.get(
 
 /*
 |--------------------------------------------------------------------------
-| GET RIDE HISTORY (driver)  ⟵ NEW
+| GET RIDE HISTORY (driver)
 |--------------------------------------------------------------------------
 |
-| Returns completed + cancelled rides for the authenticated driver.
-| Must be registered BEFORE `/rides/:rideId` so that `/rides/history`
-| is not swallowed by the `:rideId` param route.
+| Returns the authenticated driver's completed + cancelled rides,
+| newest first. Consumed by DriverRidesScreen's History tab.
+|
+| MUST be registered BEFORE `GET /rides/:rideId` — otherwise Express
+| matches `/rides/history` with `:rideId = "history"` and returns
+| "Invalid ride ID." (HTTP 400).
+|
+| Schema notes (verified against supabase_backup.sql):
+|   • public.passengers has NO `rating` column
+|   • public.passengers has NO `total_rides` column
+|   → both are hardcoded, matching /rides/pending.
+|   • public.rides.driver_id stores the Firebase UID (text)
 |
 | Query params:
 |   limit   (default 50, max 100)
@@ -1325,49 +1334,76 @@ router.get(
                 });
             }
 
-            let limit = Number(req.query.limit);
+            let limit = parseInt(
+                String(req.query.limit ?? '50'),
+                10
+            );
             if (!Number.isFinite(limit) || limit <= 0) limit = 50;
-            limit = Math.min(limit, 100);
+            if (limit > 100) limit = 100;
 
-            let offset = Number(req.query.offset);
+            let offset = parseInt(
+                String(req.query.offset ?? '0'),
+                10
+            );
             if (!Number.isFinite(offset) || offset < 0) offset = 0;
 
-            const result = await pool.query(
+            // Sanity check: return [] instead of 500 if driver missing.
+            const driverCheck = await pool.query(
                 `
+                SELECT uid
+                FROM public.drivers
+                WHERE uid = $1::text
+                LIMIT 1
+                `,
+                [uid]
+            );
+
+            if (driverCheck.rows.length === 0) {
+                console.warn(
+                    `ℹ️ History: driver ${uid} not found — returning [].`
+                );
+                return res.status(200).json({
+                    success: true,
+                    rides: [],
+                });
+            }
+
+            const sql = `
                 SELECT
-                    r.id                       AS "rideId",
-                    r.passenger_id             AS "passengerId",
-                    r.driver_id                AS "driverId",
+                    r.id                     AS "rideId",
+                    r.passenger_id           AS "passengerId",
+                    r.driver_id              AS "driverId",
 
-                    r.pickup_address           AS "pickupAddress",
-                    r.destination_address      AS "destinationAddress",
+                    r.pickup_address         AS "pickupAddress",
+                    r.destination_address    AS "destinationAddress",
 
-                    ST_Y(r.pickup)             AS "pickupLat",
-                    ST_X(r.pickup)             AS "pickupLng",
-                    ST_Y(r.destination)        AS "destLat",
-                    ST_X(r.destination)        AS "destLng",
+                    ST_Y(r.pickup)           AS "pickupLat",
+                    ST_X(r.pickup)           AS "pickupLng",
+                    ST_Y(r.destination)      AS "destLat",
+                    ST_X(r.destination)      AS "destLng",
 
-                    r.distance                 AS "distanceKm",
-                    r.duration                 AS "durationMin",
+                    r.distance               AS "distanceKm",
+                    r.duration               AS "durationMin",
                     r.fare,
 
-                    r.driver_earnings          AS "driverEarnings",
-                    r.tegaara_commission       AS "tegaaraCommission",
+                    r.driver_earnings        AS "driverEarnings",
+                    r.tegaara_commission     AS "tegaaraCommission",
 
-                    r.payment_method           AS "paymentMethod",
-                    r.payment_status           AS "paymentStatus",
+                    r.payment_method         AS "paymentMethod",
+                    r.payment_status         AS "paymentStatus",
 
                     r.status,
-                    r.ride_type                AS "rideType",
+                    r.ride_type              AS "rideType",
 
-                    r.requested_at             AS "requestedAt",
-                    r.completed_at             AS "completedAt",
+                    r.requested_at           AS "requestedAt",
+                    r.completed_at           AS "completedAt",
 
-                    p.full_name                AS "passengerName",
-                    p.profile_photo_url        AS "passengerPhotoUrl",
+                    p.full_name              AS "passengerName",
+                    p.profile_photo_url      AS "passengerPhotoUrl",
 
-                    COALESCE(p.rating, 5.0)    AS "passengerRating",
-                    COALESCE(p.total_rides, 0) AS "passengerRides"
+                    -- hardcoded: columns do not exist in this schema
+                    5.0                      AS "passengerRating",
+                    0                        AS "passengerRides"
 
                 FROM public.rides r
 
@@ -1377,33 +1413,54 @@ router.get(
                 WHERE r.driver_id = $1::text
                   AND r.status IN ('completed', 'cancelled')
 
-                ORDER BY
-                    COALESCE(r.completed_at, r.requested_at)
-                    DESC NULLS LAST
+                ORDER BY r.id DESC
 
                 LIMIT $2 OFFSET $3
-                `,
-                [uid, limit, offset]
-            );
+            `;
 
             console.log(
-                `📜 Ride history for driver ${uid}: ${result.rows.length} row(s)`
+                `📜 History query driver=${uid} limit=${limit} offset=${offset}`
+            );
+
+            const result = await pool.query(sql, [
+                uid,
+                limit,
+                offset,
+            ]);
+
+            console.log(
+                `✅ Ride history for driver ${uid}: ` +
+                `${result.rows.length} row(s)`
             );
 
             return res.status(200).json({
                 success: true,
                 rides: result.rows,
             });
-        } catch (error) {
-            console.error(
-                '❌ Ride history error:',
-                error
-            );
+        } catch (error: unknown) {
+            const pgError = error as {
+                code?: string;
+                message?: string;
+                detail?: string;
+                hint?: string;
+                position?: string;
+            };
+
+            console.error('❌ Ride history error:', {
+                code: pgError.code,
+                message: pgError.message,
+                detail: pgError.detail,
+                hint: pgError.hint,
+                position: pgError.position,
+            });
 
             return res.status(500).json({
                 success: false,
                 message:
                     'Server error while fetching ride history.',
+                code:
+                    pgError.code ?? 'HISTORY_FETCH_FAILED',
+                detail: pgError.message ?? null,
             });
         }
     }
@@ -2542,6 +2599,11 @@ router.get(
 |--------------------------------------------------------------------------
 | GET RIDE DETAILS
 |--------------------------------------------------------------------------
+|
+| NOTE: registered LAST among GET /rides/* routes so it doesn't
+| shadow /rides/history, /rides/nearby, /rides/pending, or
+| /rides/:rideId/status.
+|
 */
 
 router.get(
