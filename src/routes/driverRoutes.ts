@@ -76,10 +76,7 @@ const verifyFirebaseToken = async (
     } catch (error: unknown) {
         console.error('❌ Firebase token verification failed:', error);
 
-        const firebaseError = error as {
-            code?: string;
-            message?: string;
-        };
+        const firebaseError = error as { code?: string; message?: string };
 
         if (firebaseError.code === 'auth/id-token-expired') {
             res.status(401).json({
@@ -126,30 +123,37 @@ const normaliseParam = (value: string | string[] | undefined): string => {
 
 /*
 |--------------------------------------------------------------------------
-| Supabase Storage client (server-side)
+| Supabase Storage (lazy — a missing env var won't crash boot)
 |--------------------------------------------------------------------------
 */
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const SUPABASE_DRIVER_BUCKET =
     process.env.SUPABASE_DRIVER_BUCKET || 'driver-assets';
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    console.warn(
-        '⚠️  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not set — image upload will fail.',
-    );
-}
+let _supabaseAdmin: ReturnType<typeof createClient> | null = null;
 
-const supabaseAdmin = createClient(
-    SUPABASE_URL ?? '',
-    SUPABASE_SERVICE_ROLE_KEY ?? '',
-    { auth: { persistSession: false } },
-);
+function getSupabaseAdmin() {
+    if (_supabaseAdmin) return _supabaseAdmin;
+
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!url || !key) {
+        throw new Error(
+            'Supabase Storage is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the server.',
+        );
+    }
+
+    console.log('✅ Supabase Storage client initialised');
+    _supabaseAdmin = createClient(url, key, {
+        auth: { persistSession: false },
+    });
+    return _supabaseAdmin;
+}
 
 /*
 |--------------------------------------------------------------------------
-| Multer (in-memory) — streams straight to Supabase Storage
+| Multer + allowed image fields
 |--------------------------------------------------------------------------
 */
 
@@ -399,12 +403,12 @@ router.post(
             if (!file) {
                 return res.status(400).json({
                     success: false,
-                    message: 'No file uploaded. Expected multipart field "file".',
+                    message:
+                        'No file uploaded. Expected multipart field "file".',
                     code: 'FILE_MISSING',
                 });
             }
 
-            // Confirm the driver exists and get its numeric PK.
             const driverLookup = await pool.query(
                 `SELECT id FROM public.drivers WHERE uid = $1 LIMIT 1`,
                 [uid],
@@ -420,7 +424,6 @@ router.post(
 
             const driverId: number = driverLookup.rows[0].id;
 
-            // Derive extension.
             const ext = (() => {
                 const original = file.originalname || '';
                 const dot = original.lastIndexOf('.');
@@ -432,8 +435,9 @@ router.post(
 
             const objectPath = `drivers/${driverId}/${fieldName}-${Date.now()}.${ext}`;
 
-            // Upload to Supabase Storage.
-            const { error: uploadError } = await supabaseAdmin.storage
+            const supabase = getSupabaseAdmin();
+
+            const { error: uploadError } = await supabase.storage
                 .from(SUPABASE_DRIVER_BUCKET)
                 .upload(objectPath, file.buffer, {
                     contentType: file.mimetype,
@@ -450,8 +454,7 @@ router.post(
                 });
             }
 
-            // Public URL (bucket must be public).
-            const { data: urlData } = supabaseAdmin.storage
+            const { data: urlData } = supabase.storage
                 .from(SUPABASE_DRIVER_BUCKET)
                 .getPublicUrl(objectPath);
 
@@ -460,7 +463,8 @@ router.post(
             if (!publicUrl) {
                 return res.status(500).json({
                     success: false,
-                    message: 'Failed to resolve public URL for uploaded image.',
+                    message:
+                        'Failed to resolve public URL for uploaded image.',
                     code: 'STORAGE_URL_FAILED',
                 });
             }
@@ -500,6 +504,18 @@ router.post(
                     success: false,
                     message: 'File too large. Maximum size is 10 MB.',
                     code: 'FILE_TOO_LARGE',
+                });
+            }
+
+            if (
+                typeof err.message === 'string' &&
+                err.message.includes('Supabase Storage is not configured')
+            ) {
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        'Server misconfigured: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set.',
+                    code: 'SUPABASE_NOT_CONFIGURED',
                 });
             }
 
@@ -544,12 +560,15 @@ router.get(
                     vehicle_type, registration_number, vehicle_color,
                     vehicle_model, vehicle_year,
                     vehicle_photo_url,
+                    license_photo_url, registration_doc_url,
+                    insurance_doc_url, inspection_doc_url,
                     region, district, town_city, home_address,
                     is_online, is_available, status,
                     current_latitude, current_longitude, last_location_update,
                     rating, total_rides, completed_rides, cancelled_rides,
                     preferred_payment_method, mobile_money_provider,
                     mobile_money_number,
+                    reviewer_comment, correction_message,
                     created_at, updated_at
                 FROM public.drivers
                 WHERE uid = $1
@@ -607,20 +626,7 @@ router.get(
 
             const result = await pool.query(
                 `
-                SELECT
-                    id, uid, full_name, phone, email, profile_photo_url,
-                    date_of_birth, gender, national_id, license_number,
-                    license_expiry_date,
-                    vehicle_type, registration_number, vehicle_color,
-                    vehicle_model, vehicle_year,
-                    vehicle_photo_url,
-                    region, district, town_city, home_address,
-                    is_online, is_available, status,
-                    current_latitude, current_longitude, last_location_update,
-                    rating, total_rides, completed_rides, cancelled_rides,
-                    preferred_payment_method, mobile_money_provider,
-                    mobile_money_number,
-                    created_at, updated_at
+                SELECT *
                 FROM public.drivers
                 WHERE uid = $1
                 LIMIT 1
