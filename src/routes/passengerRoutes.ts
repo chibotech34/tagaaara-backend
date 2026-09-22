@@ -117,16 +117,6 @@ const getAuthenticatedUid = (
  * NOTIFICATION HELPERS
  * ========================================================================== */
 
-/**
- * Create a persistent alert.
- *
- * The alert is stored in public.alerts and will appear in the
- * passenger/driver Alert Screen.
- *
- * IMPORTANT:
- * The supplied database client is used so the alert becomes part
- * of the same database transaction as the wallet/payment operation.
- */
 const createAlert = async (
     client: any,
     userId: string,
@@ -178,15 +168,6 @@ const createAlert = async (
     );
 };
 
-
-/**
- * Send an FCM notification.
- *
- * FCM is sent AFTER the database transaction commits.
- *
- * Therefore, if FCM fails, the wallet/payment operation
- * remains successful.
- */
 const sendFcmNotification = async (
     token: string,
     title: string,
@@ -309,10 +290,6 @@ const sendFcmNotification = async (
     }
 };
 
-
-/**
- * Get the latest FCM token for a Firebase user.
- */
 const getUserFcmToken = async (
     userId: string,
 ): Promise<string | null> => {
@@ -2811,6 +2788,128 @@ router.get(
 );
 
 /* ==========================================================================
+ * GET /api/passengers/wallet/pending-payment-ride
+ *
+ * Returns the passenger's most recent COMPLETED but UNPAID ride, together
+ * with the assigned driver's details, so the "Pay for Ride" dialog can
+ * pre-fill ride_id, amount, driver name, driver ID and vehicle info.
+ *
+ * Returns { success: true, ride: null } when there is nothing to pay.
+ * ========================================================================== */
+
+router.get(
+    '/wallet/pending-payment-ride',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        try {
+            const uid = getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
+
+            const passengerResult = await pool.query(
+                `
+                SELECT id
+                FROM public.passengers
+                WHERE firebase_uid = $1
+                LIMIT 1
+                `,
+                [uid],
+            );
+
+            if (passengerResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger account not found.',
+                    code: 'PASSENGER_NOT_FOUND',
+                });
+            }
+
+            const passengerId = passengerResult.rows[0].id;
+
+            const rideResult = await pool.query(
+                `
+                SELECT
+                    r.id                            AS ride_id,
+                    r.fare                          AS amount,
+                    r.driver_id                     AS driver_id,
+                    r.completed_at                  AS completed_at,
+                    r.payment_status                AS payment_status,
+
+                    d.full_name                     AS driver_name,
+                    d.profile_photo_url             AS driver_photo_url,
+                    d.vehicle_type                  AS vehicle_type,
+                    d.vehicle_model                 AS vehicle_model,
+                    d.vehicle_color                 AS vehicle_color,
+                    d.registration_number           AS vehicle_registration,
+                    d.vehicle_year                  AS vehicle_year
+                FROM public.rides r
+                LEFT JOIN public.drivers d
+                    ON d.uid = r.driver_id
+                WHERE r.passenger_id = $1
+                  AND r.status = 'completed'
+                  AND COALESCE(r.payment_status, 'pending') <> 'paid'
+                ORDER BY
+                    r.completed_at DESC NULLS LAST,
+                    r.id DESC
+                LIMIT 1
+                `,
+                [passengerId],
+            );
+
+            if (rideResult.rows.length === 0) {
+                return res.status(200).json({
+                    success: true,
+                    ride: null,
+                });
+            }
+
+            const ride = rideResult.rows[0];
+
+            return res.status(200).json({
+                success: true,
+                ride: {
+                    ride_id: ride.ride_id,
+                    amount: Number(ride.amount),
+                    driver_id: ride.driver_id,
+                    driver_name: ride.driver_name,
+                    driver_photo_url: ride.driver_photo_url,
+                    vehicle_type: ride.vehicle_type,
+                    vehicle_model: ride.vehicle_model,
+                    vehicle_color: ride.vehicle_color,
+                    vehicle_registration: ride.vehicle_registration,
+                    vehicle_year: ride.vehicle_year,
+                    completed_at: ride.completed_at,
+                    payment_status: ride.payment_status ?? 'pending',
+                },
+            });
+        } catch (error: unknown) {
+            const e = error as { message?: string };
+
+            console.error(
+                '❌ Error fetching pending payment ride:',
+                e,
+            );
+
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load pending payment ride.',
+                code: 'PENDING_RIDE_FETCH_FAILED',
+                error: e.message,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
  * POST /api/passengers/wallet/topup
  *
  * DEVELOPMENT / TESTING VERSION
@@ -3113,10 +3212,6 @@ router.post(
             const transaction =
                 transactionResult.rows[0];
 
-            /* ------------------------------------------------------------
-             * PERSISTENT PAYMENT ALERT
-             * ------------------------------------------------------------ */
-
             const alertTitle =
                 'Wallet Funded';
 
@@ -3175,10 +3270,6 @@ router.post(
                 false;
 
             client.release();
-
-            /* ------------------------------------------------------------
-             * FCM AFTER COMMIT
-             * ------------------------------------------------------------ */
 
             const fcmToken =
                 await getUserFcmToken(
@@ -3640,10 +3731,6 @@ router.post(
                 });
             }
 
-            /*
-             * IMPORTANT:
-             * The database fare is authoritative.
-             */
             const amount =
                 Number(
                     ride.fare,
@@ -3892,11 +3979,6 @@ router.post(
 
             /* ------------------------------------------------------------
              * DRIVER SETTLEMENT
-             *
-             * The ride completion trigger has already placed the
-             * driver's earning into pending_balance.
-             *
-             * This section moves the pending earning to balance.
              * ------------------------------------------------------------ */
 
             const driverEarnings =
@@ -3919,10 +4001,6 @@ router.post(
                 );
 
                 try {
-                    /* ----------------------------------------------------
-                     * FIND DRIVER
-                     * ---------------------------------------------------- */
-
                     const driverResult =
                         await client.query(
                             `
@@ -3951,10 +4029,6 @@ router.post(
 
                     const driver =
                         driverResult.rows[0];
-
-                    /* ----------------------------------------------------
-                     * LOCK DRIVER WALLET
-                     * ---------------------------------------------------- */
 
                     const driverWalletResult =
                         await client.query(
@@ -4010,10 +4084,6 @@ router.post(
                         pendingBefore -
                         settledAmount;
 
-                    /* ----------------------------------------------------
-                     * UPDATE DRIVER WALLET
-                     * ---------------------------------------------------- */
-
                     await client.query(
                         `
                         UPDATE public.driver_wallets
@@ -4030,10 +4100,6 @@ router.post(
                             driverWallet.id,
                         ],
                     );
-
-                    /* ----------------------------------------------------
-                     * DRIVER TRANSACTION
-                     * ---------------------------------------------------- */
 
                     await client.query(
                         `
