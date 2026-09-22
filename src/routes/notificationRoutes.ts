@@ -1,4 +1,5 @@
 // routes/notificationRoutes.ts
+
 import {
     Router,
     Request,
@@ -150,6 +151,206 @@ const normaliseParam = (
     if (value === undefined) return '';
     return Array.isArray(value) ? value[0] ?? '' : value;
 };
+
+/* ==========================================================================
+ * FCM TOKEN REGISTRATION
+ * ==========================================================================
+ *
+ * The Flutter app calls POST /api/notifications/register-token right
+ * after every successful login (driver or passenger). The token is
+ * stored in public.fcm_tokens, keyed by the Firebase UID so both roles
+ * share the same table.
+ *
+ * Backend senders (rideRoutes.ts, passengerWalletRoutes.ts) already
+ * look up tokens with:
+ *
+ *   SELECT token FROM public.fcm_tokens
+ *   WHERE user_id = $1::text
+ *   ORDER BY updated_at DESC NULLS LAST LIMIT 1
+ *
+ * so this endpoint must keep that contract.
+ * ========================================================================== */
+
+router.post(
+    '/register-token',
+    verifyFirebaseToken,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            const uid = req.decodedToken?.uid;
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
+
+            const token =
+                typeof req.body?.token === 'string'
+                    ? req.body.token.trim()
+                    : '';
+
+            const deviceType =
+                typeof req.body?.deviceType === 'string' &&
+                    req.body.deviceType.trim()
+                    ? req.body.deviceType.trim()
+                    : 'mobile';
+
+            const userIdFromBody =
+                typeof req.body?.userId === 'string'
+                    ? req.body.userId.trim()
+                    : '';
+
+            // The authenticated UID and the body's userId must match.
+            // (Prevents registering a device for a different user.)
+            if (userIdFromBody && userIdFromBody !== uid) {
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        'userId in body does not match the authenticated user.',
+                    code: 'UID_MISMATCH',
+                });
+            }
+
+            if (!token) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'FCM token is required.',
+                    code: 'TOKEN_MISSING',
+                });
+            }
+
+            /*
+            |------------------------------------------------------------------
+            | Upsert: one row per (user_id, token).
+            |------------------------------------------------------------------
+            | Unique constraint expected:
+            |   UNIQUE (user_id, token)  OR  UNIQUE (token)
+            |
+            | The ON CONFLICT target is (token) — a device's FCM token is
+            | globally unique, so if a device changes users we simply
+            | overwrite the user_id.
+            */
+
+            await pool.query(
+                `
+                INSERT INTO public.fcm_tokens (
+                    user_id,
+                    token,
+                    device_type,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1::text,
+                    $2::text,
+                    $3::varchar,
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (token)
+                DO UPDATE SET
+                    user_id     = EXCLUDED.user_id,
+                    device_type = EXCLUDED.device_type,
+                    updated_at  = NOW()
+                `,
+                [uid, token, deviceType],
+            );
+
+            console.log(
+                `✅ FCM token registered for ${uid} (${deviceType})`
+            );
+
+            return res.status(200).json({
+                success: true,
+                message: 'FCM token registered.',
+            });
+        } catch (error: unknown) {
+            console.error(
+                '❌ POST /notifications/register-token failed:',
+                error,
+            );
+
+            const dbError = error as {
+                code?: string;
+                message?: string;
+                detail?: string;
+            };
+
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to register FCM token.',
+                code: dbError.code ?? 'FCM_REGISTER_FAILED',
+                detail: dbError.detail ?? null,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
+ * FCM TOKEN UNREGISTRATION (logout)
+ * ========================================================================== */
+
+router.post(
+    '/unregister-token',
+    verifyFirebaseToken,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            const uid = req.decodedToken?.uid;
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
+
+            const token =
+                typeof req.body?.token === 'string'
+                    ? req.body.token.trim()
+                    : '';
+
+            if (token) {
+                await pool.query(
+                    `
+                    DELETE FROM public.fcm_tokens
+                    WHERE user_id = $1::text
+                      AND token   = $2::text
+                    `,
+                    [uid, token],
+                );
+            } else {
+                // No token provided → clear all tokens for this user.
+                await pool.query(
+                    `
+                    DELETE FROM public.fcm_tokens
+                    WHERE user_id = $1::text
+                    `,
+                    [uid],
+                );
+            }
+
+            console.log(`🗑️ FCM token unregistered for ${uid}`);
+
+            return res.status(200).json({
+                success: true,
+                message: 'FCM token unregistered.',
+            });
+        } catch (error: unknown) {
+            console.error(
+                '❌ POST /notifications/unregister-token failed:',
+                error,
+            );
+
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to unregister FCM token.',
+            });
+        }
+    },
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -354,7 +555,6 @@ router.get(
                 error,
             );
 
-            // Badge is non-critical: return 0 rather than 500.
             return res.status(200).json({
                 success: true,
                 unreadCount: 0,
@@ -367,10 +567,6 @@ router.get(
 |--------------------------------------------------------------------------
 | PATCH /api/notifications/read-all
 |--------------------------------------------------------------------------
-|
-| IMPORTANT: declared BEFORE any '/:id/read' route, otherwise
-| '/read-all' would be interpreted as an id.
-|
 */
 
 router.patch(
