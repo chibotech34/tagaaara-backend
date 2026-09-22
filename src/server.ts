@@ -20,6 +20,7 @@ import {
 } from './middleware/firebaseAdmin';
 
 import passengerRoutes from './routes/passengerRoutes';
+import passengerWalletRoutes from './routes/passengerWalletRoutes'; // ✏️ ADDED
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
 import rideRoutes from './routes/rideRoutes';
@@ -248,6 +249,32 @@ pool.query('SELECT NOW()')
 app.use(
     '/api',
     rideRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| Passenger Wallet Routes
+|--------------------------------------------------------------------------
+|
+| Registered BEFORE passengerRoutes so /wallet, /transactions, etc.
+| are matched first and are not shadowed by any `/:id` route in
+| passengerRoutes.
+|
+| Endpoints:
+|
+|   GET  /api/passengers/wallet
+|   POST /api/passengers/wallet
+|   GET  /api/passengers/wallet/pending-payment-ride
+|   POST /api/passengers/wallet/topup
+|   POST /api/passengers/wallet/pay
+|   GET  /api/passengers/transactions
+|
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/passengers',
+    passengerWalletRoutes, // ✏️ ADDED
 );
 
 /*

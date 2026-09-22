@@ -995,24 +995,6 @@ router.get(
 |--------------------------------------------------------------------------
 | GET PENDING RIDES  (driver dispatch queue)
 |--------------------------------------------------------------------------
-|
-| Endpoint consumed by the Flutter client:
-|
-|   GET /rides/pending?driverId=<uid>&lat=<>&lng=<>&radiusKm=<>
-|
-| `lat` / `lng` are OPTIONAL. If they are missing or invalid, the route
-| falls back to the driver's stored `current_latitude` /
-| `current_longitude`.
-|
-| SELF-HEALING:
-|
-|   `is_available` is flipped to false the moment a driver accepts a
-|   ride. If the client ever drops offline or crashes mid-ride, the
-|   flag can stay false forever and the driver never sees new
-|   requests. This handler therefore checks whether the driver has
-|   any active (accepted/arrived/started) ride; if not, it restores
-|   `is_available = true` before serving the queue.
-|
 */
 
 router.get(
@@ -1070,13 +1052,6 @@ router.get(
                 });
             }
 
-            /*
-            |------------------------------------------------------------------
-            | SELF-HEAL is_available
-            |------------------------------------------------------------------
-            | Only restore if the driver has no active ride.
-            */
-
             if (!driver.is_available) {
                 const activeRide = await pool.query(
                     `
@@ -1119,7 +1094,6 @@ router.get(
                 }
             }
 
-            // Resolve lat/lng: query param first, then stored location.
             let lat = Number(req.query.lat);
             let lng = Number(req.query.lng);
 
@@ -1297,24 +1271,6 @@ router.get(
 |--------------------------------------------------------------------------
 | GET RIDE HISTORY (driver)
 |--------------------------------------------------------------------------
-|
-| Returns the authenticated driver's completed + cancelled rides,
-| newest first. Consumed by DriverRidesScreen's History tab.
-|
-| MUST be registered BEFORE `GET /rides/:rideId` — otherwise Express
-| matches `/rides/history` with `:rideId = "history"` and returns
-| "Invalid ride ID." (HTTP 400).
-|
-| Schema notes (verified against supabase_backup.sql):
-|   • public.passengers has NO `rating` column
-|   • public.passengers has NO `total_rides` column
-|   → both are hardcoded, matching /rides/pending.
-|   • public.rides.driver_id stores the Firebase UID (text)
-|
-| Query params:
-|   limit   (default 50, max 100)
-|   offset  (default 0)
-|
 */
 
 router.get(
@@ -1347,7 +1303,6 @@ router.get(
             );
             if (!Number.isFinite(offset) || offset < 0) offset = 0;
 
-            // Sanity check: return [] instead of 500 if driver missing.
             const driverCheck = await pool.query(
                 `
                 SELECT uid
@@ -1401,7 +1356,6 @@ router.get(
                     p.full_name              AS "passengerName",
                     p.profile_photo_url      AS "passengerPhotoUrl",
 
-                    -- hardcoded: columns do not exist in this schema
                     5.0                      AS "passengerRating",
                     0                        AS "passengerRides"
 
@@ -1779,6 +1733,11 @@ router.post(
                 `✅ Driver ${uid} accepted ride ${rideId}`
             );
 
+            /*
+            |----------------------------------------------------------
+            | Notify PASSENGER that the driver accepted
+            |----------------------------------------------------------
+            */
             try {
                 const passengerTokenResult =
                     await pool.query(
@@ -1942,6 +1901,128 @@ router.post(
             ) {
                 console.error(
                     '❌ Passenger notification failed:',
+                    notificationError
+                );
+            }
+
+            /*
+            |----------------------------------------------------------
+            | Notify DRIVER — confirmation of their own acceptance
+            |----------------------------------------------------------
+            */
+            try {
+                const driverTokenResult =
+                    await pool.query(
+                        `
+                        SELECT token
+
+                        FROM public.fcm_tokens
+
+                        WHERE user_id = $1::text
+
+                        ORDER BY
+                            updated_at DESC NULLS LAST
+
+                        LIMIT 1
+                        `,
+                        [uid]
+                    );
+
+                const driverToken =
+                    driverTokenResult
+                        .rows[0]?.token;
+
+                if (driverToken) {
+                    await sendFcmNotification(
+                        driverToken,
+
+                        'Ride Accepted',
+
+                        `You accepted ride #${rideId}. Head to ${ride.pickupAddress || 'the pickup location'}.`,
+
+                        {
+                            role: 'driver',
+                            notificationType:
+                                'ride_accepted_driver',
+                            targetScreen:
+                                'driver_ride',
+                            status: 'accepted',
+
+                            rideId:
+                                String(rideId),
+
+                            passengerName:
+                                ride.passengerName ||
+                                'Passenger',
+
+                            passengerPhoto:
+                                ride.passengerPhotoUrl ||
+                                '',
+
+                            pickupAddress:
+                                ride.pickupAddress ||
+                                '',
+
+                            destinationAddress:
+                                ride.destinationAddress ||
+                                '',
+
+                            pickupLat:
+                                ride.pickupLat != null
+                                    ? String(
+                                        ride.pickupLat
+                                    )
+                                    : '',
+
+                            pickupLng:
+                                ride.pickupLng != null
+                                    ? String(
+                                        ride.pickupLng
+                                    )
+                                    : '',
+
+                            destLat:
+                                ride.destLat != null
+                                    ? String(
+                                        ride.destLat
+                                    )
+                                    : '',
+
+                            destLng:
+                                ride.destLng != null
+                                    ? String(
+                                        ride.destLng
+                                    )
+                                    : '',
+
+                            fare:
+                                ride.fare != null
+                                    ? String(
+                                        ride.fare
+                                    )
+                                    : '',
+
+                            distanceKm:
+                                ride.distanceKm != null
+                                    ? String(
+                                        ride.distanceKm
+                                    )
+                                    : '',
+
+                            durationMin:
+                                ride.durationMin != null
+                                    ? String(
+                                        ride.durationMin
+                                    )
+                                    : '',
+                        }
+                    );
+                }
+            } catch (
+            notificationError
+            ) {
+                console.error(
+                    '❌ Driver acceptance notification failed:',
                     notificationError
                 );
             }
@@ -2591,6 +2672,250 @@ router.get(
                 message:
                     'Server error while fetching ride status.',
             });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| PAY RIDE  (passenger pays → driver is notified + wallet is credited)
+|--------------------------------------------------------------------------
+|
+| NOTE: registered BEFORE GET /rides/:rideId to keep route precedence
+| clean (though POST vs GET means they wouldn't collide anyway).
+|
+*/
+
+router.post(
+    '/rides/:rideId/pay',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response
+    ) => {
+        const client = await pool.connect();
+
+        try {
+            const rideId = Number(req.params.rideId);
+
+            if (!Number.isInteger(rideId) || rideId <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid ride ID.',
+                });
+            }
+
+            const uid = getAuthenticatedUid(req);
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Unauthenticated.',
+                });
+            }
+
+            const paymentMethod =
+                typeof req.body?.paymentMethod === 'string' &&
+                    req.body.paymentMethod.trim()
+                    ? req.body.paymentMethod.trim()
+                    : 'cash';
+
+            await client.query('BEGIN');
+
+            const rideResult = await client.query(
+                `
+                SELECT
+                    r.id,
+                    r.passenger_id,
+                    r.driver_id,
+                    r.fare,
+                    r.payment_status,
+                    r.pickup_address,
+                    r.destination_address,
+                    p.firebase_uid AS passenger_firebase_uid,
+                    p.full_name    AS passenger_name
+                FROM public.rides r
+                LEFT JOIN public.passengers p
+                    ON p.id = r.passenger_id
+                WHERE r.id = $1::integer
+                LIMIT 1
+                FOR UPDATE OF r
+                `,
+                [rideId]
+            );
+
+            if (rideResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(404).json({
+                    success: false,
+                    message: 'Ride not found.',
+                });
+            }
+
+            const ride = rideResult.rows[0];
+
+            if (ride.passenger_firebase_uid !== uid) {
+                await client.query('ROLLBACK');
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        'You are not authorized to pay for this ride.',
+                });
+            }
+
+            if (ride.payment_status === 'paid') {
+                await client.query('ROLLBACK');
+                return res.status(200).json({
+                    success: true,
+                    alreadyPaid: true,
+                    message: 'Ride already paid.',
+                });
+            }
+
+            const fare = Number(ride.fare) || 0;
+
+            // Flat GH₵2.00 commission, capped at the fare.
+            const commission = Math.min(2.0, fare);
+            const driverEarnings = Math.max(0, fare - commission);
+
+            await client.query(
+                `
+                UPDATE public.rides
+                SET
+                    payment_status     = 'paid',
+                    payment_method     = $1::varchar,
+                    driver_earnings    = $2::numeric,
+                    tegaara_commission = $3::numeric
+                WHERE id = $4::integer
+                `,
+                [paymentMethod, driverEarnings, commission, rideId]
+            );
+
+            const driverFirebaseUid: string | null = ride.driver_id;
+            let newDriverBalance: number | null = null;
+
+            if (driverFirebaseUid) {
+                const driverResult = await client.query(
+                    `
+                    SELECT id
+                    FROM public.drivers
+                    WHERE uid = $1::text
+                    LIMIT 1
+                    `,
+                    [driverFirebaseUid]
+                );
+
+                const driverNumericId = driverResult.rows[0]?.id;
+
+                if (driverNumericId) {
+                    const walletUpdate = await client.query(
+                        `
+                        UPDATE public.driver_wallets
+                        SET
+                            balance    = balance + $1::numeric,
+                            updated_at = NOW()
+                        WHERE driver_id = $2
+                        RETURNING balance
+                        `,
+                        [driverEarnings, driverNumericId]
+                    );
+
+                    if (walletUpdate.rows[0]?.balance != null) {
+                        newDriverBalance = Number(
+                            walletUpdate.rows[0].balance
+                        );
+                    }
+                }
+            }
+
+            await client.query('COMMIT');
+
+            console.log(
+                `💵 Ride ${rideId} paid. fare=${fare} ` +
+                `driverEarnings=${driverEarnings} commission=${commission}`
+            );
+
+            /*
+            |----------------------------------------------------------
+            | Notify DRIVER — payment received
+            |----------------------------------------------------------
+            */
+            if (driverFirebaseUid) {
+                try {
+                    const tokenResult = await pool.query(
+                        `
+                        SELECT token
+                        FROM public.fcm_tokens
+                        WHERE user_id = $1::text
+                        ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 1
+                        `,
+                        [driverFirebaseUid]
+                    );
+
+                    const driverToken = tokenResult.rows[0]?.token;
+
+                    if (driverToken) {
+                        await sendFcmNotification(
+                            driverToken,
+                            'Payment Received',
+                            `You earned GH₵${driverEarnings.toFixed(2)} for ride #${rideId}.`,
+                            {
+                                role: 'driver',
+                                notificationType: 'payment_received',
+                                targetScreen: 'driver_wallet',
+                                status: 'paid',
+                                rideId: String(rideId),
+
+                                amount: driverEarnings.toFixed(2),
+                                fare: fare.toFixed(2),
+                                commission: commission.toFixed(2),
+                                paymentMethod,
+
+                                newBalance:
+                                    newDriverBalance != null
+                                        ? newDriverBalance.toFixed(2)
+                                        : '',
+
+                                passengerName:
+                                    ride.passenger_name || '',
+
+                                pickupAddress:
+                                    ride.pickup_address || '',
+
+                                destinationAddress:
+                                    ride.destination_address || '',
+                            }
+                        );
+                    }
+                } catch (notificationError) {
+                    console.error(
+                        '❌ Driver payment notification failed:',
+                        notificationError
+                    );
+                }
+            }
+
+            return res.status(200).json({
+                success: true,
+                rideId,
+                paymentStatus: 'paid',
+                driverEarnings,
+                tegaaraCommission: commission,
+                message: 'Payment processed successfully.',
+            });
+        } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch (_) { }
+
+            console.error('❌ Pay ride error:', error);
+
+            return res.status(500).json({
+                success: false,
+                message: 'Server error while processing payment.',
+            });
+        } finally {
+            client.release();
         }
     }
 );
