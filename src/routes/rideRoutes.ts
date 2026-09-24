@@ -2680,10 +2680,6 @@ router.get(
 |--------------------------------------------------------------------------
 | PAY RIDE  (passenger pays → driver is notified + wallet is credited)
 |--------------------------------------------------------------------------
-|
-| NOTE: registered BEFORE GET /rides/:rideId to keep route precedence
-| clean (though POST vs GET means they wouldn't collide anyway).
-|
 */
 
 router.post(
@@ -2773,7 +2769,6 @@ router.post(
 
             const fare = Number(ride.fare) || 0;
 
-            // Flat GH₵2.00 commission, capped at the fare.
             const commission = Math.min(2.0, fare);
             const driverEarnings = Math.max(0, fare - commission);
 
@@ -2834,11 +2829,6 @@ router.post(
                 `driverEarnings=${driverEarnings} commission=${commission}`
             );
 
-            /*
-            |----------------------------------------------------------
-            | Notify DRIVER — payment received
-            |----------------------------------------------------------
-            */
             if (driverFirebaseUid) {
                 try {
                     const tokenResult = await pool.query(
@@ -2922,12 +2912,15 @@ router.post(
 
 /*
 |--------------------------------------------------------------------------
-| GET RIDE DETAILS
+| GET RIDE DETAILS (single ride — camelCase, works for any status)
 |--------------------------------------------------------------------------
 |
-| NOTE: registered LAST among GET /rides/* routes so it doesn't
-| shadow /rides/history, /rides/nearby, /rides/pending, or
-| /rides/:rideId/status.
+| Used by RideService.fetchRideById on the driver app. Returns the same
+| shape as /drivers/:uid/current-request so RideRequest.fromJson can parse
+| the response directly. Works for both active and terminal rides.
+|
+| NOTE: registered LAST among GET /rides/* routes so it doesn't shadow
+| /rides/history, /rides/nearby, /rides/pending, or /rides/:rideId/status.
 |
 */
 
@@ -2939,110 +2932,92 @@ router.get(
         res: Response
     ) => {
         try {
-            const rideId =
-                Number(req.params.rideId);
+            const rideId = Number(req.params.rideId);
 
-            if (
-                !Number.isInteger(rideId) ||
-                rideId <= 0
-            ) {
+            if (!Number.isInteger(rideId) || rideId <= 0) {
                 return res.status(400).json({
                     success: false,
-                    message:
-                        'Invalid ride ID.',
+                    message: 'Invalid ride ID.',
                 });
             }
 
-            const uid =
-                getAuthenticatedUid(req);
+            const uid = getAuthenticatedUid(req);
 
             if (!uid) {
                 return res.status(401).json({
                     success: false,
-                    message:
-                        'Unauthenticated.',
+                    message: 'Unauthenticated.',
                 });
             }
 
-            const result =
-                await pool.query(
-                    `
-                    SELECT
-                        r.id,
-                        r.passenger_id,
-                        r.driver_id,
-                        r.pickup_address,
-                        r.destination_address,
+            const result = await pool.query(
+                `
+                SELECT
+                    r.id                        AS "rideId",
+                    r.passenger_id              AS "passengerId",
+                    r.driver_id                 AS "driverId",
 
-                        ST_Y(r.pickup)
-                            AS pickup_lat,
+                    r.pickup_address            AS "pickupAddress",
+                    r.destination_address       AS "destinationAddress",
 
-                        ST_X(r.pickup)
-                            AS pickup_lng,
+                    ST_Y(r.pickup)              AS "pickupLat",
+                    ST_X(r.pickup)              AS "pickupLng",
+                    ST_Y(r.destination)         AS "destLat",
+                    ST_X(r.destination)         AS "destLng",
 
-                        ST_Y(r.destination)
-                            AS dest_lat,
+                    r.distance                  AS "distanceKm",
+                    r.duration                  AS "durationMin",
+                    r.fare,
 
-                        ST_X(r.destination)
-                            AS dest_lng,
+                    r.driver_earnings           AS "driverEarnings",
+                    r.tegaara_commission        AS "tegaaraCommission",
 
-                        r.distance,
-                        r.duration,
-                        r.fare,
-                        r.payment_method,
-                        r.payment_status,
-                        r.status,
-                        r.ride_type,
-                        r.requested_at,
-                        r.completed_at,
+                    r.payment_method            AS "paymentMethod",
+                    r.payment_status            AS "paymentStatus",
 
-                        d.full_name
-                            AS driver_name,
+                    r.status,
+                    r.ride_type                 AS "rideType",
 
-                        d.profile_photo_url
-                            AS driver_photo,
+                    r.requested_at              AS "requestedAt",
+                    r.completed_at              AS "completedAt",
 
-                        d.current_latitude
-                            AS driver_lat,
+                    p.full_name                 AS "passengerName",
+                    p.profile_photo_url         AS "passengerPhotoUrl",
 
-                        d.current_longitude
-                            AS driver_lng,
+                    5.0                         AS "passengerRating",
+                    0                           AS "passengerRides",
 
-                        d.vehicle_type,
-                        d.vehicle_model,
-                        d.vehicle_color,
+                    d.full_name                 AS "driverName",
+                    d.profile_photo_url         AS "driverPhoto",
+                    d.current_latitude          AS "driverLat",
+                    d.current_longitude         AS "driverLng",
+                    d.vehicle_type              AS "vehicleType",
+                    d.vehicle_model             AS "vehicleModel",
+                    d.vehicle_color             AS "vehicleColor",
+                    d.registration_number       AS "vehicleRegistration",
+                    d.vehicle_year              AS "vehicleYear"
 
-                        d.registration_number
-                            AS vehicle_registration,
+                FROM public.rides r
 
-                        d.vehicle_year
+                LEFT JOIN public.passengers p
+                    ON p.id = r.passenger_id
 
-                    FROM public.rides r
+                LEFT JOIN public.drivers d
+                    ON d.uid = r.driver_id
 
-                    LEFT JOIN public.passengers p
-                        ON p.id = r.passenger_id
+                WHERE r.id = $1::integer
 
-                    LEFT JOIN public.drivers d
-                        ON d.uid = r.driver_id
+                  AND (
+                      p.firebase_uid = $2::text
+                      OR r.driver_id = $2::text
+                  )
 
-                    WHERE r.id = $1::integer
+                LIMIT 1
+                `,
+                [rideId, uid]
+            );
 
-                      AND (
-                          p.firebase_uid =
-                              $2::text
-
-                          OR r.driver_id =
-                              $2::text
-                      )
-
-                    LIMIT 1
-                    `,
-                    [rideId, uid]
-                );
-
-            if (
-                result.rows.length === 0
-            ) {
+            if (result.rows.length === 0) {
                 return res.status(404).json({
                     success: false,
                     message:
