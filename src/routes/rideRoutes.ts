@@ -121,14 +121,6 @@ async function restoreDriverAvailability(
 |--------------------------------------------------------------------------
 | DRIVER NOTIFICATION PERSISTENCE
 |--------------------------------------------------------------------------
-|
-| The in-app notifications list on the driver app reads from
-| public.driver_notifications. Pushes alone are not enough — the row must
-| exist server-side so the driver sees it in their notification centre
-| even if they missed / dismissed the push.
-|
-| This helper works with both a transaction client and the pool.
-|
 */
 
 interface DriverNotificationInput {
@@ -310,8 +302,6 @@ async function notifyNearbyDrivers(
     try {
         const radiusMeters = 5000;
 
-        // NOTE: also returns the numeric driver pk so we can persist
-        // a driver_notifications row for every notified driver.
         const result = await pool.query(
             `
             SELECT DISTINCT
@@ -365,10 +355,6 @@ async function notifyNearbyDrivers(
             return;
         }
 
-        // ---------------------------------------------------------------
-        // Persist a driver_notifications row for each notified driver.
-        // This is what makes the notification show up in the in-app list.
-        // ---------------------------------------------------------------
         const notifyMessage =
             `${rideData.passenger_name || 'A passenger'} → ` +
             `${rideData.destination_address || 'destination'}`;
@@ -540,12 +526,6 @@ async function notifyNearbyDrivers(
 /*
 |--------------------------------------------------------------------------
 | Notify Passenger (generic helper for ride lifecycle events)
-|--------------------------------------------------------------------------
-|
-| Centralises the "look up passenger FCM token → send push" flow used
-| by accept / arrived / started / completed, so the lifecycle endpoints
-| stay consistent.
-|
 |--------------------------------------------------------------------------
 */
 
@@ -1653,8 +1633,22 @@ router.post(
             );
 
             // -----------------------------------------------------------
-            // Clear every OTHER driver's "new_ride_request" ping for this
-            // ride so it disappears from their notifications list.
+            // (a) DELETE the ACCEPTING driver's own "new ride request"
+            //     row — the ride is theirs now, the offer is stale.
+            // -----------------------------------------------------------
+            await client.query(
+                `
+                DELETE FROM public.driver_notifications
+                WHERE ride_id = $1
+                  AND type = 'new_ride_request'
+                  AND driver_id = $2
+                `,
+                [rideId, driver.id]
+            );
+
+            // -----------------------------------------------------------
+            // (b) Mark every OTHER driver's offer as read so it
+            //     disappears from their unread list.
             // -----------------------------------------------------------
             await client.query(
                 `
@@ -1707,7 +1701,6 @@ router.post(
             // -----------------------------------------------------------
             // Persist a "ride_accepted" notification row for the driver
             // so it appears in their in-app notification list.
-            // (Do this inside the transaction, before COMMIT.)
             // -----------------------------------------------------------
             await insertDriverNotification(client, {
                 driverId: driver.id,
@@ -1850,86 +1843,6 @@ router.post(
             } catch (notificationError) {
                 console.error(
                     '❌ Passenger notification failed:',
-                    notificationError
-                );
-            }
-
-            /*
-            |----------------------------------------------------------
-            | Notify DRIVER — confirmation of their own acceptance
-            |----------------------------------------------------------
-            */
-            try {
-                const driverTokenResult =
-                    await pool.query(
-                        `
-                        SELECT token
-                        FROM public.fcm_tokens
-                        WHERE user_id = $1::text
-                        ORDER BY
-                            updated_at DESC NULLS LAST
-                        LIMIT 1
-                        `,
-                        [uid]
-                    );
-
-                const driverToken =
-                    driverTokenResult.rows[0]?.token;
-
-                if (driverToken) {
-                    await sendFcmNotification(
-                        driverToken,
-                        'Ride Accepted',
-                        `You accepted ride #${rideId}. Head to ${ride.pickupAddress || 'the pickup location'}.`,
-                        {
-                            role: 'driver',
-                            notificationType:
-                                'ride_accepted_driver',
-                            targetScreen: 'ride_details',
-                            status: 'accepted',
-                            rideId: String(rideId),
-                            passengerName:
-                                ride.passengerName || 'Passenger',
-                            passengerPhoto:
-                                ride.passengerPhotoUrl || '',
-                            pickupAddress:
-                                ride.pickupAddress || '',
-                            destinationAddress:
-                                ride.destinationAddress || '',
-                            pickupLat:
-                                ride.pickupLat != null
-                                    ? String(ride.pickupLat)
-                                    : '',
-                            pickupLng:
-                                ride.pickupLng != null
-                                    ? String(ride.pickupLng)
-                                    : '',
-                            destLat:
-                                ride.destLat != null
-                                    ? String(ride.destLat)
-                                    : '',
-                            destLng:
-                                ride.destLng != null
-                                    ? String(ride.destLng)
-                                    : '',
-                            fare:
-                                ride.fare != null
-                                    ? String(ride.fare)
-                                    : '',
-                            distanceKm:
-                                ride.distanceKm != null
-                                    ? String(ride.distanceKm)
-                                    : '',
-                            durationMin:
-                                ride.durationMin != null
-                                    ? String(ride.durationMin)
-                                    : '',
-                        }
-                    );
-                }
-            } catch (notificationError) {
-                console.error(
-                    '❌ Driver acceptance notification failed:',
                     notificationError
                 );
             }
@@ -2993,6 +2906,77 @@ router.post(
                 `✅ Ride ${rideId} completed. Driver ${uid} availability restored.`
             );
 
+            /*
+            |----------------------------------------------------------
+            | Notify DRIVER — their own "Ride Completed" notification
+            |----------------------------------------------------------
+            */
+            try {
+                const driverRow = await pool.query(
+                    `SELECT id FROM public.drivers WHERE uid = $1::text LIMIT 1`,
+                    [uid]
+                );
+
+                const driverNumericId = driverRow.rows[0]?.id;
+
+                if (driverNumericId) {
+                    await insertDriverNotification(pool, {
+                        driverId: driverNumericId,
+                        type: 'ride_completed',
+                        category: 'ride',
+                        title: 'Ride Completed',
+                        message:
+                            `Ride #${rideId} completed successfully. ` +
+                            `Earnings will be credited once the passenger pays.`,
+                        priority: 'normal',
+                        rideId,
+                        targetScreen: 'ride_details',
+                        metadata: {
+                            rideId,
+                            status: 'completed',
+                            fare: completedRide.fare ?? null,
+                        },
+                    });
+                }
+
+                const driverTokenRow = await pool.query(
+                    `
+                    SELECT token
+                    FROM public.fcm_tokens
+                    WHERE user_id = $1::text
+                    ORDER BY updated_at DESC NULLS LAST
+                    LIMIT 1
+                    `,
+                    [uid]
+                );
+
+                const driverToken = driverTokenRow.rows[0]?.token;
+
+                if (driverToken) {
+                    await sendFcmNotification(
+                        driverToken,
+                        'Ride Completed',
+                        `Ride #${rideId} completed. You'll be paid once the passenger pays.`,
+                        {
+                            role: 'driver',
+                            notificationType: 'ride_completed',
+                            targetScreen: 'ride_details',
+                            status: 'completed',
+                            rideId: String(rideId),
+                            fare:
+                                completedRide.fare != null
+                                    ? String(completedRide.fare)
+                                    : '',
+                        }
+                    );
+                }
+            } catch (notificationError) {
+                console.error(
+                    '❌ Driver completion notification failed:',
+                    notificationError
+                );
+            }
+
             // ── Notify the passenger that the ride is complete ──
             await notifyPassenger({
                 passengerId: completedRide.passenger_id,
@@ -3403,7 +3387,8 @@ router.post(
                     driver_id,
                     passenger_id,
                     status,
-                    completed_at
+                    completed_at,
+                    fare
                 `,
                 [nextStatus, rideId, uid, allowedFrom]
             );
@@ -3429,8 +3414,76 @@ router.post(
                 `✅ Ride ${rideId} status → ${nextStatus} (driver ${uid})`
             );
 
+            // ── Notify the DRIVER when status becomes 'completed' ──
+            if (isCompleted) {
+                try {
+                    const driverRow = await pool.query(
+                        `SELECT id FROM public.drivers WHERE uid = $1::text LIMIT 1`,
+                        [uid]
+                    );
+
+                    const driverNumericId = driverRow.rows[0]?.id;
+
+                    if (driverNumericId) {
+                        await insertDriverNotification(pool, {
+                            driverId: driverNumericId,
+                            type: 'ride_completed',
+                            category: 'ride',
+                            title: 'Ride Completed',
+                            message:
+                                `Ride #${rideId} completed successfully. ` +
+                                `Earnings will be credited once the passenger pays.`,
+                            priority: 'normal',
+                            rideId,
+                            targetScreen: 'ride_details',
+                            metadata: {
+                                rideId,
+                                status: 'completed',
+                                fare: updatedRide.fare ?? null,
+                            },
+                        });
+                    }
+
+                    const driverTokenRow = await pool.query(
+                        `
+                        SELECT token
+                        FROM public.fcm_tokens
+                        WHERE user_id = $1::text
+                        ORDER BY updated_at DESC NULLS LAST
+                        LIMIT 1
+                        `,
+                        [uid]
+                    );
+
+                    const driverToken = driverTokenRow.rows[0]?.token;
+
+                    if (driverToken) {
+                        await sendFcmNotification(
+                            driverToken,
+                            'Ride Completed',
+                            `Ride #${rideId} completed successfully.`,
+                            {
+                                role: 'driver',
+                                notificationType: 'ride_completed',
+                                targetScreen: 'ride_details',
+                                status: 'completed',
+                                rideId: String(rideId),
+                                fare:
+                                    updatedRide.fare != null
+                                        ? String(updatedRide.fare)
+                                        : '',
+                            }
+                        );
+                    }
+                } catch (notificationError) {
+                    console.error(
+                        '❌ Driver completion notification failed:',
+                        notificationError
+                    );
+                }
+            }
+
             // ── Notify the passenger for EVERY driver-side transition ──
-            //    (arrived / started / completed)
             try {
                 let title = '';
                 let body = '';
