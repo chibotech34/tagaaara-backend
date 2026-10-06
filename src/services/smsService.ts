@@ -1,102 +1,155 @@
-// ============================================================
-// HUBTEL SMS SERVICE
-// ============================================================
+import { sailupConfig, assertSailupConfigured } from '../config/sailup';
 
-// Hard cap on how long we wait for Hubtel before giving up.
-// Must be well below the client timeout (90 s in the Flutter
-// AuthService), and below typical reverse-proxy idle limits.
-const HUBTEL_TIMEOUT_MS = 15_000;
+export interface SendSmsResult {
+    success: boolean;
+    provider: 'sailup';
+    messageId?: string;
+    raw?: unknown;
+    error?: string;
+}
 
-export async function sendSms(
-    phone: string,
-    message: string
-): Promise<void> {
+/**
+ * Normalise Ghana phone numbers to E.164 digits (no "+").
+ *  "0244123456"    -> "233244123456"
+ *  "+233244123456" -> "233244123456"
+ *  "233244123456"  -> "233244123456"
+ *  "244123456"     -> "233244123456"
+ */
+export const normalizeGhanaPhone = (
+    phone: string | null | undefined,
+): string | null => {
+    if (!phone) return null;
+    const digits = String(phone).replace(/\D/g, '');
+    if (digits.length === 12 && digits.startsWith('233')) return digits;
+    if (digits.length === 10 && digits.startsWith('0')) return `233${digits.slice(1)}`;
+    if (digits.length === 9) return `233${digits}`;
+    return null;
+};
 
-    const hubtelUrl =
-        process.env.HUBTEL_SMS_URL ||
-        "https://smsc.hubtel.com/v1/messages/send";
+interface SailupResponse {
+    status?: string;
+    message?: string;
+    data?: { message_id?: string; id?: string } | unknown;
+    message_id?: string;
+    id?: string;
+    [key: string]: unknown;
+}
 
-    const clientId = process.env.HUBTEL_SMS_CLIENT_ID;
-    const clientSecret = process.env.HUBTEL_SMS_CLIENT_SECRET;
-    const senderId = process.env.HUBTEL_SMS_FROM;
+export const sendSms = async (
+    toPhone: string,
+    message: string,
+    senderId?: string,
+): Promise<SendSmsResult> => {
+    const normalized = normalizeGhanaPhone(toPhone);
 
-    if (!clientId) {
-        throw new Error("HUBTEL_SMS_CLIENT_ID is not configured");
+    if (!normalized) {
+        return {
+            success: false,
+            provider: 'sailup',
+            error: `Invalid phone number: ${toPhone}`,
+        };
     }
-    if (!clientSecret) {
-        throw new Error("HUBTEL_SMS_CLIENT_SECRET is not configured");
-    }
-    if (!senderId) {
-        throw new Error("HUBTEL_SMS_FROM is not configured");
-    }
-
-    const params = new URLSearchParams({
-        clientid: clientId,
-        clientsecret: clientSecret,
-        from: senderId,
-        to: phone,
-        content: message,
-    });
-
-    const url = `${hubtelUrl}?${params.toString()}`;
-
-    // --------------------------------------------------------
-    // ABORT CONTROLLER: hard timeout for the Hubtel call.
-    // Without this, a stalled Hubtel connection hangs the
-    // entire /send-otp request indefinitely.
-    // --------------------------------------------------------
-    const controller = new AbortController();
-    const timeoutId = setTimeout(
-        () => controller.abort(),
-        HUBTEL_TIMEOUT_MS,
-    );
-
-    const startedAt = Date.now();
 
     try {
-        const response = await fetch(url, {
-            method: "GET",
-            headers: { Accept: "application/json" },
+        assertSailupConfigured();
+    } catch (err) {
+        const e = err as { message?: string };
+        return {
+            success: false,
+            provider: 'sailup',
+            error: e.message ?? 'SailUp not configured',
+        };
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), sailupConfig.timeoutMs);
+
+    try {
+        const body = {
+            sender: senderId ?? sailupConfig.senderId,
+            recipient: normalized,
+            recipients: [normalized],
+            message,
+        };
+
+        const response = await fetch(sailupConfig.apiUrl, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${sailupConfig.apiKey}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+            },
+            body: JSON.stringify(body),
             signal: controller.signal,
         });
 
-        const responseText = await response.text();
-        const elapsed = Date.now() - startedAt;
+        const text = await response.text();
+        let json: SailupResponse | null = null;
+
+        try {
+            json = text ? (JSON.parse(text) as SailupResponse) : null;
+        } catch {
+            json = { raw: text };
+        }
 
         if (!response.ok) {
-            console.error("Hubtel SMS error:", {
+            console.error('❌ SailUp SMS failed:', {
                 status: response.status,
-                elapsedMs: elapsed,
-                response: responseText,
+                body: json ?? text,
             });
-            throw new Error(
-                `Hubtel SMS failed with status ${response.status}`,
-            );
+            return {
+                success: false,
+                provider: 'sailup',
+                raw: json,
+                error:
+                    (json?.message as string | undefined) ??
+                    `SailUp responded with HTTP ${response.status}`,
+            };
         }
 
-        console.log("Hubtel SMS sent:", {
-            elapsedMs: elapsed,
-            response: responseText,
-        });
-    } catch (err: any) {
-        const elapsed = Date.now() - startedAt;
+        const messageId =
+            json?.message_id ??
+            json?.id ??
+            (json?.data as { message_id?: string; id?: string } | undefined)?.message_id ??
+            (json?.data as { message_id?: string; id?: string } | undefined)?.id;
 
-        if (err?.name === "AbortError") {
-            console.error("Hubtel SMS request timed out:", {
-                elapsedMs: elapsed,
-                timeoutMs: HUBTEL_TIMEOUT_MS,
-            });
-            throw new Error(
-                `Hubtel SMS timed out after ${HUBTEL_TIMEOUT_MS} ms`,
-            );
+        console.log(`📨 SailUp SMS sent to ${normalized} (id=${messageId ?? 'n/a'})`);
+
+        return {
+            success: true,
+            provider: 'sailup',
+            messageId,
+            raw: json,
+        };
+    } catch (err: unknown) {
+        const e = err as { name?: string; message?: string };
+
+        if (e.name === 'AbortError') {
+            return {
+                success: false,
+                provider: 'sailup',
+                error: 'SailUp request timed out',
+            };
         }
 
-        console.error("Hubtel SMS request failed:", {
-            elapsedMs: elapsed,
-            error: err?.message ?? err,
-        });
-        throw err;
+        return {
+            success: false,
+            provider: 'sailup',
+            error: e.message ?? 'Unknown SailUp error',
+        };
     } finally {
-        clearTimeout(timeoutId);
+        clearTimeout(timeout);
     }
-}
+};
+
+export const sendOtpSms = async (
+    phone: string,
+    code: string,
+    ttlMinutes: number,
+): Promise<SendSmsResult> => {
+    const message =
+        `Your Tegaara verification code is ${code}. ` +
+        `It expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'}. ` +
+        `Do not share this code with anyone.`;
+    return sendSms(phone, message);
+};

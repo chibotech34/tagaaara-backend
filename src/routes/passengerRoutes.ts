@@ -14,7 +14,24 @@ import {
     firebaseMessaging,
 } from '../config/firebase';
 
+// ----- OTP integration -----
+import { createOtpRouter } from './otpRouterFactory';
+import { verifyOtp } from '../services/otpService';
+// ---------------------------
+
 const router = Router();
+
+/*
+|--------------------------------------------------------------------------
+| OTP endpoints (unauthenticated)
+|--------------------------------------------------------------------------
+| Mounts:
+|   POST /api/passengers/otp/send
+|   POST /api/passengers/otp/verify
+|--------------------------------------------------------------------------
+*/
+
+router.use('/otp', createOtpRouter('passenger'));
 
 /* ==========================================================================
  * TYPES
@@ -632,6 +649,41 @@ router.patch(
                             'INVALID_PHONE',
                     });
                 }
+
+                // ---- OTP phone-change gate (optional) ----
+                if (
+                    phone &&
+                    process.env.PROFILE_PHONE_CHANGE_REQUIRE_OTP === 'true'
+                ) {
+                    const otpValue = body.otp ?? body.otp_code;
+
+                    if (!otpValue) {
+                        client.release();
+                        return res.status(400).json({
+                            success: false,
+                            message:
+                                'OTP is required to change your phone number.',
+                            code: 'OTP_REQUIRED',
+                        });
+                    }
+
+                    const otpCheck = await verifyOtp({
+                        phone,
+                        code: String(otpValue),
+                        purpose: 'phone_change',
+                    });
+
+                    if (!otpCheck.success) {
+                        client.release();
+                        return res.status(400).json({
+                            success: false,
+                            message: otpCheck.message,
+                            code: 'OTP_VERIFICATION_FAILED',
+                            detail: otpCheck.errorCode,
+                        });
+                    }
+                }
+                // ---- end OTP gate ----
 
                 addField(
                     'phone',

@@ -11,7 +11,26 @@ import { createClient } from '@supabase/supabase-js';
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
+// ----- OTP integration -----
+import { createOtpRouter } from './otpRouterFactory';
+import { verifyOtp } from '../services/otpService';
+// ---------------------------
+
 const router = Router();
+
+/*
+|--------------------------------------------------------------------------
+| OTP endpoints (unauthenticated)
+|--------------------------------------------------------------------------
+| Mounts:
+|   POST /api/drivers/otp/send
+|   POST /api/drivers/otp/verify
+|
+| Phone-ownership verification only — no Firebase token required.
+|--------------------------------------------------------------------------
+*/
+
+router.use('/otp', createOtpRouter('driver'));
 
 /*
 |--------------------------------------------------------------------------
@@ -234,6 +253,36 @@ router.post(
                     code: 'REQUIRED_FIELDS_MISSING',
                 });
             }
+
+            // ---- OTP verification gate (optional) ----
+            const { otp } = req.body ?? {};
+
+            if (process.env.DRIVER_REGISTER_REQUIRE_OTP === 'true') {
+                if (!otp) {
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            'Phone verification is required. Please verify your phone number first.',
+                        code: 'OTP_REQUIRED',
+                    });
+                }
+
+                const otpCheck = await verifyOtp({
+                    phone,
+                    code: String(otp),
+                    purpose: 'registration',
+                });
+
+                if (!otpCheck.success) {
+                    return res.status(400).json({
+                        success: false,
+                        message: otpCheck.message,
+                        code: 'OTP_VERIFICATION_FAILED',
+                        detail: otpCheck.errorCode,
+                    });
+                }
+            }
+            // ---- end OTP gate ----
 
             if (uid !== decodedUid) {
                 return res.status(403).json({
