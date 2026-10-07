@@ -13,12 +13,17 @@ export interface SailupResponse {
     created_at: string;
 }
 
+/**
+ * Read all Sailup settings from the environment.
+ *
+ * There is deliberately NO hardcoded URL fallback. If SAILUP_API_URL is
+ * missing or empty, we throw at request time so the misconfiguration is
+ * obvious instead of silently hitting a wrong endpoint.
+ */
 const getSailupConfig = () => {
     const apiKey = process.env.SAILUP_API_KEY?.trim();
     const senderId = process.env.SAILUP_SENDER_ID?.trim();
-    const apiUrl =
-        process.env.SAILUP_API_URL?.trim() ||
-        'https://api.sailup.io/v1/sms/';
+    const apiUrl = process.env.SAILUP_API_URL?.trim();
 
     if (!apiKey) {
         throw new Error('SAILUP_API_KEY is not configured');
@@ -28,22 +33,31 @@ const getSailupConfig = () => {
         throw new Error('SAILUP_SENDER_ID is not configured');
     }
 
-    return {
-        apiKey,
-        senderId,
-        apiUrl,
-    };
+    if (!apiUrl) {
+        throw new Error(
+            'SAILUP_API_URL is not configured. ' +
+            'Set it in the environment (e.g. https://api.sailup.io/v1/sms/).',
+        );
+    }
+
+    // Optional: reject obviously wrong URLs early.
+    if (!/^https?:\/\//i.test(apiUrl)) {
+        throw new Error(
+            `SAILUP_API_URL must be an absolute http(s) URL, got: ${apiUrl}`,
+        );
+    }
+
+    return { apiKey, senderId, apiUrl };
 };
+
+const truncate = (value: string, max = 300): string =>
+    value.length > max ? `${value.slice(0, max)}…[truncated]` : value;
 
 export async function sendSailupSms(
     phone: string,
     message: string,
 ): Promise<SailupResponse> {
-    const {
-        apiKey,
-        senderId,
-        apiUrl,
-    } = getSailupConfig();
+    const { apiKey, senderId, apiUrl } = getSailupConfig();
 
     console.log('📨 Sending SMS via Sailup:', {
         url: apiUrl,
@@ -80,24 +94,29 @@ export async function sendSailupSms(
     }
 
     if (!response.ok) {
+        // Log a truncated view for debugging, but never propagate the raw
+        // provider body (which may be a huge HTML page) to callers.
+        const snippet =
+            typeof data === 'string'
+                ? truncate(data.replace(/\s+/g, ' '))
+                : truncate(JSON.stringify(data));
+
         console.error('❌ Sailup HTTP error:', {
             status: response.status,
             statusText: response.statusText,
-            response: data,
+            url: apiUrl,
+            snippet,
         });
 
         throw new Error(
-            `Sailup SMS failed with status ${response.status}: ${typeof data === 'string'
-                ? data
-                : JSON.stringify(data)
-            }`,
+            `Sailup SMS failed with status ${response.status} ${response.statusText}`,
         );
     }
 
     console.log('✅ Sailup SMS accepted:', data);
 
     return data as SailupResponse;
-};
+}
 
 
 /* -------------------------------------------------------------------------- */
@@ -116,17 +135,11 @@ export function normalizeGhanaPhone(
     let local: string;
 
     // +233XXXXXXXXX / 233XXXXXXXXX
-    if (
-        digits.startsWith('233') &&
-        digits.length === 12
-    ) {
+    if (digits.startsWith('233') && digits.length === 12) {
         local = digits.slice(3);
 
         // 0XXXXXXXXX
-    } else if (
-        digits.startsWith('0') &&
-        digits.length === 10
-    ) {
+    } else if (digits.startsWith('0') && digits.length === 10) {
         local = digits.slice(1);
 
         // XXXXXXXXX
@@ -164,13 +177,11 @@ export async function sendOtpSms(
 ): Promise<SendOtpSmsResult> {
     const message =
         `Your Tegaara verification code is: ${code}. ` +
-        `It expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'
-        }. ` +
+        `It expires in ${ttlMinutes} minute${ttlMinutes === 1 ? '' : 's'}. ` +
         `Do not share this code with anyone.`;
 
     try {
-        const normalizedPhone =
-            normalizeGhanaPhone(phone);
+        const normalizedPhone = normalizeGhanaPhone(phone);
 
         if (!normalizedPhone) {
             return {
@@ -179,10 +190,7 @@ export async function sendOtpSms(
             };
         }
 
-        const result = await sendSailupSms(
-            normalizedPhone,
-            message,
-        );
+        const result = await sendSailupSms(normalizedPhone, message);
 
         return {
             success: true,
@@ -190,20 +198,13 @@ export async function sendOtpSms(
         };
 
     } catch (error: unknown) {
-        const e = error as {
-            message?: string;
-        };
+        const e = error as { message?: string };
 
-        console.error(
-            '❌ sendOtpSms error:',
-            e.message ?? error,
-        );
+        console.error('❌ sendOtpSms error:', e.message ?? error);
 
         return {
             success: false,
-            error:
-                e.message ??
-                'Failed to send SMS via Sailup.',
+            error: e.message ?? 'Failed to send SMS via Sailup.',
         };
     }
 }
