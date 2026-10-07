@@ -115,6 +115,8 @@ export const sendOtp = async (options: SendOtpOptions): Promise<SendOtpResult> =
     const otpHash = hashOtp(normalized, code, purpose);
     const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
 
+    // `user_uid` and `max_attempts` are stored inside metadata because
+    // public.phone_otps has no dedicated columns for them.
     await createOtp({
         phone: normalized,
         otpHash,
@@ -178,7 +180,18 @@ export const verifyOtp = async (params: {
         };
     }
 
-    if (record.attempts >= record.max_attempts) {
+    // phone_otps has no `max_attempts` column — we use the service-level cap
+    // (and also honour a per-row override if it was written into metadata).
+    const perRowMax = (() => {
+        const m = record.metadata;
+        if (m && typeof m === 'object' && 'max_attempts' in m) {
+            const v = Number((m as Record<string, unknown>).max_attempts);
+            if (Number.isFinite(v) && v > 0) return v;
+        }
+        return OTP_MAX_ATTEMPTS;
+    })();
+
+    if (record.attempts >= perRowMax) {
         return {
             success: false,
             message: 'Too many invalid attempts. Please request a new code.',
@@ -191,7 +204,7 @@ export const verifyOtp = async (params: {
 
     if (!matches) {
         const attempts = await incrementAttempts(record.id);
-        const remaining = Math.max(record.max_attempts - attempts, 0);
+        const remaining = Math.max(perRowMax - attempts, 0);
 
         return {
             success: false,

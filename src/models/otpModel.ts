@@ -1,8 +1,3 @@
-/*
-|--------------------------------------------------------------------------
-| OTP Model — backed by public.phone_otps (existing table, extended)
-|--------------------------------------------------------------------------
-*/
 
 import pool from '../config/database';
 
@@ -21,13 +16,12 @@ export interface OtpRow {
     otp_hash: string;
     purpose: OtpPurpose;
     user_type: OtpUserType | null;
-    user_uid: string | null;
     expires_at: Date;
     verified: boolean;
     attempts: number;
-    max_attempts: number;
     last_sent_at: Date;
-    metadata: Record<string, unknown>;
+    metadata: Record<string, unknown> | null;
+    consumed_at: Date | null;
     created_at: Date;
     updated_at: Date;
 }
@@ -37,24 +31,38 @@ export interface CreateOtpInput {
     otpHash: string;
     purpose: OtpPurpose;
     userType?: OtpUserType | null;
+    /** Stored inside `metadata.user_uid` — there is no dedicated column. */
     userUid?: string | null;
     expiresAt: Date;
-    maxAttempts: number;
+    /** Stored inside `metadata.max_attempts` — there is no dedicated column. */
+    maxAttempts?: number;
     metadata?: Record<string, unknown>;
 }
 
 export const createOtp = async (input: CreateOtpInput): Promise<OtpRow> => {
+    const mergedMetadata: Record<string, unknown> = {
+        ...(input.metadata ?? {}),
+    };
+
+    if (input.userUid) {
+        mergedMetadata.user_uid = input.userUid;
+    }
+
+    if (typeof input.maxAttempts === 'number') {
+        mergedMetadata.max_attempts = input.maxAttempts;
+    }
+
     const result = await pool.query<OtpRow>(
         `
         INSERT INTO public.phone_otps (
-            phone, otp_hash, purpose, user_type, user_uid,
-            expires_at, verified, attempts, max_attempts,
+            phone, otp_hash, purpose, user_type,
+            expires_at, verified, attempts,
             last_sent_at, metadata, created_at, updated_at
         )
         VALUES (
-            $1, $2, $3, $4, $5,
-            $6, false, 0, $7,
-            NOW(), $8::jsonb, NOW(), NOW()
+            $1, $2, $3, $4,
+            $5, false, 0,
+            NOW(), $6::jsonb, NOW(), NOW()
         )
         RETURNING *
         `,
@@ -63,10 +71,10 @@ export const createOtp = async (input: CreateOtpInput): Promise<OtpRow> => {
             input.otpHash,
             input.purpose,
             input.userType ?? null,
-            input.userUid ?? null,
             input.expiresAt,
-            input.maxAttempts,
-            JSON.stringify(input.metadata ?? {}),
+            Object.keys(mergedMetadata).length > 0
+                ? JSON.stringify(mergedMetadata)
+                : null,
         ],
     );
 
@@ -84,6 +92,7 @@ export const findActiveOtp = async (
         WHERE phone = $1
           AND purpose = $2
           AND verified = false
+          AND consumed_at IS NULL
           AND expires_at > NOW()
         ORDER BY created_at DESC
         LIMIT 1
@@ -133,6 +142,7 @@ export const markVerified = async (id: number): Promise<void> => {
         `
         UPDATE public.phone_otps
         SET verified = true,
+            consumed_at = NOW(),
             updated_at = NOW()
         WHERE id = $1
         `,
@@ -148,10 +158,12 @@ export const invalidateOtps = async (
         `
         UPDATE public.phone_otps
         SET verified = true,
+            consumed_at = NOW(),
             updated_at = NOW()
         WHERE phone = $1
           AND purpose = $2
           AND verified = false
+          AND consumed_at IS NULL
         `,
         [phone, purpose],
     );
