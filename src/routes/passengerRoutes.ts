@@ -15,7 +15,8 @@ import {
 } from '../config/firebase';
 
 // ----- OTP integration -----
-import { createOtpRouter, verifyOtp } from './otpRouterFactory';
+import { createOtpRouter } from './otpRouterFactory';
+import { verifyOtp } from '../services/otpService';
 // ---------------------------
 
 const router = Router();
