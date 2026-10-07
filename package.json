@@ -9,7 +9,6 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",
-    "@zavudev/sdk": "^0.56.0",
     "axios": "^1.19.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

@@ -1,6 +1,5 @@
 import { Router, Request, Response } from 'express';
 import { sendOtp, verifyOtp, otpConfig } from '../services/otpService';
-// ⬇️ Swapped from '../services/smsService' (Zavu) → Sailup
 import { normalizeGhanaPhone } from '../services/sailup.service';
 import { firebaseAuth } from '../config/firebase';
 import pool from '../config/database';
@@ -83,8 +82,6 @@ export const createOtpRouter = (
 
     /* ================================================================
      * POST /otp/send
-     *
-     * Mounted as:
      *
      * Driver:
      * POST /api/drivers/otp/send
@@ -188,8 +185,7 @@ export const createOtpRouter = (
 
                     ...(result.code
                         ? {
-                            devCode:
-                                result.code,
+                            devCode: result.code,
                         }
                         : {}),
                 });
@@ -220,8 +216,6 @@ export const createOtpRouter = (
 
     /* ================================================================
      * POST /otp/verify
-     *
-     * Mounted as:
      *
      * Driver:
      * POST /api/drivers/otp/verify
@@ -254,7 +248,7 @@ export const createOtpRouter = (
 
                 // Support both:
                 // { otp: "123456" }
-                // and
+                // and:
                 // { code: "123456" }
                 const otpValue = otp ?? code;
 
@@ -309,13 +303,10 @@ export const createOtpRouter = (
                  * ======================================================== */
 
                 if (
-                    normalizedPurpose ===
-                    'login'
+                    normalizedPurpose === 'login'
                 ) {
                     const normalizedPhone =
-                        normalizeGhanaPhone(
-                            phone,
-                        );
+                        normalizeGhanaPhone(phone);
 
                     if (!normalizedPhone) {
                         return res.status(400).json({
@@ -404,3 +395,4 @@ export const createOtpRouter = (
 
     return router;
 };
+
