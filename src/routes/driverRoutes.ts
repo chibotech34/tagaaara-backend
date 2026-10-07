@@ -12,8 +12,7 @@ import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
 // ----- OTP integration -----
-import { createOtpRouter } from './otpRouterFactory';
-import { verifyOtp } from '../services/otpService';
+import { createOtpRouter, verifyOtp } from './otpRouterFactory';
 // ---------------------------
 
 const router = Router();
