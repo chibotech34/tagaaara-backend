@@ -13,7 +13,8 @@ import {
     type OtpUserType,
 } from '../models/otpModel';
 
-import { sendOtpSms, normalizeGhanaPhone } from './smsService';
+// ⬇️ Swapped from './smsService' (Zavu) → Sailup
+import { sendOtpSms, normalizeGhanaPhone } from './sailup.service';
 
 const OTP_LENGTH = Number(process.env.OTP_LENGTH ?? 6) || 6;
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES ?? 5) || 5;

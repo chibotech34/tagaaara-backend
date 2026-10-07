@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { sendOtp, verifyOtp, otpConfig } from '../services/otpService';
-import { normalizeGhanaPhone } from '../services/smsService';
+// ⬇️ Swapped from '../services/smsService' (Zavu) → Sailup
+import { normalizeGhanaPhone } from '../services/sailup.service';
 import { firebaseAuth } from '../config/firebase';
 import pool from '../config/database';
 import type { OtpPurpose, OtpUserType } from '../models/otpModel';
