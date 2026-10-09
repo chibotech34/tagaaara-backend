@@ -340,6 +340,372 @@ const getUserFcmToken = async (
 };
 
 /* ==========================================================================
+ * POST /api/passengers/register
+ *
+ * Creates the passenger record after Firebase authentication.
+ *
+ * The OTP verification step (in otpRouterFactory) creates the Firebase
+ * user and returns a custom token. The client signs in with that token,
+ * then calls this endpoint to persist the passenger profile row.
+ *
+ * Idempotent: if a passenger row already exists for this Firebase UID,
+ * the existing record is returned with 200 instead of an error.
+ *
+ * Accepts both camelCase (from Flutter) and snake_case field names.
+ * ========================================================================== */
+
+router.post(
+    '/register',
+    verifyFirebaseToken,
+    async (
+        req: AuthenticatedRequest,
+        res: Response,
+    ) => {
+        try {
+            const uid = getAuthenticatedUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Authenticated user not found.',
+                    code: 'AUTH_USER_MISSING',
+                });
+            }
+
+            const body = req.body ?? {};
+
+            if (
+                typeof body !== 'object' ||
+                Array.isArray(body) ||
+                body === null
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Request body must be a JSON object.',
+                    code: 'INVALID_REQUEST_BODY',
+                });
+            }
+
+            // Accept either camelCase or snake_case keys.
+            const pick = (
+                camel: string,
+                snake: string,
+            ): unknown => {
+                const c = body[camel];
+                if (c !== undefined && c !== null && c !== '') {
+                    return c;
+                }
+                const s = body[snake];
+                if (s !== undefined && s !== null && s !== '') {
+                    return s;
+                }
+                return null;
+            };
+
+            const fullName = String(
+                pick('fullName', 'full_name') ?? '',
+            ).trim();
+
+            const phone = String(
+                pick('phone', 'phone') ?? '',
+            ).trim();
+
+            const email = String(
+                pick('email', 'email') ?? '',
+            )
+                .trim()
+                .toLowerCase();
+
+            const gender = String(
+                pick('gender', 'gender') ?? '',
+            ).trim();
+
+            const emergencyContactName = String(
+                pick(
+                    'emergencyContactName',
+                    'emergency_contact_name',
+                ) ?? '',
+            ).trim();
+
+            const emergencyContactPhone = String(
+                pick(
+                    'emergencyContactPhone',
+                    'emergency_contact_phone',
+                ) ?? '',
+            ).trim();
+
+            const emergencyRelationship = String(
+                pick(
+                    'emergencyRelationship',
+                    'emergency_relationship',
+                ) ?? '',
+            ).trim();
+
+            const homeAddress = String(
+                pick('homeAddress', 'home_address') ?? '',
+            ).trim();
+
+            const region = String(
+                pick('region', 'region') ?? '',
+            ).trim();
+
+            const district = String(
+                pick('district', 'district') ?? '',
+            ).trim();
+
+            const townCity = String(
+                pick('townCity', 'town_city') ?? '',
+            ).trim();
+
+            const preferredPaymentMethod = String(
+                pick(
+                    'preferredPaymentMethod',
+                    'preferred_payment_method',
+                ) ?? '',
+            ).trim();
+
+            const mobileMoneyNumber = String(
+                pick(
+                    'mobileMoneyNumber',
+                    'mobile_money_number',
+                ) ?? '',
+            ).trim();
+
+            const languagePreference = String(
+                pick(
+                    'languagePreference',
+                    'language_preference',
+                ) ?? '',
+            ).trim();
+
+            const savedLocationsRaw = pick(
+                'savedLocations',
+                'saved_locations',
+            );
+
+            const savedLocations = Array.isArray(savedLocationsRaw)
+                ? savedLocationsRaw
+                : [];
+
+            const notificationRaw = pick(
+                'notificationEnabled',
+                'notification_enabled',
+            );
+
+            const notificationEnabled =
+                notificationRaw === null
+                    ? true
+                    : Boolean(notificationRaw);
+
+            const privacyRaw = pick(
+                'privacyEnabled',
+                'privacy_enabled',
+            );
+
+            const privacyEnabled =
+                privacyRaw === null
+                    ? true
+                    : Boolean(privacyRaw);
+
+            const onlineRaw = pick('isOnline', 'is_online');
+
+            const isOnline =
+                onlineRaw === null ? true : Boolean(onlineRaw);
+
+            const latitude = Number(
+                pick('latitude', 'current_latitude'),
+            );
+
+            const longitude = Number(
+                pick('longitude', 'current_longitude'),
+            );
+
+            const hasCoords =
+                Number.isFinite(latitude) &&
+                Number.isFinite(longitude);
+
+            if (!fullName) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Full name is required.',
+                    code: 'MISSING_FULL_NAME',
+                });
+            }
+
+            if (!phone) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Phone number is required.',
+                    code: 'MISSING_PHONE',
+                });
+            }
+
+            // Idempotency: if the row already exists, return it.
+            const existing = await pool.query(
+                `
+                SELECT *
+                FROM public.passengers
+                WHERE firebase_uid = $1
+                LIMIT 1
+                `,
+                [uid],
+            );
+
+            if (existing.rows.length > 0) {
+                return res.status(200).json({
+                    success: true,
+                    message: 'Passenger already registered.',
+                    alreadyExists: true,
+                    passenger: existing.rows[0],
+                });
+            }
+
+            const insertResult = await pool.query(
+                `
+                INSERT INTO public.passengers (
+                    firebase_uid,
+                    full_name,
+                    phone,
+                    email,
+                    gender,
+                    emergency_contact_name,
+                    emergency_contact_phone,
+                    emergency_relationship,
+                    home_address,
+                    region,
+                    district,
+                    town_city,
+                    saved_locations,
+                    preferred_payment_method,
+                    mobile_money_number,
+                    language_preference,
+                    notification_enabled,
+                    privacy_enabled,
+                    is_online,
+                    current_latitude,
+                    current_longitude,
+                    last_location_update,
+                    last_online_at,
+                    account_status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1,  $2,  $3,  $4,  $5,
+                    $6,  $7,  $8,  $9,  $10,
+                    $11, $12, $13::jsonb,
+                    $14, $15, $16, $17, $18,
+                    $19,
+                    $20, $21, $22,
+                    $23,
+                    'active',
+                    NOW(),
+                    NOW()
+                )
+                RETURNING *
+                `,
+                [
+                    uid,
+                    fullName,
+                    phone,
+                    email || null,
+                    gender || null,
+                    emergencyContactName || null,
+                    emergencyContactPhone || null,
+                    emergencyRelationship || null,
+                    homeAddress || null,
+                    region || null,
+                    district || null,
+                    townCity || null,
+                    JSON.stringify(savedLocations),
+                    preferredPaymentMethod || null,
+                    mobileMoneyNumber || null,
+                    languagePreference || null,
+                    notificationEnabled,
+                    privacyEnabled,
+                    isOnline,
+                    hasCoords ? latitude : null,
+                    hasCoords ? longitude : null,
+                    hasCoords ? new Date() : null,
+                    new Date(),
+                ],
+            );
+
+            console.log(`✅ Passenger registered: ${uid}`);
+
+            return res.status(201).json({
+                success: true,
+                message: 'Passenger registered successfully.',
+                alreadyExists: false,
+                passenger: insertResult.rows[0],
+            });
+        } catch (error: unknown) {
+            const e = error as {
+                message?: string;
+                code?: string;
+                detail?: string;
+                constraint?: string;
+            };
+
+            console.error('❌ Passenger registration error:', e);
+
+            // Unique violation (e.g. phone already registered) → try
+            // to return the existing row instead of failing.
+            if (e.code === '23505') {
+                try {
+                    const uid = getAuthenticatedUid(
+                        req as AuthenticatedRequest,
+                    );
+
+                    if (uid) {
+                        const existing = await pool.query(
+                            `
+                            SELECT *
+                            FROM public.passengers
+                            WHERE firebase_uid = $1
+                            LIMIT 1
+                            `,
+                            [uid],
+                        );
+
+                        if (existing.rows.length > 0) {
+                            return res.status(200).json({
+                                success: true,
+                                message:
+                                    'Passenger already registered.',
+                                alreadyExists: true,
+                                passenger: existing.rows[0],
+                            });
+                        }
+                    }
+                } catch {
+                    // ignore and fall through
+                }
+
+                return res.status(409).json({
+                    success: false,
+                    message: 'Passenger record already exists.',
+                    code: 'PASSENGER_ALREADY_EXISTS',
+                });
+            }
+
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to register passenger.',
+                code:
+                    e.code ??
+                    'PASSENGER_REGISTRATION_FAILED',
+                error:
+                    e.message ??
+                    'Unknown database error',
+                detail: e.detail ?? null,
+                constraint: e.constraint ?? null,
+            });
+        }
+    },
+);
+
+/* ==========================================================================
  * GET /api/passengers/profile
  * ========================================================================== */
 
