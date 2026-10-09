@@ -3,6 +3,7 @@ import { sendOtp, verifyOtp, otpConfig } from '../services/otpService';
 import { normalizeGhanaPhone } from '../services/sailup.service';
 import { firebaseAuth } from '../config/firebase';
 import pool from '../config/database';
+import { findLatestOtp } from '../models/otpModel';
 import type { OtpPurpose, OtpUserType } from '../models/otpModel';
 
 const ALLOWED_PURPOSES: OtpPurpose[] = [
@@ -357,7 +358,164 @@ export const createOtpRouter = (
                 }
 
                 /* ========================================================
-                 * NON-LOGIN OTP
+                 * REGISTRATION
+                 *
+                 * After successful OTP verification:
+                 *
+                 * 1. Normalize phone
+                 * 2. Reject if the phone number is already registered
+                 *    for this role (drivers/passengers).
+                 * 3. Create (or reuse) the Firebase user tied to that
+                 *    phone number.
+                 * 4. Return a Firebase custom token so Flutter can
+                 *    signInWithCustomToken() and then persist the
+                 *    driver/passenger record via its own DB service.
+                 * ======================================================== */
+
+                if (
+                    normalizedPurpose === 'registration'
+                ) {
+                    const normalizedPhone =
+                        normalizeGhanaPhone(phone);
+
+                    if (!normalizedPhone) {
+                        return res.status(400).json({
+                            success: false,
+                            message:
+                                'Invalid phone number.',
+                            code: 'INVALID_PHONE',
+                        });
+                    }
+
+                    // 1) Reject duplicate registration
+                    //    (same phone, same role).
+                    const existing =
+                        await findExistingUser(
+                            userType,
+                            normalizedPhone,
+                        );
+
+                    if (existing) {
+                        return res.status(409).json({
+                            success: false,
+                            message:
+                                'This phone number is already registered. ' +
+                                'Please register with a different phone number.',
+                            code: 'PHONE_ALREADY_EXISTS',
+                            uid: existing.uid,
+                        });
+                    }
+
+                    // 2) Pull the metadata captured at /otp/send time.
+                    //    findLatestOtp does NOT filter on consumed_at,
+                    //    so this still works after verifyOtp() has
+                    //    marked the row verified.
+                    const latestOtp = await findLatestOtp(
+                        normalizedPhone,
+                        'registration',
+                    );
+
+                    const registrationMetadata =
+                        (latestOtp?.metadata as Record<
+                            string,
+                            unknown
+                        > | null) ?? {};
+
+                    const fullName =
+                        typeof registrationMetadata.fullName ===
+                            'string'
+                            ? (
+                                registrationMetadata.fullName as string
+                            ).trim()
+                            : '';
+
+                    const email =
+                        typeof registrationMetadata.email ===
+                            'string'
+                            ? (
+                                registrationMetadata.email as string
+                            ).trim().toLowerCase()
+                            : '';
+
+                    // 3) Create the Firebase user (or reuse one already
+                    //    tied to this phone number so we don't 500 on
+                    //    client retries).
+                    let firebaseUid: string;
+
+                    try {
+                        const firebaseUser =
+                            await firebaseAuth.createUser({
+                                phoneNumber:
+                                    normalizedPhone,
+
+                                displayName:
+                                    fullName || undefined,
+
+                                email:
+                                    email || undefined,
+                            });
+
+                        firebaseUid = firebaseUser.uid;
+                    } catch (createErr: unknown) {
+                        const ce = createErr as {
+                            code?: string;
+                        };
+
+                        if (
+                            ce?.code ===
+                            'auth/phone-number-already-exists' ||
+                            ce?.code ===
+                            'auth/email-already-exists'
+                        ) {
+                            // The auth user exists but is not yet in our
+                            // drivers/passengers table. Reuse it and let
+                            // the client persist the profile.
+                            try {
+                                const existingFb =
+                                    await firebaseAuth.getUserByPhoneNumber(
+                                        normalizedPhone,
+                                    );
+
+                                firebaseUid =
+                                    existingFb.uid;
+                            } catch {
+                                return res.status(409).json({
+                                    success: false,
+                                    message:
+                                        'This phone number is already registered. ' +
+                                        'Please register with a different phone number.',
+                                    code: 'PHONE_ALREADY_EXISTS',
+                                });
+                            }
+                        } else {
+                            throw createErr;
+                        }
+                    }
+
+                    // 4) Return a custom token so Flutter can sign in
+                    //    and persist the driver/passenger record via
+                    //    its own DB service.
+                    const customToken =
+                        await firebaseAuth.createCustomToken(
+                            firebaseUid,
+                        );
+
+                    return res.status(200).json({
+                        success: true,
+                        message:
+                            'OTP verified successfully.',
+                        purpose:
+                            normalizedPurpose,
+                        phone,
+                        userType,
+                        uid: firebaseUid,
+                        customToken,
+                    });
+                }
+
+                /* ========================================================
+                 * NON-LOGIN / NON-REGISTRATION OTP
+                 * (phone_change, password_reset, general)
                  * ======================================================== */
 
                 return res.status(200).json({
@@ -395,4 +553,3 @@ export const createOtpRouter = (
 
     return router;
 };
-
