@@ -14,6 +14,7 @@ import {
     verifyTransaction,
     generateReference,
     fromPesewas,
+    submitOtp,
     type PaystackProvider,
 } from '../services/paystackService';
 
@@ -172,8 +173,6 @@ async function notifyDriverPaymentReceived(
 
 /* ==========================================================================
  * PAYSTACK: APPLY A SUCCESSFUL PAYMENT (idempotent)
- *
- * NOTE: now uses `wallets` / `transactions` (the actual tables).
  * ========================================================================== */
 
 export async function applySuccessfulPayment(
@@ -524,7 +523,8 @@ export async function applySuccessfulPayment(
                 UPDATE public.rides
                 SET payment_status     = 'paid',
                     driver_earnings    = $1::numeric,
-                    tegaara_commission = $2::numeric
+                    tegaara_commission = $2::numeric,
+                    paid_at            = NOW()
                 WHERE id = $3::integer
                 `,
                 [driverEarnings, commission, ride.id],
@@ -1738,6 +1738,175 @@ router.post(
 );
 
 /* ==========================================================================
+ * PAYSTACK: SUBMIT OTP FOR WALLET TOP-UP
+ * ========================================================================== */
+
+router.post(
+    '/passengers/wallet/topup/submit-otp',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.body?.reference ?? '').trim();
+        const otp = String(req.body?.otp ?? '').trim();
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reference is required.',
+            });
+        }
+        if (!otp) {
+            return res.status(400).json({
+                success: false,
+                message: 'OTP is required.',
+            });
+        }
+
+        try {
+            const txResult = await pool.query(
+                `
+                SELECT *
+                FROM public.paystack_transactions
+                WHERE reference = $1
+                  AND user_firebase_uid = $2
+                  AND purpose = 'wallet_topup'
+                LIMIT 1
+                `,
+                [reference, uid],
+            );
+
+            if (txResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Top-up not found.',
+                });
+            }
+
+            const tx = txResult.rows[0];
+
+            if (tx.applied === true) {
+                const walletResult = await pool.query(
+                    `
+                    SELECT balance
+                    FROM public.wallets
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [tx.wallet_id],
+                );
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: true,
+                    newBalance: walletResult.rows[0]
+                        ? Number(walletResult.rows[0].balance) || 0
+                        : null,
+                });
+            }
+
+            let submitResult;
+            try {
+                submitResult = await submitOtp({ reference, otp });
+            } catch (otpErr: any) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'send_otp',
+                    message:
+                        otpErr?.message ??
+                        'Incorrect code. Please try again.',
+                });
+            }
+
+            await pool.query(
+                `
+                UPDATE public.paystack_transactions
+                SET status          = $1,
+                    paystack_verify = $2::jsonb,
+                    updated_at      = NOW()
+                WHERE reference = $3
+                `,
+                [
+                    submitResult.status,
+                    JSON.stringify(submitResult.raw),
+                    reference,
+                ],
+            );
+
+            if (submitResult.status === 'success') {
+                const applied = await applySuccessfulPayment(
+                    reference,
+                    submitResult.raw?.data ?? submitResult.raw ?? {},
+                );
+                const walletResult = await pool.query(
+                    `
+                    SELECT balance
+                    FROM public.wallets
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [tx.wallet_id],
+                );
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: applied.alreadyApplied,
+                    newBalance: walletResult.rows[0]
+                        ? Number(walletResult.rows[0].balance) || 0
+                        : null,
+                });
+            }
+
+            if (submitResult.status === 'send_otp') {
+                return res.status(200).json({
+                    success: true,
+                    status: 'send_otp',
+                    message:
+                        submitResult.displayText ||
+                        'Incorrect or expired code. Please try again.',
+                });
+            }
+
+            if (
+                submitResult.status === 'failed' ||
+                submitResult.status === 'reversed'
+            ) {
+                return res.status(200).json({
+                    success: false,
+                    status: 'failed',
+                    message:
+                        submitResult.displayText ||
+                        'OTP verification failed.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                status: submitResult.status || 'pay_offline',
+                message:
+                    submitResult.displayText ||
+                    'Now enter your MoMo PIN on your phone to confirm.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet/topup/submit-otp failed:',
+                error,
+            );
+            return res.status(500).json({
+                success: false,
+                message: error?.message ?? 'Failed to submit OTP.',
+            });
+        }
+    },
+);
+
+/* ==========================================================================
  * PAYSTACK: VERIFY WALLET TOP-UP
  * ========================================================================== */
 
@@ -2045,6 +2214,153 @@ router.post(
                 message:
                     error?.message ??
                     'Failed to initiate mobile money charge.',
+            });
+        }
+    },
+);
+
+/* ==========================================================================
+ * PAYSTACK: SUBMIT OTP FOR DIRECT RIDE PAYMENT
+ * ========================================================================== */
+
+router.post(
+    '/passengers/wallet/pay/submit-otp',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.body?.reference ?? '').trim();
+        const otp = String(req.body?.otp ?? '').trim();
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reference is required.',
+            });
+        }
+        if (!otp) {
+            return res.status(400).json({
+                success: false,
+                message: 'OTP is required.',
+            });
+        }
+
+        try {
+            const txResult = await pool.query(
+                `
+                SELECT *
+                FROM public.paystack_transactions
+                WHERE reference = $1
+                  AND user_firebase_uid = $2
+                  AND purpose = 'ride_payment'
+                LIMIT 1
+                `,
+                [reference, uid],
+            );
+
+            if (txResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Payment not found.',
+                });
+            }
+
+            const tx = txResult.rows[0];
+
+            if (tx.applied === true) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: true,
+                    rideId: tx.ride_id,
+                });
+            }
+
+            let submitResult;
+            try {
+                submitResult = await submitOtp({ reference, otp });
+            } catch (otpErr: any) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'send_otp',
+                    message:
+                        otpErr?.message ??
+                        'Incorrect code. Please try again.',
+                });
+            }
+
+            await pool.query(
+                `
+                UPDATE public.paystack_transactions
+                SET status          = $1,
+                    paystack_verify = $2::jsonb,
+                    updated_at      = NOW()
+                WHERE reference = $3
+                `,
+                [
+                    submitResult.status,
+                    JSON.stringify(submitResult.raw),
+                    reference,
+                ],
+            );
+
+            if (submitResult.status === 'success') {
+                const applied = await applySuccessfulPayment(
+                    reference,
+                    submitResult.raw?.data ?? submitResult.raw ?? {},
+                );
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: applied.alreadyApplied,
+                    rideId: tx.ride_id,
+                });
+            }
+
+            if (submitResult.status === 'send_otp') {
+                return res.status(200).json({
+                    success: true,
+                    status: 'send_otp',
+                    message:
+                        submitResult.displayText ||
+                        'Incorrect or expired code. Please try again.',
+                });
+            }
+
+            if (
+                submitResult.status === 'failed' ||
+                submitResult.status === 'reversed'
+            ) {
+                return res.status(200).json({
+                    success: false,
+                    status: 'failed',
+                    message:
+                        submitResult.displayText ||
+                        'OTP verification failed.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                status: submitResult.status || 'pay_offline',
+                message:
+                    submitResult.displayText ||
+                    'Now enter your MoMo PIN on your phone to confirm.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet/pay/submit-otp failed:',
+                error,
+            );
+            return res.status(500).json({
+                success: false,
+                message: error?.message ?? 'Failed to submit OTP.',
             });
         }
     },
