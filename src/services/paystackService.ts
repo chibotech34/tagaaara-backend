@@ -44,7 +44,7 @@ export interface PaystackVerifyResult {
 
 export function generateReference(
     purpose: 'topup' | 'ride',
-    userId: string
+    userId: string,
 ): string {
     const suffix = crypto.randomBytes(6).toString('hex');
     const userPart = userId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10);
@@ -61,6 +61,13 @@ export function fromPesewas(pesewas: number): number {
 
 /* ==========================================================================
  * INITIATE MOBILE MONEY CHARGE
+ *
+ * Possible `status` values returned by Paystack:
+ *   - "pay_offline"  → user approves on their phone (USSD prompt)
+ *   - "send_otp"     → Paystack sent an SMS code; app must collect it
+ *                      and call submitOtp()
+ *   - "success"      → already completed
+ *   - "pending"      → awaiting approval
  * ========================================================================== */
 
 export async function initializeMobileMoneyCharge(params: {
@@ -108,7 +115,7 @@ export async function initializeMobileMoneyCharge(params: {
                     'Content-Type': 'application/json',
                 },
                 timeout: 20_000,
-            }
+            },
         );
 
         const data = response.data?.data ?? {};
@@ -118,7 +125,7 @@ export async function initializeMobileMoneyCharge(params: {
             status: String(data.status ?? 'pending'),
             displayText: String(
                 data.display_text ??
-                'Please approve the payment prompt on your phone.'
+                'Please approve the payment prompt on your phone.',
             ),
             raw: response.data,
         };
@@ -134,11 +141,76 @@ export async function initializeMobileMoneyCharge(params: {
 }
 
 /* ==========================================================================
+ * SUBMIT OTP
+ *
+ * Called when Paystack returns `status: 'send_otp'` from /charge.
+ * The user has received a 6-digit code by SMS; we relay it back.
+ *
+ * Possible responses:
+ *   - "success"      → charge completed
+ *   - "send_otp"     → code was wrong; user should try again
+ *   - "pending"      → awaiting further action (rare)
+ *   - "failed"       → charge failed permanently
+ * ========================================================================== */
+
+export async function submitOtp(params: {
+    reference: string;
+    otp: string;
+}): Promise<PaystackChargeResult> {
+    const { reference, otp } = params;
+
+    if (!reference || !reference.trim()) {
+        throw new Error('Reference is required.');
+    }
+
+    if (!otp || !otp.trim()) {
+        throw new Error('OTP is required.');
+    }
+
+    try {
+        const response = await axios.post(
+            `${PAYSTACK_BASE_URL}/charge/submit_otp`,
+            {
+                reference: reference.trim(),
+                otp: otp.trim(),
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${getSecretKey()}`,
+                    'Content-Type': 'application/json',
+                },
+                timeout: 20_000,
+            },
+        );
+
+        const data = response.data?.data ?? {};
+
+        return {
+            reference: data.reference ?? reference,
+            status: String(data.status ?? 'pending'),
+            displayText: String(
+                data.display_text ??
+                'OTP submitted. Waiting for confirmation.',
+            ),
+            raw: response.data,
+        };
+    } catch (error) {
+        const err = error as AxiosError<any>;
+        const message =
+            err.response?.data?.message ||
+            err.message ||
+            'Failed to submit OTP.';
+
+        throw new Error(message);
+    }
+}
+
+/* ==========================================================================
  * VERIFY TRANSACTION
  * ========================================================================== */
 
 export async function verifyTransaction(
-    reference: string
+    reference: string,
 ): Promise<PaystackVerifyResult> {
     if (!reference || !reference.trim()) {
         throw new Error('Reference is required.');
@@ -147,14 +219,14 @@ export async function verifyTransaction(
     try {
         const response = await axios.get(
             `${PAYSTACK_BASE_URL}/transaction/verify/${encodeURIComponent(
-                reference
+                reference,
             )}`,
             {
                 headers: {
                     Authorization: `Bearer ${getSecretKey()}`,
                 },
                 timeout: 20_000,
-            }
+            },
         );
 
         const data = response.data?.data ?? {};
@@ -188,7 +260,7 @@ export async function verifyTransaction(
 
 export function verifyWebhookSignature(
     rawBody: Buffer | string,
-    signature: string | undefined
+    signature: string | undefined,
 ): boolean {
     if (!signature) return false;
 
