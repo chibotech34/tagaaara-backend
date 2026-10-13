@@ -29,15 +29,9 @@ const FLAT_COMMISSION = 2.0;
  * AUTH HELPER
  * ========================================================================== */
 
-function getAuthenticatedUid(
-    req: AuthenticatedRequest
-): string | null {
+function getAuthenticatedUid(req: AuthenticatedRequest): string | null {
     const uid = req.decodedToken?.uid;
-
-    if (!uid || typeof uid !== 'string' || !uid.trim()) {
-        return null;
-    }
-
+    if (!uid || typeof uid !== 'string' || !uid.trim()) return null;
     return uid.trim();
 }
 
@@ -69,27 +63,25 @@ async function notifyDriverPaymentReceived(
             ORDER BY updated_at DESC NULLS LAST
             LIMIT 1
             `,
-            [driverFirebaseUid]
+            [driverFirebaseUid],
         );
-
         driverToken = tokenResult.rows[0]?.token ?? null;
     } catch (lookupError) {
         console.error(
             '❌ Driver payment FCM — token lookup failed:',
-            lookupError
+            lookupError,
         );
         return;
     }
 
     if (!driverToken) {
         console.log(
-            `ℹ️ Driver payment FCM — no token for UID ${driverFirebaseUid}`
+            `ℹ️ Driver payment FCM — no token for UID ${driverFirebaseUid}`,
         );
         return;
     }
 
     const title = 'Payment Received';
-
     const body =
         `You earned GH₵${driverEarnings.toFixed(2)} ` +
         `for ride #${rideId}.`;
@@ -99,22 +91,15 @@ async function notifyDriverPaymentReceived(
         notificationType: 'payment_received',
         targetScreen: 'driver_wallet',
         status: 'paid',
-
         rideId: String(rideId),
-
         amount: driverEarnings.toFixed(2),
         fare: fare.toFixed(2),
         commission: commission.toFixed(2),
-
         newBalance:
-            newDriverBalance != null
-                ? newDriverBalance.toFixed(2)
-                : '',
-
+            newDriverBalance != null ? newDriverBalance.toFixed(2) : '',
         passengerName,
         pickupAddress,
         destinationAddress,
-
         title,
         body,
     };
@@ -122,15 +107,11 @@ async function notifyDriverPaymentReceived(
     try {
         await firebaseMessaging.send({
             token: driverToken,
-
             notification: { title, body },
-
             data,
-
             android: {
                 priority: 'high',
                 ttl: 60 * 1000,
-
                 notification: {
                     channelId: 'tegaara_ride_channel',
                     priority: 'high' as const,
@@ -140,13 +121,11 @@ async function notifyDriverPaymentReceived(
                     clickAction: 'FLUTTER_NOTIFICATION_CLICK',
                 },
             },
-
             apns: {
                 headers: {
                     'apns-priority': '10',
                     'apns-push-type': 'alert',
                 },
-
                 payload: {
                     aps: {
                         alert: { title, body },
@@ -158,7 +137,6 @@ async function notifyDriverPaymentReceived(
                 },
             },
         });
-
         console.log(
             `📨 payment_received sent to driver ${driverFirebaseUid} ` +
             `for ride ${rideId} ` +
@@ -166,7 +144,7 @@ async function notifyDriverPaymentReceived(
             `balance=${newDriverBalance != null
                 ? newDriverBalance.toFixed(2)
                 : 'n/a'
-            })`
+            })`,
         );
     } catch (error: any) {
         if (
@@ -176,38 +154,31 @@ async function notifyDriverPaymentReceived(
             try {
                 await pool.query(
                     `DELETE FROM public.fcm_tokens WHERE token = $1`,
-                    [driverToken]
+                    [driverToken],
                 );
-
                 console.log(
-                    `🧹 Removed stale FCM token for driver ${driverFirebaseUid}`
+                    `🧹 Removed stale FCM token for driver ${driverFirebaseUid}`,
                 );
             } catch (deleteError) {
                 console.error(
                     '❌ Failed deleting invalid FCM token:',
-                    deleteError
+                    deleteError,
                 );
             }
         }
-
         console.error('❌ Driver payment FCM failed:', error);
     }
 }
 
 /* ==========================================================================
  * PAYSTACK: APPLY A SUCCESSFUL PAYMENT (idempotent)
- * ==========================================================================
- * Called by BOTH:
- *   - the verify endpoint (client polls)
- *   - the Paystack webhook (authoritative)
  *
- * Uses a DB transaction + row lock on paystack_transactions.reference so
- * concurrent callers cannot double-credit.
+ * NOTE: now uses `wallets` / `transactions` (the actual tables).
  * ========================================================================== */
 
 export async function applySuccessfulPayment(
     reference: string,
-    paystackData: Record<string, any>
+    paystackData: Record<string, any>,
 ): Promise<{
     applied: boolean;
     alreadyApplied: boolean;
@@ -219,7 +190,6 @@ export async function applySuccessfulPayment(
     try {
         await client.query('BEGIN');
 
-        /* Lock the paystack_transactions row. */
         const txRowResult = await client.query(
             `
             SELECT *
@@ -228,13 +198,13 @@ export async function applySuccessfulPayment(
             LIMIT 1
             FOR UPDATE
             `,
-            [reference]
+            [reference],
         );
 
         if (txRowResult.rows.length === 0) {
             await client.query('ROLLBACK');
             console.warn(
-                `⚠️ applySuccessfulPayment: ref ${reference} not found.`
+                `⚠️ applySuccessfulPayment: ref ${reference} not found.`,
             );
             return {
                 applied: false,
@@ -246,24 +216,19 @@ export async function applySuccessfulPayment(
 
         const txRow = txRowResult.rows[0];
 
-        /* Idempotency guard — still surface current balance to callers. */
         if (txRow.applied === true) {
             let newBalance: number | null = null;
 
-            if (
-                txRow.purpose === 'wallet_topup' &&
-                txRow.wallet_id
-            ) {
+            if (txRow.purpose === 'wallet_topup' && txRow.wallet_id) {
                 const walletResult = await client.query(
                     `
                     SELECT balance
-                    FROM public.passenger_wallets
+                    FROM public.wallets
                     WHERE id = $1
                     LIMIT 1
                     `,
-                    [txRow.wallet_id]
+                    [txRow.wallet_id],
                 );
-
                 if (walletResult.rows.length > 0) {
                     newBalance =
                         Number(walletResult.rows[0].balance) || 0;
@@ -271,12 +236,10 @@ export async function applySuccessfulPayment(
             }
 
             await client.query('ROLLBACK');
-
             console.log(
                 `ℹ️ applySuccessfulPayment: ref ${reference} already applied ` +
-                `(purpose=${txRow.purpose})`
+                `(purpose=${txRow.purpose})`,
             );
-
             return {
                 applied: true,
                 alreadyApplied: true,
@@ -285,7 +248,6 @@ export async function applySuccessfulPayment(
             };
         }
 
-        /* Amount sanity check. Paystack sends pesewas. */
         const paidPesewas = Number(paystackData?.amount) || 0;
         const paidGHS = fromPesewas(paidPesewas);
         const expectedGHS = Number(txRow.amount) || 0;
@@ -293,9 +255,8 @@ export async function applySuccessfulPayment(
         if (Math.abs(paidGHS - expectedGHS) > 0.01) {
             console.error(
                 `⚠️ Paystack ref=${reference}: amount mismatch. ` +
-                `paid=${paidGHS} expected=${expectedGHS}`
+                `paid=${paidGHS} expected=${expectedGHS}`,
             );
-
             await client.query(
                 `
                 UPDATE public.paystack_transactions
@@ -304,11 +265,9 @@ export async function applySuccessfulPayment(
                     updated_at      = NOW()
                 WHERE reference = $2
                 `,
-                [JSON.stringify(paystackData), reference]
+                [JSON.stringify(paystackData), reference],
             );
-
             await client.query('COMMIT');
-
             return {
                 applied: false,
                 alreadyApplied: false,
@@ -318,7 +277,6 @@ export async function applySuccessfulPayment(
         }
 
         const payloadJson = JSON.stringify(paystackData);
-
         let newBalance: number | null = null;
 
         /* ==================================================================
@@ -327,41 +285,43 @@ export async function applySuccessfulPayment(
         if (txRow.purpose === 'wallet_topup') {
             const walletResult = await client.query(
                 `
-                SELECT id, balance
-                FROM public.passenger_wallets
+                SELECT id, passenger_id, balance
+                FROM public.wallets
                 WHERE id = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [txRow.wallet_id]
+                [txRow.wallet_id],
             );
 
             if (walletResult.rows.length === 0) {
                 throw new Error(
-                    `Wallet ${txRow.wallet_id} not found for ref ${reference}`
+                    `Wallet ${txRow.wallet_id} not found for ref ${reference}`,
                 );
             }
 
             const walletId = walletResult.rows[0].id;
+            const passengerId = walletResult.rows[0].passenger_id;
             const balanceBefore =
                 Number(walletResult.rows[0].balance) || 0;
             const balanceAfter = balanceBefore + expectedGHS;
 
             await client.query(
                 `
-                UPDATE public.passenger_wallets
+                UPDATE public.wallets
                 SET balance             = $1::numeric,
                     last_transaction_at = NOW(),
                     updated_at          = NOW()
                 WHERE id = $2
                 `,
-                [balanceAfter, walletId]
+                [balanceAfter, walletId],
             );
 
             await client.query(
                 `
-                INSERT INTO public.passenger_transactions (
+                INSERT INTO public.transactions (
                     wallet_id,
+                    passenger_id,
                     type,
                     amount,
                     balance_before,
@@ -370,29 +330,33 @@ export async function applySuccessfulPayment(
                     payment_method,
                     provider,
                     description,
-                    created_at
+                    created_at,
+                    updated_at
                 )
                 VALUES (
-                    $1::integer,
+                    $1::bigint,
+                    $2::integer,
                     'topup',
-                    $2::numeric,
                     $3::numeric,
                     $4::numeric,
+                    $5::numeric,
                     'completed',
                     'paystack_momo',
-                    $5::varchar,
-                    $6::text,
+                    $6::varchar,
+                    $7::text,
+                    NOW(),
                     NOW()
                 )
                 `,
                 [
                     walletId,
+                    passengerId,
                     expectedGHS,
                     balanceBefore,
                     balanceAfter,
                     txRow.provider ?? 'mtn',
                     `Paystack top-up • ref ${reference}`,
-                ]
+                ],
             );
 
             newBalance = balanceAfter;
@@ -417,12 +381,12 @@ export async function applySuccessfulPayment(
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [txRow.ride_id]
+                [txRow.ride_id],
             );
 
             if (rideResult.rows.length === 0) {
                 throw new Error(
-                    `Ride ${txRow.ride_id} not found for ref ${reference}`
+                    `Ride ${txRow.ride_id} not found for ref ${reference}`,
                 );
             }
 
@@ -439,16 +403,14 @@ export async function applySuccessfulPayment(
                         updated_at      = NOW()
                     WHERE reference = $2
                     `,
-                    [payloadJson, reference]
+                    [payloadJson, reference],
                 );
 
                 await client.query('COMMIT');
-
                 console.log(
                     `ℹ️ applySuccessfulPayment: ride ${ride.id} already paid, ` +
-                    `ref ${reference} marked applied.`
+                    `ref ${reference} marked applied.`,
                 );
-
                 return {
                     applied: true,
                     alreadyApplied: true,
@@ -470,7 +432,7 @@ export async function applySuccessfulPayment(
                     WHERE uid = $1::text
                     LIMIT 1
                     `,
-                    [ride.driver_id]
+                    [ride.driver_id],
                 );
 
                 const driverNumericId = driverLookup.rows[0]?.id;
@@ -484,7 +446,7 @@ export async function applySuccessfulPayment(
                         LIMIT 1
                         FOR UPDATE
                         `,
-                        [driverNumericId]
+                        [driverNumericId],
                     );
 
                     if (driverWallet.rows.length > 0) {
@@ -501,50 +463,62 @@ export async function applySuccessfulPayment(
                                 updated_at          = NOW()
                             WHERE id = $2
                             `,
-                            [dwAfter, dwId]
+                            [dwAfter, dwId],
                         );
 
                         await client.query(
                             `
                             INSERT INTO public.driver_transactions (
+                                driver_id,
                                 wallet_id,
                                 ride_id,
-                                type,
                                 amount,
+                                type,
+                                status,
                                 balance_before,
                                 balance_after,
-                                status,
-                                payment_method,
+                                transaction_reference,
                                 description,
-                                created_at
+                                metadata,
+                                created_at,
+                                updated_at
                             )
                             VALUES (
-                                $1::integer,
-                                $2::integer,
-                                'ride_earning',
-                                $3::numeric,
+                                $1::bigint,
+                                $2::bigint,
+                                $3::integer,
                                 $4::numeric,
-                                $5::numeric,
+                                'ride_earning',
                                 'completed',
-                                'paystack_momo',
-                                $6::text,
+                                $5::numeric,
+                                $6::numeric,
+                                'PAYSTACK-' || $3 || '-' ||
+                                    extract(epoch from now())::bigint,
+                                $7::text,
+                                $8::jsonb,
+                                NOW(),
                                 NOW()
                             )
                             `,
                             [
+                                driverNumericId,
                                 dwId,
                                 ride.id,
                                 driverEarnings,
                                 dwBefore,
                                 dwAfter,
                                 `Earnings from ride #${ride.id}`,
-                            ]
+                                JSON.stringify({
+                                    ride_id: ride.id,
+                                    passenger_id: ride.passenger_id,
+                                    source: 'paystack',
+                                }),
+                            ],
                         );
                     }
                 }
             }
 
-            /* Update ride + record passenger transaction. */
             await client.query(
                 `
                 UPDATE public.rides
@@ -553,17 +527,17 @@ export async function applySuccessfulPayment(
                     tegaara_commission = $2::numeric
                 WHERE id = $3::integer
                 `,
-                [driverEarnings, commission, ride.id]
+                [driverEarnings, commission, ride.id],
             );
 
             const walletLookup = await client.query(
                 `
                 SELECT id, balance
-                FROM public.passenger_wallets
+                FROM public.wallets
                 WHERE passenger_id = $1
                 LIMIT 1
                 `,
-                [ride.passenger_id]
+                [ride.passenger_id],
             );
 
             if (walletLookup.rows.length > 0) {
@@ -573,8 +547,9 @@ export async function applySuccessfulPayment(
 
                 await client.query(
                     `
-                    INSERT INTO public.passenger_transactions (
+                    INSERT INTO public.transactions (
                         wallet_id,
+                        passenger_id,
                         ride_id,
                         type,
                         amount,
@@ -583,33 +558,36 @@ export async function applySuccessfulPayment(
                         status,
                         payment_method,
                         description,
-                        created_at
+                        created_at,
+                        updated_at
                     )
                     VALUES (
-                        $1::integer,
+                        $1::bigint,
                         $2::integer,
+                        $3::integer,
                         'ride_payment',
-                        $3::numeric,
                         $4::numeric,
-                        $4::numeric,
+                        $5::numeric,
+                        $5::numeric,
                         'completed',
                         'paystack_momo',
-                        $5::text,
+                        $6::text,
+                        NOW(),
                         NOW()
                     )
                     `,
                     [
                         wId,
+                        ride.passenger_id,
                         ride.id,
                         fare,
                         wBal,
                         `MoMo payment for ride #${ride.id}`,
-                    ]
+                    ],
                 );
             }
         }
 
-        /* Mark our row as applied. */
         await client.query(
             `
             UPDATE public.paystack_transactions
@@ -620,14 +598,13 @@ export async function applySuccessfulPayment(
                 updated_at      = NOW()
             WHERE reference = $2
             `,
-            [payloadJson, reference]
+            [payloadJson, reference],
         );
 
         await client.query('COMMIT');
-
         console.log(
             `✅ applySuccessfulPayment OK: ref=${reference} ` +
-            `purpose=${txRow.purpose} balance=${newBalance ?? 'n/a'}`
+            `purpose=${txRow.purpose} balance=${newBalance ?? 'n/a'}`,
         );
 
         return {
@@ -642,12 +619,10 @@ export async function applySuccessfulPayment(
         } catch (_) {
             /* ignore */
         }
-
         console.error(
             `❌ applySuccessfulPayment failed (ref=${reference}):`,
-            error
+            error,
         );
-
         return {
             applied: false,
             alreadyApplied: false,
@@ -668,7 +643,6 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -684,7 +658,7 @@ router.get(
                 WHERE firebase_uid = $1::text
                 LIMIT 1
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -704,16 +678,14 @@ router.get(
                     balance,
                     pending_balance      AS "pendingBalance",
                     total_spent          AS "totalSpent",
-                    currency,
-                    is_active            AS "isActive",
                     last_transaction_at  AS "lastTransactionAt",
                     created_at           AS "createdAt",
                     updated_at           AS "updatedAt"
-                FROM public.passenger_wallets
+                FROM public.wallets
                 WHERE passenger_id = $1
                 LIMIT 1
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             if (walletResult.rows.length === 0) {
@@ -723,32 +695,31 @@ router.get(
                 });
             }
 
-            const wallet = walletResult.rows[0];
+            const w = walletResult.rows[0];
 
             return res.status(200).json({
                 success: true,
                 wallet: {
-                    id: wallet.id,
-                    passengerId: wallet.passenger_id,
-                    balance: Number(wallet.balance) || 0,
-                    pendingBalance: Number(wallet.pendingBalance) || 0,
-                    totalSpent: Number(wallet.totalSpent) || 0,
-                    currency: wallet.currency || 'GHS',
-                    isActive: wallet.isActive ?? true,
-                    lastTransactionAt: wallet.lastTransactionAt,
-                    createdAt: wallet.createdAt,
-                    updatedAt: wallet.updatedAt,
+                    id: w.id,
+                    passengerId: w.passenger_id,
+                    balance: Number(w.balance) || 0,
+                    pendingBalance: Number(w.pendingBalance) || 0,
+                    totalSpent: Number(w.totalSpent) || 0,
+                    currency: 'GHS',
+                    isActive: true,
+                    lastTransactionAt: w.lastTransactionAt,
+                    createdAt: w.createdAt,
+                    updatedAt: w.updatedAt,
                 },
             });
         } catch (error) {
             console.error('❌ GET /passengers/wallet failed:', error);
-
             return res.status(500).json({
                 success: false,
                 message: 'Failed to load wallet.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -760,7 +731,6 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -776,7 +746,7 @@ router.post(
                 WHERE firebase_uid = $1::text
                 LIMIT 1
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -796,35 +766,31 @@ router.post(
                     balance,
                     pending_balance      AS "pendingBalance",
                     total_spent          AS "totalSpent",
-                    currency,
-                    is_active            AS "isActive",
                     last_transaction_at  AS "lastTransactionAt",
                     created_at           AS "createdAt",
                     updated_at           AS "updatedAt"
-                FROM public.passenger_wallets
+                FROM public.wallets
                 WHERE passenger_id = $1
                 LIMIT 1
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             if (existing.rows.length > 0) {
+                const w = existing.rows[0];
                 return res.status(200).json({
                     success: true,
                     wallet: {
-                        id: existing.rows[0].id,
-                        passengerId: existing.rows[0].passenger_id,
-                        balance: Number(existing.rows[0].balance) || 0,
-                        pendingBalance:
-                            Number(existing.rows[0].pendingBalance) || 0,
-                        totalSpent:
-                            Number(existing.rows[0].totalSpent) || 0,
-                        currency: existing.rows[0].currency || 'GHS',
-                        isActive: existing.rows[0].isActive ?? true,
-                        lastTransactionAt:
-                            existing.rows[0].lastTransactionAt,
-                        createdAt: existing.rows[0].createdAt,
-                        updatedAt: existing.rows[0].updatedAt,
+                        id: w.id,
+                        passengerId: w.passenger_id,
+                        balance: Number(w.balance) || 0,
+                        pendingBalance: Number(w.pendingBalance) || 0,
+                        totalSpent: Number(w.totalSpent) || 0,
+                        currency: 'GHS',
+                        isActive: true,
+                        lastTransactionAt: w.lastTransactionAt,
+                        createdAt: w.createdAt,
+                        updatedAt: w.updatedAt,
                     },
                     message: 'Wallet already exists.',
                 });
@@ -832,23 +798,19 @@ router.post(
 
             const insert = await pool.query(
                 `
-                INSERT INTO public.passenger_wallets (
+                INSERT INTO public.wallets (
                     passenger_id,
                     balance,
                     pending_balance,
                     total_spent,
-                    currency,
-                    is_active,
                     created_at,
                     updated_at
                 )
                 VALUES (
                     $1::integer,
-                    0,
-                    0,
-                    0,
-                    'GHS',
-                    true,
+                    0.00,
+                    0.00,
+                    0.00,
                     NOW(),
                     NOW()
                 )
@@ -858,13 +820,11 @@ router.post(
                     balance,
                     pending_balance      AS "pendingBalance",
                     total_spent          AS "totalSpent",
-                    currency,
-                    is_active            AS "isActive",
                     last_transaction_at  AS "lastTransactionAt",
                     created_at           AS "createdAt",
                     updated_at           AS "updatedAt"
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             const w = insert.rows[0];
@@ -877,23 +837,27 @@ router.post(
                     balance: Number(w.balance) || 0,
                     pendingBalance: Number(w.pendingBalance) || 0,
                     totalSpent: Number(w.totalSpent) || 0,
-                    currency: w.currency || 'GHS',
-                    isActive: w.isActive ?? true,
+                    currency: 'GHS',
+                    isActive: true,
                     lastTransactionAt: w.lastTransactionAt,
                     createdAt: w.createdAt,
                     updatedAt: w.updatedAt,
                 },
                 message: 'Wallet created successfully.',
             });
-        } catch (error) {
-            console.error('❌ POST /passengers/wallet failed:', error);
-
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet failed:',
+                error?.code,
+                error?.message,
+                error?.detail,
+            );
             return res.status(500).json({
                 success: false,
                 message: 'Failed to create wallet.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -905,7 +869,6 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -921,7 +884,7 @@ router.get(
                 WHERE firebase_uid = $1::text
                 LIMIT 1
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -939,7 +902,6 @@ router.get(
                     r.id                   AS ride_id,
                     r.fare                 AS amount,
                     r.completed_at,
-
                     d.uid                  AS driver_id,
                     d.full_name            AS driver_name,
                     d.profile_photo_url    AS driver_photo_url,
@@ -948,22 +910,18 @@ router.get(
                     d.vehicle_color,
                     d.registration_number  AS vehicle_registration,
                     d.vehicle_year
-
                 FROM public.rides r
-
                 LEFT JOIN public.drivers d
                     ON d.uid = r.driver_id
-
                 WHERE r.passenger_id = $1::integer
                   AND r.status = 'completed'
                   AND (r.payment_status IS NULL
                        OR r.payment_status <> 'paid')
                   AND r.driver_id IS NOT NULL
-
                 ORDER BY r.completed_at DESC NULLS LAST, r.id DESC
                 LIMIT 1
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             if (rideResult.rows.length === 0) {
@@ -980,15 +938,14 @@ router.get(
         } catch (error) {
             console.error(
                 '❌ GET /passengers/wallet/pending-payment-ride failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message: 'Failed to load pending payment ride.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1000,7 +957,6 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1038,7 +994,7 @@ router.post(
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -1054,12 +1010,12 @@ router.post(
             const walletResult = await client.query(
                 `
                 SELECT id, balance
-                FROM public.passenger_wallets
+                FROM public.wallets
                 WHERE passenger_id = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             if (walletResult.rows.length === 0) {
@@ -1072,25 +1028,27 @@ router.post(
             }
 
             const walletId = walletResult.rows[0].id;
-            const balanceBefore = Number(walletResult.rows[0].balance) || 0;
+            const balanceBefore =
+                Number(walletResult.rows[0].balance) || 0;
             const balanceAfter = balanceBefore + amount;
 
             await client.query(
                 `
-                UPDATE public.passenger_wallets
+                UPDATE public.wallets
                 SET
-                    balance            = $1::numeric,
+                    balance             = $1::numeric,
                     last_transaction_at = NOW(),
                     updated_at          = NOW()
                 WHERE id = $2
                 `,
-                [balanceAfter, walletId]
+                [balanceAfter, walletId],
             );
 
             await client.query(
                 `
-                INSERT INTO public.passenger_transactions (
+                INSERT INTO public.transactions (
                     wallet_id,
+                    passenger_id,
                     type,
                     amount,
                     balance_before,
@@ -1098,28 +1056,32 @@ router.post(
                     status,
                     payment_method,
                     provider,
-                    created_at
+                    created_at,
+                    updated_at
                 )
                 VALUES (
-                    $1::integer,
+                    $1::bigint,
+                    $2::integer,
                     'topup',
-                    $2::numeric,
                     $3::numeric,
                     $4::numeric,
+                    $5::numeric,
                     'completed',
-                    $5::varchar,
                     $6::varchar,
+                    $7::varchar,
+                    NOW(),
                     NOW()
                 )
                 `,
                 [
                     walletId,
+                    passengerId,
                     amount,
                     balanceBefore,
                     balanceAfter,
                     paymentMethod,
                     provider,
-                ]
+                ],
             );
 
             await client.query('COMMIT');
@@ -1133,9 +1095,10 @@ router.post(
             try {
                 await client.query('ROLLBACK');
             } catch (_) { }
-
-            console.error('❌ POST /passengers/wallet/topup failed:', error);
-
+            console.error(
+                '❌ POST /passengers/wallet/topup failed:',
+                error,
+            );
             return res.status(500).json({
                 success: false,
                 message: 'Failed to process top-up.',
@@ -1143,7 +1106,7 @@ router.post(
         } finally {
             client.release();
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1155,7 +1118,6 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1165,14 +1127,14 @@ router.get(
 
         const page = Math.max(
             parseInt(String(req.query.page ?? '1'), 10) || 1,
-            1
+            1,
         );
         const limit = Math.min(
             Math.max(
                 parseInt(String(req.query.limit ?? '20'), 10) || 20,
-                1
+                1,
             ),
-            100
+            100,
         );
         const offset = (page - 1) * limit;
 
@@ -1184,7 +1146,7 @@ router.get(
                 WHERE firebase_uid = $1::text
                 LIMIT 1
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -1210,14 +1172,12 @@ router.get(
                     t.payment_method,
                     t.provider,
                     t.created_at
-                FROM public.passenger_transactions t
-                INNER JOIN public.passenger_wallets w
-                    ON w.id = t.wallet_id
-                WHERE w.passenger_id = $1::integer
+                FROM public.transactions t
+                WHERE t.passenger_id = $1::integer
                 ORDER BY t.created_at DESC, t.id DESC
                 LIMIT $2 OFFSET $3
                 `,
-                [passengerId, limit, offset]
+                [passengerId, limit, offset],
             );
 
             return res.status(200).json({
@@ -1227,15 +1187,14 @@ router.get(
         } catch (error) {
             console.error(
                 '❌ GET /passengers/transactions failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message: 'Failed to load transactions.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1247,7 +1206,6 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1264,7 +1222,6 @@ router.post(
                 message: 'A valid ride_id is required.',
             });
         }
-
         if (!Number.isFinite(amountInput) || amountInput <= 0) {
             return res.status(400).json({
                 success: false,
@@ -1285,7 +1242,7 @@ router.post(
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -1316,7 +1273,7 @@ router.post(
                 LIMIT 1
                 FOR UPDATE OF r
                 `,
-                [rideId, passengerId]
+                [rideId, passengerId],
             );
 
             if (rideResult.rows.length === 0) {
@@ -1348,19 +1305,18 @@ router.post(
 
             const fare = Number(rideInfo.fare) || 0;
             const amount = fare > 0 ? fare : amountInput;
-
             const commission = Math.min(FLAT_COMMISSION, amount);
             const driverEarnings = Math.max(0, amount - commission);
 
             const passengerWalletResult = await client.query(
                 `
                 SELECT id, balance
-                FROM public.passenger_wallets
+                FROM public.wallets
                 WHERE passenger_id = $1
                 LIMIT 1
                 FOR UPDATE
                 `,
-                [passengerId]
+                [passengerId],
             );
 
             if (passengerWalletResult.rows.length === 0) {
@@ -1396,7 +1352,7 @@ router.post(
 
             await client.query(
                 `
-                UPDATE public.passenger_wallets
+                UPDATE public.wallets
                 SET
                     balance             = $1::numeric,
                     total_spent         = COALESCE(total_spent, 0) + $2::numeric,
@@ -1404,7 +1360,7 @@ router.post(
                     updated_at          = NOW()
                 WHERE id = $3
                 `,
-                [passengerBalanceAfter, amount, passengerWalletId]
+                [passengerBalanceAfter, amount, passengerWalletId],
             );
 
             const driverResult = await client.query(
@@ -1414,7 +1370,7 @@ router.post(
                 WHERE uid = $1::text
                 LIMIT 1
                 `,
-                [rideInfo.driver_id]
+                [rideInfo.driver_id],
             );
 
             let newDriverBalance: number | null = null;
@@ -1430,7 +1386,7 @@ router.post(
                     LIMIT 1
                     FOR UPDATE
                     `,
-                    [driverNumericId]
+                    [driverNumericId],
                 );
 
                 if (driverWalletResult.rows.length > 0) {
@@ -1451,52 +1407,66 @@ router.post(
                             updated_at          = NOW()
                         WHERE id = $2
                         `,
-                        [newDriverBalance, driverWalletId]
+                        [newDriverBalance, driverWalletId],
                     );
 
                     await client.query(
                         `
                         INSERT INTO public.driver_transactions (
+                            driver_id,
                             wallet_id,
                             ride_id,
-                            type,
                             amount,
+                            type,
+                            status,
                             balance_before,
                             balance_after,
-                            status,
-                            payment_method,
+                            transaction_reference,
                             description,
-                            created_at
+                            metadata,
+                            created_at,
+                            updated_at
                         )
                         VALUES (
-                            $1::integer,
-                            $2::integer,
-                            'ride_earning',
-                            $3::numeric,
+                            $1::bigint,
+                            $2::bigint,
+                            $3::integer,
                             $4::numeric,
-                            $5::numeric,
+                            'ride_earning',
                             'completed',
-                            'in_app',
-                            $6::text,
+                            $5::numeric,
+                            $6::numeric,
+                            'WALLET-' || $3 || '-' ||
+                                extract(epoch from now())::bigint,
+                            $7::text,
+                            $8::jsonb,
+                            NOW(),
                             NOW()
                         )
                         `,
                         [
+                            driverNumericId,
                             driverWalletId,
                             rideId,
                             driverEarnings,
                             driverBalanceBefore,
                             newDriverBalance,
                             `Earnings from ride #${rideId}`,
-                        ]
+                            JSON.stringify({
+                                ride_id: rideId,
+                                passenger_id: passengerId,
+                                source: 'wallet',
+                            }),
+                        ],
                     );
                 }
             }
 
             await client.query(
                 `
-                INSERT INTO public.passenger_transactions (
+                INSERT INTO public.transactions (
                     wallet_id,
+                    passenger_id,
                     ride_id,
                     type,
                     amount,
@@ -1505,29 +1475,33 @@ router.post(
                     status,
                     payment_method,
                     description,
-                    created_at
+                    created_at,
+                    updated_at
                 )
                 VALUES (
-                    $1::integer,
+                    $1::bigint,
                     $2::integer,
+                    $3::integer,
                     'ride_payment',
-                    $3::numeric,
                     $4::numeric,
                     $5::numeric,
+                    $6::numeric,
                     'completed',
                     'wallet',
-                    $6::text,
+                    $7::text,
+                    NOW(),
                     NOW()
                 )
                 `,
                 [
                     passengerWalletId,
+                    passengerId,
                     rideId,
                     amount,
                     passengerBalanceBefore,
                     passengerBalanceAfter,
                     `Payment for ride #${rideId}`,
-                ]
+                ],
             );
 
             await client.query(
@@ -1536,10 +1510,11 @@ router.post(
                 SET
                     payment_status     = 'paid',
                     driver_earnings    = $1::numeric,
-                    tegaara_commission = $2::numeric
+                    tegaara_commission = $2::numeric,
+                    paid_at            = NOW()
                 WHERE id = $3::integer
                 `,
-                [driverEarnings, commission, rideId]
+                [driverEarnings, commission, rideId],
             );
 
             await client.query('COMMIT');
@@ -1548,7 +1523,7 @@ router.post(
                 `✅ Ride ${rideId} paid by passenger ${uid}. ` +
                 `fare=${amount.toFixed(2)} ` +
                 `driverEarnings=${driverEarnings.toFixed(2)} ` +
-                `commission=${commission.toFixed(2)}`
+                `commission=${commission.toFixed(2)}`,
             );
 
             void notifyDriverPaymentReceived(
@@ -1560,7 +1535,7 @@ router.post(
                 newDriverBalance,
                 passengerName,
                 rideInfo.pickup_address ?? '',
-                rideInfo.destination_address ?? ''
+                rideInfo.destination_address ?? '',
             );
 
             return res.status(200).json({
@@ -1578,12 +1553,10 @@ router.post(
             try {
                 await client.query('ROLLBACK');
             } catch (_) { }
-
             console.error(
                 '❌ POST /passengers/wallet/pay failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message: 'Failed to process payment.',
@@ -1593,7 +1566,7 @@ router.post(
         } finally {
             client.release();
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1605,7 +1578,6 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1615,9 +1587,9 @@ router.post(
 
         const amount = Number(req.body?.amount);
         const phone = String(req.body?.phone ?? '').trim();
-        const provider = String(
-            req.body?.provider ?? ''
-        ).trim().toLowerCase() as PaystackProvider;
+        const provider = String(req.body?.provider ?? '')
+            .trim()
+            .toLowerCase() as PaystackProvider;
 
         if (!Number.isFinite(amount) || amount <= 0) {
             return res.status(400).json({
@@ -1625,14 +1597,12 @@ router.post(
                 message: 'A valid amount is required.',
             });
         }
-
         if (!['mtn', 'vod', 'atl'].includes(provider)) {
             return res.status(400).json({
                 success: false,
                 message: 'Unsupported mobile money provider.',
             });
         }
-
         if (phone.length < 6) {
             return res.status(400).json({
                 success: false,
@@ -1648,12 +1618,12 @@ router.post(
                        p.email,
                        w.id AS wallet_id
                 FROM public.passengers p
-                LEFT JOIN public.passenger_wallets w
+                LEFT JOIN public.wallets w
                     ON w.passenger_id = p.id
                 WHERE p.firebase_uid = $1::text
                 LIMIT 1
                 `,
-                [uid]
+                [uid],
             );
 
             if (passengerResult.rows.length === 0) {
@@ -1698,7 +1668,7 @@ router.post(
                     $1, $2, 'wallet_topup',
                     $3::numeric, 'pending', 'mobile_money',
                     $4::varchar, $5::varchar,
-                    $6::integer, $7::integer
+                    $6::integer, $7::bigint
                 )
                 `,
                 [
@@ -1709,7 +1679,7 @@ router.post(
                     phone,
                     p.passenger_id,
                     p.wallet_id,
-                ]
+                ],
             );
 
             const chargeResult = await initializeMobileMoneyCharge({
@@ -1738,7 +1708,7 @@ router.post(
                     chargeResult.status,
                     JSON.stringify(chargeResult.raw),
                     reference,
-                ]
+                ],
             );
 
             return res.status(200).json({
@@ -1755,9 +1725,8 @@ router.post(
         } catch (error: any) {
             console.error(
                 '❌ POST /passengers/wallet/topup/initialize failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message:
@@ -1765,7 +1734,7 @@ router.post(
                     'Failed to initiate mobile money charge.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1777,7 +1746,6 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1786,7 +1754,6 @@ router.get(
         }
 
         const reference = String(req.params.reference ?? '').trim();
-
         if (!reference) {
             return res.status(400).json({
                 success: false,
@@ -1804,7 +1771,7 @@ router.get(
                   AND purpose = 'wallet_topup'
                 LIMIT 1
                 `,
-                [reference, uid]
+                [reference, uid],
             );
 
             if (txResult.rows.length === 0) {
@@ -1820,13 +1787,12 @@ router.get(
                 const walletResult = await pool.query(
                     `
                     SELECT balance
-                    FROM public.passenger_wallets
+                    FROM public.wallets
                     WHERE id = $1
                     LIMIT 1
                     `,
-                    [tx.wallet_id]
+                    [tx.wallet_id],
                 );
-
                 return res.status(200).json({
                     success: true,
                     status: 'success',
@@ -1853,9 +1819,8 @@ router.get(
             if (verifyData.status === 'success') {
                 const result = await applySuccessfulPayment(
                     reference,
-                    verifyData.raw?.data ?? verifyData.raw ?? {}
+                    verifyData.raw?.data ?? verifyData.raw ?? {},
                 );
-
                 return res.status(200).json({
                     success: true,
                     status: 'success',
@@ -1876,9 +1841,8 @@ router.get(
                         updated_at      = NOW()
                     WHERE reference = $2
                     `,
-                    [JSON.stringify(verifyData.raw), reference]
+                    [JSON.stringify(verifyData.raw), reference],
                 );
-
                 return res.status(200).json({
                     success: false,
                     status: 'failed',
@@ -1895,16 +1859,15 @@ router.get(
         } catch (error: any) {
             console.error(
                 '❌ GET /passengers/wallet/topup/verify failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message:
                     'Failed to verify top-up. Please try again.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -1916,7 +1879,6 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -1926,9 +1888,9 @@ router.post(
 
         const rideId = Number(req.body?.ride_id);
         const phone = String(req.body?.phone ?? '').trim();
-        const provider = String(
-            req.body?.provider ?? ''
-        ).trim().toLowerCase() as PaystackProvider;
+        const provider = String(req.body?.provider ?? '')
+            .trim()
+            .toLowerCase() as PaystackProvider;
 
         if (!Number.isInteger(rideId) || rideId <= 0) {
             return res.status(400).json({
@@ -1936,14 +1898,12 @@ router.post(
                 message: 'A valid ride_id is required.',
             });
         }
-
         if (!['mtn', 'vod', 'atl'].includes(provider)) {
             return res.status(400).json({
                 success: false,
                 message: 'Unsupported mobile money provider.',
             });
         }
-
         if (phone.length < 6) {
             return res.status(400).json({
                 success: false,
@@ -1968,7 +1928,7 @@ router.post(
                   AND p.firebase_uid = $2::text
                 LIMIT 1
                 `,
-                [rideId, uid]
+                [rideId, uid],
             );
 
             if (result.rows.length === 0) {
@@ -1990,7 +1950,6 @@ router.post(
             }
 
             const fare = Number(ride.fare) || 0;
-
             if (fare <= 0) {
                 return res.status(400).json({
                     success: false,
@@ -2034,7 +1993,7 @@ router.post(
                     phone,
                     ride.passenger_id,
                     rideId,
-                ]
+                ],
             );
 
             const chargeResult = await initializeMobileMoneyCharge({
@@ -2063,7 +2022,7 @@ router.post(
                     chargeResult.status,
                     JSON.stringify(chargeResult.raw),
                     reference,
-                ]
+                ],
             );
 
             return res.status(200).json({
@@ -2079,9 +2038,8 @@ router.post(
         } catch (error: any) {
             console.error(
                 '❌ POST /passengers/wallet/pay/initialize failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message:
@@ -2089,7 +2047,7 @@ router.post(
                     'Failed to initiate mobile money charge.',
             });
         }
-    }
+    },
 );
 
 /* ==========================================================================
@@ -2101,7 +2059,6 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -2110,7 +2067,6 @@ router.get(
         }
 
         const reference = String(req.params.reference ?? '').trim();
-
         if (!reference) {
             return res.status(400).json({
                 success: false,
@@ -2128,7 +2084,7 @@ router.get(
                   AND purpose = 'ride_payment'
                 LIMIT 1
                 `,
-                [reference, uid]
+                [reference, uid],
             );
 
             if (txResult.rows.length === 0) {
@@ -2165,9 +2121,8 @@ router.get(
             if (verifyData.status === 'success') {
                 const result = await applySuccessfulPayment(
                     reference,
-                    verifyData.raw?.data ?? verifyData.raw ?? {}
+                    verifyData.raw?.data ?? verifyData.raw ?? {},
                 );
-
                 return res.status(200).json({
                     success: true,
                     status: 'success',
@@ -2188,9 +2143,8 @@ router.get(
                         updated_at      = NOW()
                     WHERE reference = $2
                     `,
-                    [JSON.stringify(verifyData.raw), reference]
+                    [JSON.stringify(verifyData.raw), reference],
                 );
-
                 return res.status(200).json({
                     success: false,
                     status: 'failed',
@@ -2207,16 +2161,15 @@ router.get(
         } catch (error: any) {
             console.error(
                 '❌ GET /passengers/wallet/pay/verify failed:',
-                error
+                error,
             );
-
             return res.status(500).json({
                 success: false,
                 message:
                     'Failed to verify ride payment. Please try again.',
             });
         }
-    }
+    },
 );
 
 export default router;
