@@ -20,12 +20,13 @@ import {
 } from './middleware/firebaseAdmin';
 
 import passengerRoutes from './routes/passengerRoutes';
-import passengerWalletRoutes from './routes/passengerWalletRoutes'; // ✏️ ADDED
+import passengerWalletRoutes from './routes/passengerWalletRoutes';
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
+import paystackWebhookRoutes from './routes/paystackWebhookRoutes';
 
 // ❌ Removed: import otpRoutes from "./routes/otpRoutes";
 // Firebase Phone Auth now handles OTP on the client. No Zavu, no server OTP routes.
@@ -100,30 +101,22 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| ❌ REMOVED: app.use("/api/auth", otpRoutes);
-|
-| Firebase Phone Auth now sends & verifies OTPs on the client.
-| The backend only verifies the resulting Firebase ID token
-| (via verifyFirebaseToken inside passengerRoutes).
-|
-| If you still have a /routes/otpRoutes.js file that uses Zavu,
-| delete it.
-|--------------------------------------------------------------------------
-*/
-
-/*
-|--------------------------------------------------------------------------
 | BODY PARSERS
 |--------------------------------------------------------------------------
 |
-| These MUST come before notificationRoutes, rideRoutes, etc.
+| The `verify` callback on express.json() stores the raw request body
+| on req.rawBody. The Paystack webhook route needs the raw bytes to
+| compute the HMAC-SHA512 signature, so this must run before any
+| webhook handler.
 |
-|--------------------------------------------------------------------------
 */
 
 app.use(
     express.json({
         limit: '10mb',
+        verify: (req: Request, _res: Response, buf: Buffer) => {
+            (req as any).rawBody = buf;
+        },
     }),
 );
 
@@ -132,6 +125,25 @@ app.use(
         extended: true,
         limit: '10mb',
     }),
+);
+
+/*
+|--------------------------------------------------------------------------
+| Paystack Webhook
+|--------------------------------------------------------------------------
+|
+| The webhook router declares its own path as `/webhooks/paystack`,
+| so mounting it at `/api` yields:
+|
+|   POST /api/webhooks/paystack
+|
+| Configure this exact URL in the Paystack dashboard.
+|
+*/
+
+app.use(
+    '/api',
+    paystackWebhookRoutes,
 );
 
 /*
@@ -159,13 +171,10 @@ app.use(
 | Notification Routes
 |--------------------------------------------------------------------------
 |
-| IMPORTANT:
-|
 | These routes use verifyFirebaseToken internally.
 |
 | They MUST be registered before adminAuth.
 |
-|--------------------------------------------------------------------------
 */
 
 app.use(
@@ -253,41 +262,53 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| Passenger Wallet Routes
+| Passenger Wallet Routes  (Paystack + wallet ledger)
 |--------------------------------------------------------------------------
 |
-| Registered BEFORE passengerRoutes so /wallet, /transactions, etc.
-| are matched first and are not shadowed by any `/:id` route in
-| passengerRoutes.
+| IMPORTANT:
 |
-| Endpoints:
+| passengerWalletRoutes declares its paths WITH the `/passengers`
+| prefix already baked in, e.g.:
 |
-|   GET  /api/passengers/wallet
-|   POST /api/passengers/wallet
-|   GET  /api/passengers/wallet/pending-payment-ride
-|   POST /api/passengers/wallet/topup
-|   POST /api/passengers/wallet/pay
-|   GET  /api/passengers/transactions
+|   GET  /passengers/wallet
+|   POST /passengers/wallet/topup/initialize
+|   GET  /passengers/wallet/topup/verify/:reference
+|   POST /passengers/wallet/pay/initialize
+|   GET  /passengers/wallet/pay/verify/:reference
 |
-|--------------------------------------------------------------------------
+| Therefore it MUST be mounted at `/api`, NOT at `/api/passengers`.
+|
+| Mounting it at `/api/passengers` produces doubled paths like
+| `/api/passengers/passengers/wallet/...`, which Express treats as
+| 404 "Route not found".
+|
+| Registered BEFORE passengerRoutes so the Paystack-aware handlers
+| win on any overlapping paths (`/wallet`, `/transactions`, etc.).
+|
 */
 
 app.use(
-    '/api/passengers',
-    passengerWalletRoutes, // ✏️ ADDED
+    '/api',
+    passengerWalletRoutes,
 );
 
 /*
 |--------------------------------------------------------------------------
-| Passenger Routes
+| Passenger Routes  (profile, register, alerts, legacy wallet)
 |--------------------------------------------------------------------------
 |
-| Passenger registration and login are now backed entirely by
+| passengerRoutes declares its paths WITHOUT the `/passengers`
+| prefix (e.g. `/wallet`, `/profile`, `/alerts`), so it is
+| mounted at `/api/passengers`.
+|
+| Passenger registration and login are backed entirely by
 | Firebase Phone Authentication. The client sends a Firebase ID
 | token; passengerRoutes verifies it and reads the verified phone
 | number from decoded.phone_number.
 |
-|--------------------------------------------------------------------------
+| Register AFTER passengerWalletRoutes so the newer wallet handlers
+| are matched first on overlapping paths.
+|
 */
 
 app.use(
@@ -327,7 +348,6 @@ app.use(
 | The wallet router handles driver Firebase authentication
 | internally, so it must be registered before adminAuth below.
 |
-|--------------------------------------------------------------------------
 */
 
 app.use(
@@ -627,7 +647,6 @@ app.post(
 | Everything below this middleware requires
 | Firebase authentication + admin lookup.
 |
-|--------------------------------------------------------------------------
 */
 
 app.use(adminAuth);
