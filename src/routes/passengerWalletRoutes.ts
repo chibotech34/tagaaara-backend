@@ -9,6 +9,14 @@ import {
     AuthenticatedRequest,
 } from '../middleware/firebaseAdmin';
 
+import {
+    initializeMobileMoneyCharge,
+    verifyTransaction,
+    generateReference,
+    fromPesewas,
+    type PaystackProvider,
+} from '../services/paystackService';
+
 const router = Router();
 
 /* ==========================================================================
@@ -35,8 +43,6 @@ function getAuthenticatedUid(
 
 /* ==========================================================================
  * FCM: Notify driver that payment was received
- * ==========================================================================
- * Fire-and-forget. Never throws. Payment must succeed even if FCM fails.
  * ========================================================================== */
 
 async function notifyDriverPaymentReceived(
@@ -189,10 +195,472 @@ async function notifyDriverPaymentReceived(
 }
 
 /* ==========================================================================
- * GET /passengers/wallet
+ * PAYSTACK: APPLY A SUCCESSFUL PAYMENT (idempotent)
  * ==========================================================================
- * Returns the passenger's wallet. Creates one implicitly on first read if
- * your schema supports it, otherwise returns 404 so the client can POST.
+ * Called by BOTH:
+ *   - the verify endpoint (client polls)
+ *   - the Paystack webhook (authoritative)
+ *
+ * Uses a DB transaction + row lock on paystack_transactions.reference so
+ * concurrent callers cannot double-credit.
+ * ========================================================================== */
+
+export async function applySuccessfulPayment(
+    reference: string,
+    paystackData: Record<string, any>
+): Promise<{
+    applied: boolean;
+    alreadyApplied: boolean;
+    purpose: string | null;
+    newBalance: number | null;
+}> {
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        /* Lock the paystack_transactions row. */
+        const txRowResult = await client.query(
+            `
+            SELECT *
+            FROM public.paystack_transactions
+            WHERE reference = $1
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [reference]
+        );
+
+        if (txRowResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            console.warn(
+                `⚠️ applySuccessfulPayment: ref ${reference} not found.`
+            );
+            return {
+                applied: false,
+                alreadyApplied: false,
+                purpose: null,
+                newBalance: null,
+            };
+        }
+
+        const txRow = txRowResult.rows[0];
+
+        /* Idempotency guard — still surface current balance to callers. */
+        if (txRow.applied === true) {
+            let newBalance: number | null = null;
+
+            if (
+                txRow.purpose === 'wallet_topup' &&
+                txRow.wallet_id
+            ) {
+                const walletResult = await client.query(
+                    `
+                    SELECT balance
+                    FROM public.passenger_wallets
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [txRow.wallet_id]
+                );
+
+                if (walletResult.rows.length > 0) {
+                    newBalance =
+                        Number(walletResult.rows[0].balance) || 0;
+                }
+            }
+
+            await client.query('ROLLBACK');
+
+            console.log(
+                `ℹ️ applySuccessfulPayment: ref ${reference} already applied ` +
+                `(purpose=${txRow.purpose})`
+            );
+
+            return {
+                applied: true,
+                alreadyApplied: true,
+                purpose: txRow.purpose,
+                newBalance,
+            };
+        }
+
+        /* Amount sanity check. Paystack sends pesewas. */
+        const paidPesewas = Number(paystackData?.amount) || 0;
+        const paidGHS = fromPesewas(paidPesewas);
+        const expectedGHS = Number(txRow.amount) || 0;
+
+        if (Math.abs(paidGHS - expectedGHS) > 0.01) {
+            console.error(
+                `⚠️ Paystack ref=${reference}: amount mismatch. ` +
+                `paid=${paidGHS} expected=${expectedGHS}`
+            );
+
+            await client.query(
+                `
+                UPDATE public.paystack_transactions
+                SET status          = 'failed',
+                    paystack_verify = $1::jsonb,
+                    updated_at      = NOW()
+                WHERE reference = $2
+                `,
+                [JSON.stringify(paystackData), reference]
+            );
+
+            await client.query('COMMIT');
+
+            return {
+                applied: false,
+                alreadyApplied: false,
+                purpose: txRow.purpose,
+                newBalance: null,
+            };
+        }
+
+        const payloadJson = JSON.stringify(paystackData);
+
+        let newBalance: number | null = null;
+
+        /* ==================================================================
+         * WALLET TOP-UP
+         * ================================================================== */
+        if (txRow.purpose === 'wallet_topup') {
+            const walletResult = await client.query(
+                `
+                SELECT id, balance
+                FROM public.passenger_wallets
+                WHERE id = $1
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [txRow.wallet_id]
+            );
+
+            if (walletResult.rows.length === 0) {
+                throw new Error(
+                    `Wallet ${txRow.wallet_id} not found for ref ${reference}`
+                );
+            }
+
+            const walletId = walletResult.rows[0].id;
+            const balanceBefore =
+                Number(walletResult.rows[0].balance) || 0;
+            const balanceAfter = balanceBefore + expectedGHS;
+
+            await client.query(
+                `
+                UPDATE public.passenger_wallets
+                SET balance             = $1::numeric,
+                    last_transaction_at = NOW(),
+                    updated_at          = NOW()
+                WHERE id = $2
+                `,
+                [balanceAfter, walletId]
+            );
+
+            await client.query(
+                `
+                INSERT INTO public.passenger_transactions (
+                    wallet_id,
+                    type,
+                    amount,
+                    balance_before,
+                    balance_after,
+                    status,
+                    payment_method,
+                    provider,
+                    description,
+                    created_at
+                )
+                VALUES (
+                    $1::integer,
+                    'topup',
+                    $2::numeric,
+                    $3::numeric,
+                    $4::numeric,
+                    'completed',
+                    'paystack_momo',
+                    $5::varchar,
+                    $6::text,
+                    NOW()
+                )
+                `,
+                [
+                    walletId,
+                    expectedGHS,
+                    balanceBefore,
+                    balanceAfter,
+                    txRow.provider ?? 'mtn',
+                    `Paystack top-up • ref ${reference}`,
+                ]
+            );
+
+            newBalance = balanceAfter;
+        }
+
+        /* ==================================================================
+         * DIRECT RIDE PAYMENT
+         * ================================================================== */
+        else if (txRow.purpose === 'ride_payment') {
+            const rideResult = await client.query(
+                `
+                SELECT
+                    r.id,
+                    r.passenger_id,
+                    r.driver_id,
+                    r.fare,
+                    r.payment_status,
+                    r.pickup_address,
+                    r.destination_address
+                FROM public.rides r
+                WHERE r.id = $1::integer
+                LIMIT 1
+                FOR UPDATE
+                `,
+                [txRow.ride_id]
+            );
+
+            if (rideResult.rows.length === 0) {
+                throw new Error(
+                    `Ride ${txRow.ride_id} not found for ref ${reference}`
+                );
+            }
+
+            const ride = rideResult.rows[0];
+
+            if (ride.payment_status === 'paid') {
+                await client.query(
+                    `
+                    UPDATE public.paystack_transactions
+                    SET applied         = TRUE,
+                        status          = 'success',
+                        paystack_verify = $1::jsonb,
+                        completed_at    = NOW(),
+                        updated_at      = NOW()
+                    WHERE reference = $2
+                    `,
+                    [payloadJson, reference]
+                );
+
+                await client.query('COMMIT');
+
+                console.log(
+                    `ℹ️ applySuccessfulPayment: ride ${ride.id} already paid, ` +
+                    `ref ${reference} marked applied.`
+                );
+
+                return {
+                    applied: true,
+                    alreadyApplied: true,
+                    purpose: txRow.purpose,
+                    newBalance: null,
+                };
+            }
+
+            const fare = Number(ride.fare) || expectedGHS;
+            const commission = Math.min(FLAT_COMMISSION, fare);
+            const driverEarnings = Math.max(0, fare - commission);
+
+            /* Credit driver wallet if we can resolve it. */
+            if (ride.driver_id) {
+                const driverLookup = await client.query(
+                    `
+                    SELECT id
+                    FROM public.drivers
+                    WHERE uid = $1::text
+                    LIMIT 1
+                    `,
+                    [ride.driver_id]
+                );
+
+                const driverNumericId = driverLookup.rows[0]?.id;
+
+                if (driverNumericId) {
+                    const driverWallet = await client.query(
+                        `
+                        SELECT id, balance
+                        FROM public.driver_wallets
+                        WHERE driver_id = $1
+                        LIMIT 1
+                        FOR UPDATE
+                        `,
+                        [driverNumericId]
+                    );
+
+                    if (driverWallet.rows.length > 0) {
+                        const dwId = driverWallet.rows[0].id;
+                        const dwBefore =
+                            Number(driverWallet.rows[0].balance) || 0;
+                        const dwAfter = dwBefore + driverEarnings;
+
+                        await client.query(
+                            `
+                            UPDATE public.driver_wallets
+                            SET balance             = $1::numeric,
+                                last_transaction_at = NOW(),
+                                updated_at          = NOW()
+                            WHERE id = $2
+                            `,
+                            [dwAfter, dwId]
+                        );
+
+                        await client.query(
+                            `
+                            INSERT INTO public.driver_transactions (
+                                wallet_id,
+                                ride_id,
+                                type,
+                                amount,
+                                balance_before,
+                                balance_after,
+                                status,
+                                payment_method,
+                                description,
+                                created_at
+                            )
+                            VALUES (
+                                $1::integer,
+                                $2::integer,
+                                'ride_earning',
+                                $3::numeric,
+                                $4::numeric,
+                                $5::numeric,
+                                'completed',
+                                'paystack_momo',
+                                $6::text,
+                                NOW()
+                            )
+                            `,
+                            [
+                                dwId,
+                                ride.id,
+                                driverEarnings,
+                                dwBefore,
+                                dwAfter,
+                                `Earnings from ride #${ride.id}`,
+                            ]
+                        );
+                    }
+                }
+            }
+
+            /* Update ride + record passenger transaction. */
+            await client.query(
+                `
+                UPDATE public.rides
+                SET payment_status     = 'paid',
+                    driver_earnings    = $1::numeric,
+                    tegaara_commission = $2::numeric
+                WHERE id = $3::integer
+                `,
+                [driverEarnings, commission, ride.id]
+            );
+
+            const walletLookup = await client.query(
+                `
+                SELECT id, balance
+                FROM public.passenger_wallets
+                WHERE passenger_id = $1
+                LIMIT 1
+                `,
+                [ride.passenger_id]
+            );
+
+            if (walletLookup.rows.length > 0) {
+                const wId = walletLookup.rows[0].id;
+                const wBal =
+                    Number(walletLookup.rows[0].balance) || 0;
+
+                await client.query(
+                    `
+                    INSERT INTO public.passenger_transactions (
+                        wallet_id,
+                        ride_id,
+                        type,
+                        amount,
+                        balance_before,
+                        balance_after,
+                        status,
+                        payment_method,
+                        description,
+                        created_at
+                    )
+                    VALUES (
+                        $1::integer,
+                        $2::integer,
+                        'ride_payment',
+                        $3::numeric,
+                        $4::numeric,
+                        $4::numeric,
+                        'completed',
+                        'paystack_momo',
+                        $5::text,
+                        NOW()
+                    )
+                    `,
+                    [
+                        wId,
+                        ride.id,
+                        fare,
+                        wBal,
+                        `MoMo payment for ride #${ride.id}`,
+                    ]
+                );
+            }
+        }
+
+        /* Mark our row as applied. */
+        await client.query(
+            `
+            UPDATE public.paystack_transactions
+            SET applied         = TRUE,
+                status          = 'success',
+                paystack_verify = $1::jsonb,
+                completed_at    = NOW(),
+                updated_at      = NOW()
+            WHERE reference = $2
+            `,
+            [payloadJson, reference]
+        );
+
+        await client.query('COMMIT');
+
+        console.log(
+            `✅ applySuccessfulPayment OK: ref=${reference} ` +
+            `purpose=${txRow.purpose} balance=${newBalance ?? 'n/a'}`
+        );
+
+        return {
+            applied: true,
+            alreadyApplied: false,
+            purpose: txRow.purpose,
+            newBalance,
+        };
+    } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch (_) {
+            /* ignore */
+        }
+
+        console.error(
+            `❌ applySuccessfulPayment failed (ref=${reference}):`,
+            error
+        );
+
+        return {
+            applied: false,
+            alreadyApplied: false,
+            purpose: null,
+            newBalance: null,
+        };
+    } finally {
+        client.release();
+    }
+}
+
+/* ==========================================================================
+ * GET /passengers/wallet
  * ========================================================================== */
 
 router.get(
@@ -285,9 +753,6 @@ router.get(
 
 /* ==========================================================================
  * POST /passengers/wallet
- * ==========================================================================
- * Creates a passenger wallet. Idempotent: returns the existing wallet if
- * one already exists.
  * ========================================================================== */
 
 router.post(
@@ -433,9 +898,6 @@ router.post(
 
 /* ==========================================================================
  * GET /passengers/wallet/pending-payment-ride
- * ==========================================================================
- * Returns the passenger's latest completed-but-unpaid ride plus the
- * assigned driver's details, so the "Pay for Ride" dialog can pre-fill.
  * ========================================================================== */
 
 router.get(
@@ -530,7 +992,7 @@ router.get(
 );
 
 /* ==========================================================================
- * POST /passengers/wallet/topup
+ * POST /passengers/wallet/topup  (legacy — direct wallet credit)
  * ========================================================================== */
 
 router.post(
@@ -777,18 +1239,7 @@ router.get(
 );
 
 /* ==========================================================================
- * POST /passengers/wallet/pay
- * ==========================================================================
- * THE MAIN EVENT — passenger pays for a completed ride.
- *
- * Steps:
- *   1. Validate ride + passenger ownership.
- *   2. Debit passenger wallet.
- *   3. Credit driver wallet (via drivers.id resolved from Firebase UID).
- *   4. Insert passenger transaction + driver transaction.
- *   5. Update ride.payment_status = 'paid'.
- *   6. COMMIT.
- *   7. Fire-and-forget FCM to the driver: "Payment Received".
+ * POST /passengers/wallet/pay  (legacy — wallet-balance payment)
  * ========================================================================== */
 
 router.post(
@@ -826,10 +1277,6 @@ router.post(
         try {
             await client.query('BEGIN');
 
-            /* ----------------------------------------------------------
-             * 1. Resolve passenger
-             * ---------------------------------------------------------- */
-
             const passengerResult = await client.query(
                 `
                 SELECT id, full_name
@@ -852,10 +1299,6 @@ router.post(
             const passengerId = passengerResult.rows[0].id;
             const passengerName =
                 passengerResult.rows[0].full_name || 'Passenger';
-
-            /* ----------------------------------------------------------
-             * 2. Lock the ride row
-             * ---------------------------------------------------------- */
 
             const rideResult = await client.query(
                 `
@@ -904,16 +1347,10 @@ router.post(
             }
 
             const fare = Number(rideInfo.fare) || 0;
-
-            // Prefer the fare on record; fall back to client amount.
             const amount = fare > 0 ? fare : amountInput;
 
             const commission = Math.min(FLAT_COMMISSION, amount);
             const driverEarnings = Math.max(0, amount - commission);
-
-            /* ----------------------------------------------------------
-             * 3. Lock passenger wallet + debit
-             * ---------------------------------------------------------- */
 
             const passengerWalletResult = await client.query(
                 `
@@ -969,10 +1406,6 @@ router.post(
                 `,
                 [passengerBalanceAfter, amount, passengerWalletId]
             );
-
-            /* ----------------------------------------------------------
-             * 4. Credit driver wallet
-             * ---------------------------------------------------------- */
 
             const driverResult = await client.query(
                 `
@@ -1060,10 +1493,6 @@ router.post(
                 }
             }
 
-            /* ----------------------------------------------------------
-             * 5. Passenger transaction + ride update
-             * ---------------------------------------------------------- */
-
             await client.query(
                 `
                 INSERT INTO public.passenger_transactions (
@@ -1113,10 +1542,6 @@ router.post(
                 [driverEarnings, commission, rideId]
             );
 
-            /* ----------------------------------------------------------
-             * 6. Commit
-             * ---------------------------------------------------------- */
-
             await client.query('COMMIT');
 
             console.log(
@@ -1125,13 +1550,6 @@ router.post(
                 `driverEarnings=${driverEarnings.toFixed(2)} ` +
                 `commission=${commission.toFixed(2)}`
             );
-
-            /* ----------------------------------------------------------
-             * 7. Fire-and-forget FCM to driver
-             * ----------------------------------------------------------
-             * Committed above. Notification failure must NOT affect
-             * the 200 response.
-             */
 
             void notifyDriverPaymentReceived(
                 rideInfo.driver_id,
@@ -1174,6 +1592,629 @@ router.post(
             });
         } finally {
             client.release();
+        }
+    }
+);
+
+/* ==========================================================================
+ * PAYSTACK: INITIALIZE WALLET TOP-UP
+ * ========================================================================== */
+
+router.post(
+    '/passengers/wallet/topup/initialize',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const amount = Number(req.body?.amount);
+        const phone = String(req.body?.phone ?? '').trim();
+        const provider = String(
+            req.body?.provider ?? ''
+        ).trim().toLowerCase() as PaystackProvider;
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'A valid amount is required.',
+            });
+        }
+
+        if (!['mtn', 'vod', 'atl'].includes(provider)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Unsupported mobile money provider.',
+            });
+        }
+
+        if (phone.length < 6) {
+            return res.status(400).json({
+                success: false,
+                message: 'A valid phone number is required.',
+            });
+        }
+
+        try {
+            const passengerResult = await pool.query(
+                `
+                SELECT p.id AS passenger_id,
+                       p.full_name,
+                       p.email,
+                       w.id AS wallet_id
+                FROM public.passengers p
+                LEFT JOIN public.passenger_wallets w
+                    ON w.passenger_id = p.id
+                WHERE p.firebase_uid = $1::text
+                LIMIT 1
+                `,
+                [uid]
+            );
+
+            if (passengerResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                });
+            }
+
+            const p = passengerResult.rows[0];
+
+            if (!p.wallet_id) {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Wallet not found. Please create a wallet first.',
+                });
+            }
+
+            const email =
+                (req.decodedToken as any)?.email ||
+                p.email ||
+                `passenger+${uid.slice(0, 8)}@tegaara.app`;
+
+            const reference = generateReference('topup', uid);
+
+            await pool.query(
+                `
+                INSERT INTO public.paystack_transactions (
+                    reference,
+                    user_firebase_uid,
+                    purpose,
+                    amount,
+                    status,
+                    channel,
+                    provider,
+                    phone,
+                    passenger_id,
+                    wallet_id
+                )
+                VALUES (
+                    $1, $2, 'wallet_topup',
+                    $3::numeric, 'pending', 'mobile_money',
+                    $4::varchar, $5::varchar,
+                    $6::integer, $7::integer
+                )
+                `,
+                [
+                    reference,
+                    uid,
+                    amount,
+                    provider,
+                    phone,
+                    p.passenger_id,
+                    p.wallet_id,
+                ]
+            );
+
+            const chargeResult = await initializeMobileMoneyCharge({
+                email,
+                amountGHS: amount,
+                phone,
+                provider,
+                reference,
+                metadata: {
+                    purpose: 'wallet_topup',
+                    userFirebaseUid: uid,
+                    passengerId: p.passenger_id,
+                    walletId: p.wallet_id,
+                },
+            });
+
+            await pool.query(
+                `
+                UPDATE public.paystack_transactions
+                SET status         = $1,
+                    paystack_init  = $2::jsonb,
+                    updated_at     = NOW()
+                WHERE reference = $3
+                `,
+                [
+                    chargeResult.status,
+                    JSON.stringify(chargeResult.raw),
+                    reference,
+                ]
+            );
+
+            return res.status(200).json({
+                success: true,
+                reference: chargeResult.reference,
+                status: chargeResult.status,
+                displayText: chargeResult.displayText,
+                amount,
+                phone,
+                provider,
+                message:
+                    'Check your phone and approve the mobile money prompt.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet/topup/initialize failed:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    error?.message ??
+                    'Failed to initiate mobile money charge.',
+            });
+        }
+    }
+);
+
+/* ==========================================================================
+ * PAYSTACK: VERIFY WALLET TOP-UP
+ * ========================================================================== */
+
+router.get(
+    '/passengers/wallet/topup/verify/:reference',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.params.reference ?? '').trim();
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reference is required.',
+            });
+        }
+
+        try {
+            const txResult = await pool.query(
+                `
+                SELECT *
+                FROM public.paystack_transactions
+                WHERE reference = $1
+                  AND user_firebase_uid = $2
+                  AND purpose = 'wallet_topup'
+                LIMIT 1
+                `,
+                [reference, uid]
+            );
+
+            if (txResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Top-up not found.',
+                });
+            }
+
+            const tx = txResult.rows[0];
+
+            if (tx.applied === true) {
+                const walletResult = await pool.query(
+                    `
+                    SELECT balance
+                    FROM public.passenger_wallets
+                    WHERE id = $1
+                    LIMIT 1
+                    `,
+                    [tx.wallet_id]
+                );
+
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: true,
+                    newBalance: walletResult.rows[0]
+                        ? Number(walletResult.rows[0].balance) || 0
+                        : null,
+                });
+            }
+
+            let verifyData;
+            try {
+                verifyData = await verifyTransaction(reference);
+            } catch (err: any) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'pending',
+                    message:
+                        err?.message ??
+                        'Waiting for confirmation from Paystack.',
+                });
+            }
+
+            if (verifyData.status === 'success') {
+                const result = await applySuccessfulPayment(
+                    reference,
+                    verifyData.raw?.data ?? verifyData.raw ?? {}
+                );
+
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: result.alreadyApplied,
+                    newBalance: result.newBalance,
+                });
+            }
+
+            if (
+                verifyData.status === 'failed' ||
+                verifyData.status === 'reversed'
+            ) {
+                await pool.query(
+                    `
+                    UPDATE public.paystack_transactions
+                    SET status          = 'failed',
+                        paystack_verify = $1::jsonb,
+                        updated_at      = NOW()
+                    WHERE reference = $2
+                    `,
+                    [JSON.stringify(verifyData.raw), reference]
+                );
+
+                return res.status(200).json({
+                    success: false,
+                    status: 'failed',
+                    message:
+                        'The mobile money charge was not successful.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                status: 'pending',
+                message: 'Awaiting approval on your phone.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ GET /passengers/wallet/topup/verify failed:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Failed to verify top-up. Please try again.',
+            });
+        }
+    }
+);
+
+/* ==========================================================================
+ * PAYSTACK: INITIALIZE DIRECT RIDE PAYMENT
+ * ========================================================================== */
+
+router.post(
+    '/passengers/wallet/pay/initialize',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const rideId = Number(req.body?.ride_id);
+        const phone = String(req.body?.phone ?? '').trim();
+        const provider = String(
+            req.body?.provider ?? ''
+        ).trim().toLowerCase() as PaystackProvider;
+
+        if (!Number.isInteger(rideId) || rideId <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'A valid ride_id is required.',
+            });
+        }
+
+        if (!['mtn', 'vod', 'atl'].includes(provider)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Unsupported mobile money provider.',
+            });
+        }
+
+        if (phone.length < 6) {
+            return res.status(400).json({
+                success: false,
+                message: 'A valid phone number is required.',
+            });
+        }
+
+        try {
+            const result = await pool.query(
+                `
+                SELECT
+                    r.id,
+                    r.fare,
+                    r.payment_status,
+                    r.driver_id,
+                    p.id AS passenger_id,
+                    p.email
+                FROM public.rides r
+                INNER JOIN public.passengers p
+                    ON p.id = r.passenger_id
+                WHERE r.id = $1::integer
+                  AND p.firebase_uid = $2::text
+                LIMIT 1
+                `,
+                [rideId, uid]
+            );
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        'Ride not found or does not belong to you.',
+                });
+            }
+
+            const ride = result.rows[0];
+
+            if (ride.payment_status === 'paid') {
+                return res.status(200).json({
+                    success: true,
+                    alreadyPaid: true,
+                    message: 'Ride already paid.',
+                });
+            }
+
+            const fare = Number(ride.fare) || 0;
+
+            if (fare <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Ride has no fare on record.',
+                });
+            }
+
+            const email =
+                (req.decodedToken as any)?.email ||
+                ride.email ||
+                `passenger+${uid.slice(0, 8)}@tegaara.app`;
+
+            const reference = generateReference('ride', uid);
+
+            await pool.query(
+                `
+                INSERT INTO public.paystack_transactions (
+                    reference,
+                    user_firebase_uid,
+                    purpose,
+                    amount,
+                    status,
+                    channel,
+                    provider,
+                    phone,
+                    passenger_id,
+                    ride_id
+                )
+                VALUES (
+                    $1, $2, 'ride_payment',
+                    $3::numeric, 'pending', 'mobile_money',
+                    $4::varchar, $5::varchar,
+                    $6::integer, $7::integer
+                )
+                `,
+                [
+                    reference,
+                    uid,
+                    fare,
+                    provider,
+                    phone,
+                    ride.passenger_id,
+                    rideId,
+                ]
+            );
+
+            const chargeResult = await initializeMobileMoneyCharge({
+                email,
+                amountGHS: fare,
+                phone,
+                provider,
+                reference,
+                metadata: {
+                    purpose: 'ride_payment',
+                    rideId,
+                    userFirebaseUid: uid,
+                    passengerId: ride.passenger_id,
+                },
+            });
+
+            await pool.query(
+                `
+                UPDATE public.paystack_transactions
+                SET status        = $1,
+                    paystack_init = $2::jsonb,
+                    updated_at    = NOW()
+                WHERE reference = $3
+                `,
+                [
+                    chargeResult.status,
+                    JSON.stringify(chargeResult.raw),
+                    reference,
+                ]
+            );
+
+            return res.status(200).json({
+                success: true,
+                reference: chargeResult.reference,
+                status: chargeResult.status,
+                displayText: chargeResult.displayText,
+                amount: fare,
+                rideId,
+                message:
+                    'Check your phone and approve the mobile money prompt.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet/pay/initialize failed:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    error?.message ??
+                    'Failed to initiate mobile money charge.',
+            });
+        }
+    }
+);
+
+/* ==========================================================================
+ * PAYSTACK: VERIFY DIRECT RIDE PAYMENT
+ * ========================================================================== */
+
+router.get(
+    '/passengers/wallet/pay/verify/:reference',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.params.reference ?? '').trim();
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'Reference is required.',
+            });
+        }
+
+        try {
+            const txResult = await pool.query(
+                `
+                SELECT *
+                FROM public.paystack_transactions
+                WHERE reference = $1
+                  AND user_firebase_uid = $2
+                  AND purpose = 'ride_payment'
+                LIMIT 1
+                `,
+                [reference, uid]
+            );
+
+            if (txResult.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Payment not found.',
+                });
+            }
+
+            const tx = txResult.rows[0];
+
+            if (tx.applied === true) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: true,
+                    rideId: tx.ride_id,
+                });
+            }
+
+            let verifyData;
+            try {
+                verifyData = await verifyTransaction(reference);
+            } catch (err: any) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'pending',
+                    message:
+                        err?.message ??
+                        'Waiting for confirmation from Paystack.',
+                });
+            }
+
+            if (verifyData.status === 'success') {
+                const result = await applySuccessfulPayment(
+                    reference,
+                    verifyData.raw?.data ?? verifyData.raw ?? {}
+                );
+
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: result.alreadyApplied,
+                    rideId: tx.ride_id,
+                });
+            }
+
+            if (
+                verifyData.status === 'failed' ||
+                verifyData.status === 'reversed'
+            ) {
+                await pool.query(
+                    `
+                    UPDATE public.paystack_transactions
+                    SET status          = 'failed',
+                        paystack_verify = $1::jsonb,
+                        updated_at      = NOW()
+                    WHERE reference = $2
+                    `,
+                    [JSON.stringify(verifyData.raw), reference]
+                );
+
+                return res.status(200).json({
+                    success: false,
+                    status: 'failed',
+                    message:
+                        'The mobile money charge was not successful.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                status: 'pending',
+                message: 'Awaiting approval on your phone.',
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ GET /passengers/wallet/pay/verify failed:',
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Failed to verify ride payment. Please try again.',
+            });
         }
     }
 );
