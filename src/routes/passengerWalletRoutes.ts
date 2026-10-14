@@ -2488,4 +2488,157 @@ router.get(
     },
 );
 
+/* ==========================================================================
+ * OTP PERSISTENCE — SAVE + FETCH
+ *
+ * These two routes let the Flutter app persist the OTP the user typed (or
+ * that was autofilled from SMS) so it can be re-shown in the dialog on
+ * reopen, and cleared automatically once the charge is applied.
+ * ========================================================================== */
+
+/* --------------------------------------------------------------------------
+ * POST /passengers/wallet/otp/save
+ *
+ * Body: { reference: string, otp: string }
+ *
+ * Called by the Flutter app the moment a full 6-digit code lands in the
+ * OTP field — whether the user typed it or the OS autofilled it.
+ *
+ * We only store it if:
+ *   - The reference belongs to the caller (Firebase UID match).
+ *   - The transaction has not yet been applied.
+ * -------------------------------------------------------------------------- */
+router.post(
+    '/passengers/wallet/otp/save',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.body?.reference ?? '').trim();
+        const otp = String(req.body?.otp ?? '').trim();
+
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'reference is required.',
+            });
+        }
+        if (!/^\d{4,8}$/.test(otp)) {
+            return res.status(400).json({
+                success: false,
+                message: 'otp must be 4–8 digits.',
+            });
+        }
+
+        try {
+            const result = await pool.query(
+                `
+                UPDATE public.paystack_transactions
+                   SET otp_code      = $1,
+                       otp_saved_at  = NOW(),
+                       updated_at    = NOW()
+                 WHERE reference          = $2
+                   AND user_firebase_uid  = $3
+                   AND applied            = FALSE
+                RETURNING id, reference, otp_code, otp_saved_at
+                `,
+                [otp, reference, uid],
+            );
+
+            if (result.rowCount === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Reference not found or already applied.',
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                reference: result.rows[0].reference,
+                otp: result.rows[0].otp_code,
+                savedAt: result.rows[0].otp_saved_at,
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ POST /passengers/wallet/otp/save failed:',
+                error,
+            );
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to save OTP.',
+            });
+        }
+    },
+);
+
+/* --------------------------------------------------------------------------
+ * GET /passengers/wallet/otp/:reference
+ *
+ * Returns the last OTP stored for the caller's own pending reference.
+ * The Flutter app uses this to pre-fill the OTP field when it re-opens
+ * (e.g. after a wrong code, or after a rebuild).
+ * -------------------------------------------------------------------------- */
+router.get(
+    '/passengers/wallet/otp/:reference',
+    verifyFirebaseToken,
+    async (req: AuthenticatedRequest, res: Response) => {
+        const uid = getAuthenticatedUid(req);
+        if (!uid) {
+            return res.status(401).json({
+                success: false,
+                message: 'Unauthenticated.',
+            });
+        }
+
+        const reference = String(req.params.reference ?? '').trim();
+        if (!reference) {
+            return res.status(400).json({
+                success: false,
+                message: 'reference is required.',
+            });
+        }
+
+        try {
+            const result = await pool.query(
+                `
+                SELECT otp_code, otp_saved_at
+                  FROM public.paystack_transactions
+                 WHERE reference         = $1
+                   AND user_firebase_uid = $2
+                 LIMIT 1
+                `,
+                [reference, uid],
+            );
+
+            if (result.rowCount === 0) {
+                return res.status(200).json({
+                    success: true,
+                    otp: null,
+                });
+            }
+
+            return res.status(200).json({
+                success: true,
+                otp: result.rows[0].otp_code ?? null,
+                savedAt: result.rows[0].otp_saved_at ?? null,
+            });
+        } catch (error: any) {
+            console.error(
+                '❌ GET /passengers/wallet/otp/:reference failed:',
+                error,
+            );
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to fetch OTP.',
+            });
+        }
+    },
+);
+
 export default router;
