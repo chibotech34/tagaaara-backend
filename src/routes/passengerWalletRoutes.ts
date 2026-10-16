@@ -1,4 +1,3 @@
-
 import { Router, Response } from 'express';
 import pool from '../config/database';
 import { firebaseMessaging } from '../config/firebase';
@@ -79,7 +78,7 @@ function amountToGHS(value: unknown): number {
 
 async function findPassenger(uid: string) {
     const result = await pool.query(
-        `SELECT id, full_name, email
+        `SELECT id, full_name, email, phone_number
          FROM public.passengers
          WHERE firebase_uid = $1::text
          LIMIT 1`,
@@ -247,10 +246,6 @@ export async function applySuccessfulPayment(
                 expectedGHS,
             });
 
-            /*
-             * Do not credit the wallet if the amount is different.
-             * Keep the transaction unapplied for investigation.
-             */
             await client.query(
                 `UPDATE public.paystack_transactions
                  SET paystack_verify = $1::jsonb,
@@ -344,11 +339,6 @@ export async function applySuccessfulPayment(
             const ride = rideResult.rows[0];
             const fare = amountToGHS(ride.fare);
 
-            /*
-             * Never mark a second external charge as successfully applied
-             * when the ride was already paid by another transaction.
-             * It requires reconciliation/refund review.
-             */
             if (ride.payment_status === 'paid') {
                 await client.query(
                     `UPDATE public.paystack_transactions
@@ -949,6 +939,10 @@ router.post(
 
 /* ==========================================================================
  * Shared Paystack initialization
+ *
+ * The `phone` in the request body is optional. When it is empty or missing,
+ * the endpoint falls back to the phone number stored on the passenger's
+ * profile (`public.passengers.phone_number`).
  * ========================================================================== */
 
 async function initializePayment(
@@ -959,7 +953,7 @@ async function initializePayment(
     const uid = getAuthenticatedUid(req);
     if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
 
-    const phone = String(req.body?.phone ?? '').trim();
+    const providedPhone = String(req.body?.phone ?? '').trim();
     const providerText = String(req.body?.provider ?? '').trim().toLowerCase();
     const amountInput = Number(req.body?.amount);
     const rideId = Number(req.body?.ride_id);
@@ -967,13 +961,25 @@ async function initializePayment(
     if (!validProvider(providerText)) {
         return res.status(400).json({ success: false, message: 'Unsupported mobile money provider.' });
     }
-    if (phone.length < 6) {
-        return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
-    }
 
     try {
         const passenger = await findPassenger(uid);
-        if (!passenger) return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+        if (!passenger) {
+            return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+        }
+
+        // ── Default the MoMo number to the one saved on the profile ──
+        const phone = providedPhone || String(passenger.phone_number ?? '').trim();
+
+        if (phone.length < 6) {
+            return res.status(400).json({
+                success: false,
+                code: 'PHONE_REQUIRED',
+                message:
+                    'No mobile money number on file. Add one to your profile ' +
+                    'or enter it manually.',
+            });
+        }
 
         let walletId: number | null = null;
         let amount = amountToGHS(amountInput);
@@ -988,7 +994,12 @@ async function initializePayment(
                 [passenger.id],
             );
             walletId = walletResult.rows[0]?.id ?? null;
-            if (!walletId) return res.status(404).json({ success: false, message: 'Wallet not found. Please create a wallet first.' });
+            if (!walletId) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Wallet not found. Please create a wallet first.',
+                });
+            }
         } else {
             if (!Number.isInteger(rideId) || rideId <= 0) {
                 return res.status(400).json({ success: false, message: 'A valid ride_id is required.' });
@@ -1001,20 +1012,31 @@ async function initializePayment(
                  LIMIT 1`,
                 [rideId, passenger.id],
             );
-            if (!rideResult.rows.length) return res.status(404).json({ success: false, message: 'Ride not found or does not belong to you.' });
+            if (!rideResult.rows.length) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Ride not found or does not belong to you.',
+                });
+            }
             if (rideResult.rows[0].payment_status === 'paid') {
                 return res.json({ success: true, alreadyPaid: true, message: 'Ride already paid.' });
             }
 
             amount = amountToGHS(rideResult.rows[0].fare);
-            if (amount <= 0) return res.status(400).json({ success: false, message: 'Ride has no valid fare.' });
+            if (amount <= 0) {
+                return res.status(400).json({ success: false, message: 'Ride has no valid fare.' });
+            }
         }
 
         const provider = providerText as PaystackProvider;
-        const email = (req.decodedToken as any)?.email ||
+        const email =
+            (req.decodedToken as any)?.email ||
             passenger.email ||
             `passenger+${uid.slice(0, 8)}@tegaara.app`;
-        const reference = generateReference(purpose === 'wallet_topup' ? 'topup' : 'ride', uid);
+        const reference = generateReference(
+            purpose === 'wallet_topup' ? 'topup' : 'ride',
+            uid,
+        );
 
         await pool.query(
             `INSERT INTO public.paystack_transactions (
@@ -1025,7 +1047,8 @@ async function initializePayment(
                      'mobile_money', $5, $6, $7::integer, $8, $9)`,
             [
                 reference, uid, purpose, amount, provider, phone,
-                passenger.id, walletId, purpose === 'ride_payment' ? rideId : null,
+                passenger.id, walletId,
+                purpose === 'ride_payment' ? rideId : null,
             ],
         );
 
@@ -1060,9 +1083,9 @@ async function initializePayment(
             displayText: statusMessage(status),
             message: statusMessage(status),
             amount,
-            ...(purpose === 'ride_payment' ? { rideId } : {}),
-            phone,
+            phone,   // ← echo back which number was actually charged
             provider,
+            ...(purpose === 'ride_payment' ? { rideId } : {}),
         });
     } catch (error) {
         console.error(`Initialize ${purpose} failed:`, error);
