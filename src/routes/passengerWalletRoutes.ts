@@ -76,15 +76,80 @@ function amountToGHS(value: unknown): number {
     return Number.isFinite(amount) ? Math.round(amount * 100) / 100 : 0;
 }
 
-async function findPassenger(uid: string) {
+/* ==========================================================================
+ * Passenger lookup — matches the real schema
+ *
+ *   public.passengers
+ *     - phone               varchar NOT NULL   ← registration number
+ *     - mobile_money_number varchar            ← preferred MoMo number
+ * ========================================================================== */
+
+async function findPassenger(uid: string): Promise<{
+    id: number;
+    full_name: string | null;
+    email: string | null;
+    phone: string | null;
+    mobile_money_number: string | null;
+} | null> {
     const result = await pool.query(
-        `SELECT id, full_name, email, phone_number
+        `SELECT id, full_name, email, phone, mobile_money_number
          FROM public.passengers
          WHERE firebase_uid = $1::text
          LIMIT 1`,
         [uid],
     );
     return result.rows[0] ?? null;
+}
+
+/**
+ * Same as findPassenger, but inserts a bare passenger row when none exists.
+ *
+ * `passengers.full_name` and `passengers.phone` are NOT NULL in this schema,
+ * so placeholders are used when the client doesn't provide values.
+ */
+async function findOrCreatePassenger(
+    uid: string,
+    fallback?: {
+        full_name?: string;
+        email?: string;
+        phone?: string;
+    },
+): Promise<{
+    id: number;
+    full_name: string | null;
+    email: string | null;
+    phone: string | null;
+    mobile_money_number: string | null;
+}> {
+    const existing = await findPassenger(uid);
+    if (existing) return existing;
+
+    const fullName = (fallback?.full_name ?? '').trim() || 'Passenger';
+    const phone =
+        (fallback?.phone ?? '').trim() || `pending-${uid.slice(0, 12)}`;
+
+    const result = await pool.query(
+        `INSERT INTO public.passengers (
+            firebase_uid, full_name, phone, email,
+            mobile_money_number, created_at, updated_at
+         )
+         VALUES (
+            $1::text, $2::varchar, $3::varchar, $4::varchar,
+            $5::varchar, NOW(), NOW()
+         )
+         ON CONFLICT (firebase_uid) DO UPDATE
+            SET firebase_uid = EXCLUDED.firebase_uid
+         RETURNING id, full_name, email, phone, mobile_money_number`,
+        [
+            uid,
+            fullName,
+            phone,
+            fallback?.email ?? null,
+            fallback?.phone ?? null,
+        ],
+    );
+
+    return result.rows[0];
 }
 
 async function getWalletBalance(walletId: number | string) {
@@ -596,7 +661,7 @@ router.get(
 );
 
 /* ==========================================================================
- * POST /passengers/wallet — create wallet if needed
+ * POST /passengers/wallet — create wallet (and passenger row if needed)
  * ========================================================================== */
 
 router.post(
@@ -604,11 +669,22 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid) {
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
+        }
+
+        const bodyFullName = String(req.body?.full_name ?? '').trim();
+        const bodyEmail = String(req.body?.email ?? '').trim();
+        const bodyPhone = String(req.body?.phone ?? '').trim();
 
         try {
-            const passenger = await findPassenger(uid);
-            if (!passenger) return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+            const passenger = await findOrCreatePassenger(uid, {
+                full_name: bodyFullName || undefined,
+                email: bodyEmail || undefined,
+                phone: bodyPhone || undefined,
+            });
 
             const result = await pool.query(
                 `INSERT INTO public.wallets (
@@ -619,7 +695,8 @@ router.post(
                  ON CONFLICT (passenger_id) DO UPDATE
                  SET passenger_id = EXCLUDED.passenger_id
                  RETURNING id, passenger_id, balance, pending_balance,
-                           total_spent, last_transaction_at, created_at, updated_at`,
+                           total_spent, last_transaction_at,
+                           created_at, updated_at`,
                 [passenger.id],
             );
 
@@ -639,9 +716,85 @@ router.post(
                     updatedAt: w.updated_at,
                 },
             });
-        } catch (error) {
-            console.error('POST wallet failed:', error);
-            return res.status(500).json({ success: false, message: 'Failed to create wallet.' });
+        } catch (error: any) {
+            console.error('POST /passengers/wallet failed:', {
+                uid,
+                code: error?.code,
+                message: error?.message,
+                detail: error?.detail,
+                constraint: error?.constraint,
+                column: error?.column,
+            });
+
+            if (error?.code === '42P01') {
+                return res.status(500).json({
+                    success: false,
+                    code: 'MISSING_TABLE',
+                    message:
+                        'Server schema error: required table not found. ' +
+                        'Contact support.',
+                });
+            }
+            if (error?.code === '42703') {
+                return res.status(500).json({
+                    success: false,
+                    code: 'MISSING_COLUMN',
+                    message:
+                        'Server schema error: missing column ' +
+                        `"${error?.column ?? 'unknown'}". Contact support.`,
+                });
+            }
+            if (error?.code === '23502') {
+                return res.status(500).json({
+                    success: false,
+                    code: 'MISSING_REQUIRED_FIELD',
+                    message:
+                        'Server schema error: required field ' +
+                        `"${error?.column ?? 'unknown'}" not provided.`,
+                });
+            }
+            if (error?.code === '23505') {
+                // Wallet already exists — return it as success.
+                try {
+                    const existing = await pool.query(
+                        `SELECT id, passenger_id, balance, pending_balance,
+                                total_spent, last_transaction_at,
+                                created_at, updated_at
+                         FROM public.wallets
+                         WHERE passenger_id = (
+                            SELECT id FROM public.passengers
+                            WHERE firebase_uid = $1::text LIMIT 1
+                         )
+                         LIMIT 1`,
+                        [uid],
+                    );
+                    if (existing.rows.length) {
+                        const w = existing.rows[0];
+                        return res.status(200).json({
+                            success: true,
+                            wallet: {
+                                id: w.id,
+                                passengerId: w.passenger_id,
+                                balance: Number(w.balance) || 0,
+                                pendingBalance: Number(w.pending_balance) || 0,
+                                totalSpent: Number(w.total_spent) || 0,
+                                currency: 'GHS',
+                                isActive: true,
+                                lastTransactionAt: w.last_transaction_at,
+                                createdAt: w.created_at,
+                                updatedAt: w.updated_at,
+                            },
+                        });
+                    }
+                } catch (_) {
+                    // fall through to the generic 500 below
+                }
+            }
+
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to create wallet.',
+            });
         }
     },
 );
@@ -940,9 +1093,10 @@ router.post(
 /* ==========================================================================
  * Shared Paystack initialization
  *
- * The `phone` in the request body is optional. When it is empty or missing,
- * the endpoint falls back to the phone number stored on the passenger's
- * profile (`public.passengers.phone_number`).
+ * Default MoMo number resolution order:
+ *   1. request body `phone`
+ *   2. passengers.mobile_money_number
+ *   3. passengers.phone
  * ========================================================================== */
 
 async function initializePayment(
@@ -968,8 +1122,11 @@ async function initializePayment(
             return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
         }
 
-        // ── Default the MoMo number to the one saved on the profile ──
-        const phone = providedPhone || String(passenger.phone_number ?? '').trim();
+        // ── Priority: client → saved MoMo number → registration phone ──
+        const phone =
+            providedPhone ||
+            String(passenger.mobile_money_number ?? '').trim() ||
+            String(passenger.phone ?? '').trim();
 
         if (phone.length < 6) {
             return res.status(400).json({
@@ -1083,7 +1240,7 @@ async function initializePayment(
             displayText: statusMessage(status),
             message: statusMessage(status),
             amount,
-            phone,   // ← echo back which number was actually charged
+            phone,   // echo back which number was actually charged
             provider,
             ...(purpose === 'ride_payment' ? { rideId } : {}),
         });
