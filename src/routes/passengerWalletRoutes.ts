@@ -78,13 +78,6 @@ function amountToGHS(value: unknown): number {
 
 /* ==========================================================================
  * PASSENGER LOOKUP / CREATE
- *
- * Schema (public.passengers):
- *   firebase_uid        varchar(255) NOT NULL UNIQUE
- *   full_name           varchar(255) NOT NULL
- *   phone               varchar(50)  NOT NULL
- *   email               varchar(255)
- *   mobile_money_number varchar(50)
  * ========================================================================== */
 
 type PassengerRow = {
@@ -117,7 +110,6 @@ async function findOrCreatePassenger(
     const existing = await findPassenger(uid);
     if (existing) return existing;
 
-    // Both full_name and phone are NOT NULL, so we seed sensible defaults.
     const fullName = (fallback?.full_name ?? '').trim() || 'Passenger';
     const phone =
         (fallback?.phone ?? '').trim() || `pending-${uid.slice(0, 12)}`;
@@ -135,7 +127,6 @@ async function findOrCreatePassenger(
         );
         return inserted.rows[0];
     } catch (error: any) {
-        // Race: another request created the row between our SELECT and INSERT.
         if (error?.code === '23505') {
             const retry = await findPassenger(uid);
             if (retry) return retry;
@@ -146,17 +137,6 @@ async function findOrCreatePassenger(
 
 /* ==========================================================================
  * WALLET LOOKUP / CREATE
- *
- * Schema (public.wallets):
- *   id            bigint
- *   passenger_id  integer  ← partial unique idx_wallets_passenger_id
- *   driver_id     bigint   ← CHECK: exactly one of passenger_id/driver_id
- *   balance, pending_balance, total_spent  numeric(10,2) NOT NULL
- *   last_transaction_at, created_at, updated_at  timestamptz
- *
- * IMPORTANT: idx_wallets_passenger_id is a PARTIAL unique index
- * (WHERE passenger_id IS NOT NULL), so `ON CONFLICT (passenger_id)` is
- * rejected with 42P10. We use SELECT → INSERT → catch 23505 instead.
  * ========================================================================== */
 
 type WalletRow = {
@@ -196,7 +176,6 @@ async function getOrCreatePassengerWallet(
         );
         return inserted.rows[0];
     } catch (error: any) {
-        // Another request won the race → just re-read.
         if (error?.code === '23505') {
             const retry = await pool.query<WalletRow>(selectSql, [passengerId]);
             if (retry.rows.length) return retry.rows[0];
@@ -205,7 +184,9 @@ async function getOrCreatePassengerWallet(
     }
 }
 
-async function getWalletBalance(walletId: number | string): Promise<number | null> {
+async function getWalletBalance(
+    walletId: number | string,
+): Promise<number | null> {
     const result = await pool.query<{ balance: string | number }>(
         `SELECT balance FROM public.wallets WHERE id = $1::bigint LIMIT 1`,
         [walletId],
@@ -277,8 +258,6 @@ async function notifyDriverPaymentReceived(
 
 /* ==========================================================================
  * applySuccessfulPayment — applies a verified Paystack payment exactly once.
- *
- * Only call with data returned by Paystack verification / OTP submission.
  * ========================================================================== */
 
 export async function applySuccessfulPayment(
@@ -513,7 +492,8 @@ export async function applySuccessfulPayment(
                     if (walletResult.rows.length) {
                         const dw = walletResult.rows[0];
                         const before = Number(dw.balance) || 0;
-                        const after = Math.round((before + earnings) * 100) / 100;
+                        const after =
+                            Math.round((before + earnings) * 100) / 100;
 
                         await client.query(
                             `UPDATE public.driver_wallets
@@ -558,9 +538,6 @@ export async function applySuccessfulPayment(
                 }
             }
 
-            // The trg_enforce_flat_commission trigger will overwrite
-            // driver_earnings/tegaara_commission when fare is set, but this
-            // UPDATE only touches payment_status / paid_at so it stays stable.
             await client.query(
                 `UPDATE public.rides
                  SET payment_status = 'paid',
@@ -672,11 +649,18 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid)
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
 
         try {
             const passenger = await findPassenger(uid);
-            if (!passenger) return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+            if (!passenger)
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                });
 
             const result = await pool.query(
                 `SELECT id, passenger_id, balance,
@@ -692,7 +676,9 @@ router.get(
             );
 
             if (!result.rows.length) {
-                return res.status(404).json({ success: false, message: 'Wallet not found.' });
+                return res
+                    .status(404)
+                    .json({ success: false, message: 'Wallet not found.' });
             }
 
             const w = result.rows[0];
@@ -709,7 +695,9 @@ router.get(
             });
         } catch (error) {
             console.error('GET wallet failed:', error);
-            return res.status(500).json({ success: false, message: 'Failed to load wallet.' });
+            return res
+                .status(500)
+                .json({ success: false, message: 'Failed to load wallet.' });
         }
     },
 );
@@ -723,7 +711,10 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid)
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
 
         const bodyFullName = String(req.body?.full_name ?? '').trim();
         const bodyEmail = String(req.body?.email ?? '').trim();
@@ -773,35 +764,40 @@ router.post(
                 return res.status(500).json({
                     success: false,
                     code,
-                    message: 'Server schema error: a required table is missing.',
+                    message:
+                        'Server schema error: a required table is missing.',
                 });
             }
             if (code === '42703') {
                 return res.status(500).json({
                     success: false,
                     code,
-                    message: `Server schema error: missing column "${error?.column ?? 'unknown'}".`,
+                    message: `Server schema error: missing column "${error?.column ?? 'unknown'
+                        }".`,
                 });
             }
             if (code === '23502') {
                 return res.status(500).json({
                     success: false,
                     code,
-                    message: `Server schema error: required field "${error?.column ?? 'unknown'}" was not provided.`,
+                    message: `Server schema error: required field "${error?.column ?? 'unknown'
+                        }" was not provided.`,
                 });
             }
             if (code === '23514') {
                 return res.status(500).json({
                     success: false,
                     code,
-                    message: `Server schema error: constraint "${error?.constraint ?? 'unknown'}" was violated.`,
+                    message: `Server schema error: constraint "${error?.constraint ?? 'unknown'
+                        }" was violated.`,
                 });
             }
 
             return res.status(500).json({
                 success: false,
                 code,
-                message: `Wallet creation failed (${code}): ${error?.message ?? 'unknown error'}`,
+                message: `Wallet creation failed (${code}): ${error?.message ?? 'unknown error'
+                    }`,
             });
         }
     },
@@ -815,12 +811,16 @@ router.post(
         res.status(410).json({
             success: false,
             code: 'LEGACY_TOPUP_DISABLED',
-            message: 'Direct wallet top-ups are disabled. Use Paystack Mobile Money.',
+            message:
+                'Direct wallet top-ups are disabled. Use Paystack Mobile Money.',
         }),
 );
 
 /* ==========================================================================
  * GET /passengers/wallet/pending-payment-ride
+ *
+ * Now also returns the driver's phone and MoMo details so the payment
+ * dialog can display them.
  * ========================================================================== */
 
 router.get(
@@ -828,15 +828,25 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid)
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
 
         try {
             const passenger = await findPassenger(uid);
-            if (!passenger) return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+            if (!passenger)
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                });
 
             const result = await pool.query(
                 `SELECT r.id AS ride_id, r.fare AS amount, r.completed_at,
                         d.uid AS driver_id, d.full_name AS driver_name,
+                        d.phone AS driver_phone,
+                        d.mobile_money_number AS driver_momo_number,
+                        d.mobile_money_provider AS driver_momo_provider,
                         d.profile_photo_url AS driver_photo_url,
                         d.vehicle_type, d.vehicle_model, d.vehicle_color,
                         d.registration_number AS vehicle_registration,
@@ -858,7 +868,10 @@ router.get(
             });
         } catch (error) {
             console.error('Pending ride lookup failed:', error);
-            return res.status(500).json({ success: false, message: 'Failed to load pending payment ride.' });
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load pending payment ride.',
+            });
         }
     },
 );
@@ -872,15 +885,28 @@ router.get(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid)
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
 
-        const page = Math.max(parseInt(String(req.query.page ?? '1'), 10) || 1, 1);
-        const limit = Math.min(Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1), 100);
+        const page = Math.max(
+            parseInt(String(req.query.page ?? '1'), 10) || 1,
+            1,
+        );
+        const limit = Math.min(
+            Math.max(parseInt(String(req.query.limit ?? '20'), 10) || 20, 1),
+            100,
+        );
         const offset = (page - 1) * limit;
 
         try {
             const passenger = await findPassenger(uid);
-            if (!passenger) return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+            if (!passenger)
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                });
 
             const result = await pool.query(
                 `SELECT id, wallet_id, ride_id, type, amount, balance_before,
@@ -895,7 +921,10 @@ router.get(
             return res.json({ success: true, transactions: result.rows });
         } catch (error) {
             console.error('Transaction history failed:', error);
-            return res.status(500).json({ success: false, message: 'Failed to load transactions.' });
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to load transactions.',
+            });
         }
     },
 );
@@ -909,11 +938,17 @@ router.post(
     verifyFirebaseToken,
     async (req: AuthenticatedRequest, res: Response) => {
         const uid = getAuthenticatedUid(req);
-        if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+        if (!uid)
+            return res
+                .status(401)
+                .json({ success: false, message: 'Unauthenticated.' });
 
         const rideId = Number(req.body?.ride_id);
         if (!Number.isInteger(rideId) || rideId <= 0) {
-            return res.status(400).json({ success: false, message: 'A valid ride_id is required.' });
+            return res.status(400).json({
+                success: false,
+                message: 'A valid ride_id is required.',
+            });
         }
 
         const client = await pool.connect();
@@ -927,7 +962,10 @@ router.post(
             );
             if (!passengerResult.rows.length) {
                 await client.query('ROLLBACK');
-                return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+                return res.status(404).json({
+                    success: false,
+                    message: 'Passenger profile not found.',
+                });
             }
 
             const passenger = passengerResult.rows[0];
@@ -941,23 +979,36 @@ router.post(
             );
             if (!rideResult.rows.length) {
                 await client.query('ROLLBACK');
-                return res.status(404).json({ success: false, message: 'Ride not found or does not belong to you.' });
+                return res.status(404).json({
+                    success: false,
+                    message: 'Ride not found or does not belong to you.',
+                });
             }
 
             const ride = rideResult.rows[0];
             if (ride.payment_status === 'paid') {
                 await client.query('ROLLBACK');
-                return res.json({ success: true, alreadyPaid: true, message: 'Ride already paid.' });
+                return res.json({
+                    success: true,
+                    alreadyPaid: true,
+                    message: 'Ride already paid.',
+                });
             }
             if (!ride.driver_id) {
                 await client.query('ROLLBACK');
-                return res.status(400).json({ success: false, message: 'Ride has no assigned driver.' });
+                return res.status(400).json({
+                    success: false,
+                    message: 'Ride has no assigned driver.',
+                });
             }
 
             const fare = amountToGHS(ride.fare);
             if (fare <= 0) {
                 await client.query('ROLLBACK');
-                return res.status(400).json({ success: false, message: 'Ride has no valid fare.' });
+                return res.status(400).json({
+                    success: false,
+                    message: 'Ride has no valid fare.',
+                });
             }
 
             const walletResult = await client.query(
@@ -967,7 +1018,10 @@ router.post(
             );
             if (!walletResult.rows.length) {
                 await client.query('ROLLBACK');
-                return res.status(404).json({ success: false, message: 'Wallet not found. Please create a wallet first.' });
+                return res.status(404).json({
+                    success: false,
+                    message: 'Wallet not found. Please create a wallet first.',
+                });
             }
 
             const wallet = walletResult.rows[0];
@@ -977,7 +1031,9 @@ router.post(
                 return res.status(402).json({
                     success: false,
                     code: 'INSUFFICIENT_WALLET_BALANCE',
-                    message: `Insufficient balance. You have GH₵${before.toFixed(2)} but need GH₵${fare.toFixed(2)}.`,
+                    message: `Insufficient balance. You have GH₵${before.toFixed(
+                        2,
+                    )} but need GH₵${fare.toFixed(2)}.`,
                     balance: before,
                     required: fare,
                 });
@@ -1014,7 +1070,8 @@ router.post(
                 if (dwResult.rows.length) {
                     const dw = dwResult.rows[0];
                     const dbefore = Number(dw.balance) || 0;
-                    driverBalance = Math.round((dbefore + earnings) * 100) / 100;
+                    driverBalance =
+                        Math.round((dbefore + earnings) * 100) / 100;
 
                     await client.query(
                         `UPDATE public.driver_wallets
@@ -1116,7 +1173,9 @@ router.post(
                 // ignore
             }
             console.error('Wallet ride payment failed:', error);
-            return res.status(500).json({ success: false, message: 'Failed to process payment.' });
+            return res
+                .status(500)
+                .json({ success: false, message: 'Failed to process payment.' });
         } finally {
             client.release();
         }
@@ -1125,11 +1184,6 @@ router.post(
 
 /* ==========================================================================
  * SHARED PAYSTACK INITIALIZATION
- *
- * Default MoMo number resolution order:
- *   1. request body `phone`
- *   2. passengers.mobile_money_number
- *   3. passengers.phone
  * ========================================================================== */
 
 async function initializePayment(
@@ -1138,21 +1192,32 @@ async function initializePayment(
     purpose: 'wallet_topup' | 'ride_payment',
 ) {
     const uid = getAuthenticatedUid(req);
-    if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+    if (!uid)
+        return res
+            .status(401)
+            .json({ success: false, message: 'Unauthenticated.' });
 
     const providedPhone = String(req.body?.phone ?? '').trim();
-    const providerText = String(req.body?.provider ?? '').trim().toLowerCase();
+    const providerText = String(req.body?.provider ?? '')
+        .trim()
+        .toLowerCase();
     const amountInput = Number(req.body?.amount);
     const rideId = Number(req.body?.ride_id);
 
     if (!validProvider(providerText)) {
-        return res.status(400).json({ success: false, message: 'Unsupported mobile money provider.' });
+        return res.status(400).json({
+            success: false,
+            message: 'Unsupported mobile money provider.',
+        });
     }
 
     try {
         const passenger = await findPassenger(uid);
         if (!passenger) {
-            return res.status(404).json({ success: false, message: 'Passenger profile not found.' });
+            return res.status(404).json({
+                success: false,
+                message: 'Passenger profile not found.',
+            });
         }
 
         const phone =
@@ -1175,7 +1240,10 @@ async function initializePayment(
 
         if (purpose === 'wallet_topup') {
             if (amount <= 0 || amount > 10000) {
-                return res.status(400).json({ success: false, message: 'Enter a valid top-up amount.' });
+                return res.status(400).json({
+                    success: false,
+                    message: 'Enter a valid top-up amount.',
+                });
             }
 
             const walletResult = await pool.query(
@@ -1191,7 +1259,10 @@ async function initializePayment(
             }
         } else {
             if (!Number.isInteger(rideId) || rideId <= 0) {
-                return res.status(400).json({ success: false, message: 'A valid ride_id is required.' });
+                return res.status(400).json({
+                    success: false,
+                    message: 'A valid ride_id is required.',
+                });
             }
 
             const rideResult = await pool.query(
@@ -1208,12 +1279,19 @@ async function initializePayment(
                 });
             }
             if (rideResult.rows[0].payment_status === 'paid') {
-                return res.json({ success: true, alreadyPaid: true, message: 'Ride already paid.' });
+                return res.json({
+                    success: true,
+                    alreadyPaid: true,
+                    message: 'Ride already paid.',
+                });
             }
 
             amount = amountToGHS(rideResult.rows[0].fare);
             if (amount <= 0) {
-                return res.status(400).json({ success: false, message: 'Ride has no valid fare.' });
+                return res.status(400).json({
+                    success: false,
+                    message: 'Ride has no valid fare.',
+                });
             }
         }
 
@@ -1291,7 +1369,8 @@ async function initializePayment(
         console.error(`Initialize ${purpose} failed:`, error);
         return res.status(500).json({
             success: false,
-            message: 'Could not initiate the Mobile Money payment. Please try again.',
+            message:
+                'Could not initiate the Mobile Money payment. Please try again.',
         });
     }
 }
@@ -1320,16 +1399,24 @@ async function submitPaymentOtp(
     purpose: 'wallet_topup' | 'ride_payment',
 ) {
     const uid = getAuthenticatedUid(req);
-    if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+    if (!uid)
+        return res
+            .status(401)
+            .json({ success: false, message: 'Unauthenticated.' });
 
     const reference = String(req.body?.reference ?? '').trim();
     const otp = String(req.body?.otp ?? '').trim();
 
     if (!reference) {
-        return res.status(400).json({ success: false, message: 'Reference is required.' });
+        return res
+            .status(400)
+            .json({ success: false, message: 'Reference is required.' });
     }
     if (!/^\d{4,8}$/.test(otp)) {
-        return res.status(400).json({ success: false, message: 'Enter a valid verification code.' });
+        return res.status(400).json({
+            success: false,
+            message: 'Enter a valid verification code.',
+        });
     }
 
     try {
@@ -1343,7 +1430,9 @@ async function submitPaymentOtp(
         );
 
         if (!txResult.rows.length) {
-            return res.status(404).json({ success: false, message: 'Payment not found.' });
+            return res
+                .status(404)
+                .json({ success: false, message: 'Payment not found.' });
         }
 
         const tx = txResult.rows[0];
@@ -1368,7 +1457,8 @@ async function submitPaymentOtp(
                 success: false,
                 status: 'send_otp',
                 code: 'OTP_SUBMISSION_FAILED',
-                message: 'The verification code could not be accepted. Check the code and try again.',
+                message:
+                    'The verification code could not be accepted. Check the code and try again.',
             });
         }
 
@@ -1461,11 +1551,16 @@ async function verifyPayment(
     purpose: 'wallet_topup' | 'ride_payment',
 ) {
     const uid = getAuthenticatedUid(req);
-    if (!uid) return res.status(401).json({ success: false, message: 'Unauthenticated.' });
+    if (!uid)
+        return res
+            .status(401)
+            .json({ success: false, message: 'Unauthenticated.' });
 
     const reference = String(req.params.reference ?? '').trim();
     if (!reference) {
-        return res.status(400).json({ success: false, message: 'Reference is required.' });
+        return res
+            .status(400)
+            .json({ success: false, message: 'Reference is required.' });
     }
 
     try {
@@ -1479,7 +1574,9 @@ async function verifyPayment(
         );
 
         if (!txResult.rows.length) {
-            return res.status(404).json({ success: false, message: 'Payment not found.' });
+            return res
+                .status(404)
+                .json({ success: false, message: 'Payment not found.' });
         }
 
         const tx = txResult.rows[0];
@@ -1512,7 +1609,10 @@ async function verifyPayment(
         const paystackData = verified.raw?.data ?? verified.raw ?? {};
 
         if (status === 'success') {
-            const result = await applySuccessfulPayment(reference, paystackData);
+            const result = await applySuccessfulPayment(
+                reference,
+                paystackData,
+            );
 
             if (!result.applied) {
                 return res.status(503).json({
