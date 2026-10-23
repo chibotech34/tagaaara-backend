@@ -18,6 +18,10 @@ import { createOtpRouter } from './otpRouterFactory';
 import { verifyOtp } from '../services/otpService';
 // ---------------------------
 
+// ----- Driver subscription integration -----
+import driverSubscriptionRouter from './driverSubscriptionRoutes';
+// -------------------------------------------
+
 const router = Router();
 
 /*
@@ -34,6 +38,27 @@ const router = Router();
 */
 
 router.use('/otp', createOtpRouter('driver'));
+
+/*
+|--------------------------------------------------------------------------
+| Subscription endpoints (Firebase-authenticated)
+|--------------------------------------------------------------------------
+|
+| Mounts:
+|   GET  /api/drivers/subscription/plans
+|   GET  /api/drivers/subscription/current
+|   POST /api/drivers/subscription/activate-trial
+|   POST /api/drivers/subscription/initialize
+|   POST /api/drivers/subscription/submit-otp
+|   GET  /api/drivers/subscription/verify/:reference
+|   GET  /api/drivers/subscription/payments
+|
+| Must be mounted BEFORE the /:uid/... routes so the literal
+| "subscription" prefix is not swallowed by the wildcard param routes.
+|--------------------------------------------------------------------------
+*/
+
+router.use('/subscription', driverSubscriptionRouter);
 
 /*
 |--------------------------------------------------------------------------
