@@ -31,6 +31,17 @@ type PaymentStatus =
 /* Helpers                                                                     */
 /* --------------------------------------------------------------------------- */
 
+/** Safe string coercion (Express v5 params/query/headers can be string[]). */
+function toStr(value: unknown): string {
+    if (typeof value === 'string') return value.trim();
+    if (Array.isArray(value)) {
+        const first = value[0];
+        return typeof first === 'string' ? first.trim() : '';
+    }
+    if (value === undefined || value === null) return '';
+    return String(value).trim();
+}
+
 function toPaystackProvider(value: unknown): PaystackProvider | null {
     const s = String(value ?? '').trim().toLowerCase();
     if (!s) return null;
@@ -86,21 +97,26 @@ async function expireStaleSubscriptions(driverId: number): Promise<void> {
     );
 }
 
+/**
+ * Serialize a `driver_subscriptions` row for the client.
+ *
+ * IMPORTANT: `pg` returns BIGINT (`id`, `driver_id`, `plan_id`) and
+ * NUMERIC (`price_paid`) columns as **strings**. The Flutter models
+ * expect real numbers, so every numeric field must be coerced here.
+ */
 function subscriptionRowToJson(row: any) {
     return {
-        id: row.id,
-        driver_id: row.driver_id,
-        plan_id: row.plan_id,
-        plan_name: row.plan_name,
-        plan_type: row.plan_type,
+        id: Number(row.id),
+        driver_id: Number(row.driver_id),
+        plan_id: Number(row.plan_id),
+        plan_name: row.plan_name ?? 'Subscription',
+        plan_type: row.plan_type ?? 'monthly',
         status: row.status,
         starts_at: row.starts_at,
         expires_at: row.expires_at,
         is_trial: row.is_trial === true,
-        // Prefer the driver-wide flag (`has_used_trial`) if present,
-        // otherwise fall back to the row's own column.
         trial_used: row.has_used_trial ?? row.trial_used ?? false,
-        currency: row.currency,
+        currency: row.currency ?? 'GHS',
         price_paid: Number(row.price_paid) || 0,
     };
 }
@@ -137,7 +153,7 @@ async function authenticateDriver(
     next: NextFunction,
 ): Promise<void> {
     try {
-        const authHeader = req.headers.authorization;
+        const authHeader = toStr(req.headers.authorization);
 
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
             res.status(401).json({
@@ -239,14 +255,14 @@ router.get('/plans', authenticateDriver, async (_req, res) => {
         res.json({
             success: true,
             plans: result.rows.map((r) => ({
-                id: r.id,
+                id: Number(r.id),
                 name: r.name,
                 type: r.type,
                 price: Number(r.price) || 0,
-                currency: r.currency,
-                duration_days: r.duration_days,
-                description: r.description,
-                is_active: r.is_active,
+                currency: r.currency ?? 'GHS',
+                duration_days: Number(r.duration_days) || 0,
+                description: r.description ?? null,
+                is_active: r.is_active === true,
             })),
         });
     } catch (err) {
@@ -316,7 +332,6 @@ router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverReque
         const driverId = req.driverId!;
         await client.query('BEGIN');
 
-        // One free trial per driver, ever.
         const used = await client.query(
             `SELECT 1 FROM public.driver_subscriptions
               WHERE driver_id = $1 AND is_trial = true
@@ -349,7 +364,6 @@ router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverReque
 
         const plan = planRes.rows[0];
 
-        // Cancel any other active subscription just in case.
         await client.query(
             `UPDATE public.driver_subscriptions
                 SET status = 'cancelled',
@@ -402,17 +416,12 @@ router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverReque
 
 /* ===========================================================================
  * POST /api/drivers/subscription/initialize
- *
- * Body: { plan_id, provider, phone? }
- * Creates a pending payment row, initiates the MoMo charge, returns the
- * reference so the client can poll /verify or submit the OTP.
  * ========================================================================= */
 router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, res) => {
     const driverId = req.driverId!;
     const uid = req.firebaseUid!;
 
     try {
-        /* -------- Validate input ------------------------------------- */
         const planId = Number(req.body?.plan_id);
         if (!Number.isInteger(planId) || planId <= 0) {
             return res.status(400).json({
@@ -431,7 +440,6 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
 
         const providedPhone = normalizeGhanaMobileNumber(req.body?.phone);
 
-        /* -------- Load plan ------------------------------------------ */
         const planRes = await pool.query(
             `SELECT * FROM public.subscription_plans
               WHERE id = $1 AND is_active = true
@@ -455,7 +463,6 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
             });
         }
 
-        /* -------- Resolve phone + email ------------------------------ */
         const driverRes = await pool.query(
             `SELECT id, email, phone, mobile_money_number
                FROM public.drivers
@@ -497,13 +504,11 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
         }
 
         const email =
-            driver.email ||
-            `driver+${uid.slice(0, 8)}@tegaara.app`;
+            driver.email || `driver+${uid.slice(0, 8)}@tegaara.app`;
 
         const amountGHS = Number(plan.price);
         const reference = `SUB-${generateReference('topup', uid)}`;
 
-        /* -------- Create pending payment row ------------------------- */
         await pool.query(
             `INSERT INTO public.subscription_payments
                 (driver_id, plan_id, reference, amount, currency,
@@ -513,7 +518,6 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
             [driverId, plan.id, reference, amountGHS, plan.currency, phone],
         );
 
-        /* -------- Initiate the MoMo charge --------------------------- */
         let charge;
         try {
             charge = await initializeMobileMoneyCharge({
@@ -590,8 +594,8 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
  * ========================================================================= */
 router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, res) => {
     const driverId = req.driverId!;
-    const reference = String(req.body?.reference ?? '').trim();
-    const otp = String(req.body?.otp ?? '').trim();
+    const reference = toStr(req.body?.reference);
+    const otp = toStr(req.body?.otp);
 
     if (!reference) {
         return res.status(400).json({ success: false, message: 'Reference is required.' });
@@ -701,7 +705,7 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
  * ========================================================================= */
 router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverRequest, res) => {
     const driverId = req.driverId!;
-    const reference = String(req.params.reference ?? '').trim();
+    const reference = toStr(req.params.reference);
 
     if (!reference) {
         return res.status(400).json({ success: false, message: 'Reference is required.' });
@@ -813,7 +817,8 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
 router.get('/payments', authenticateDriver, async (req: AuthedDriverRequest, res) => {
     try {
         const driverId = req.driverId!;
-        const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+        const rawLimit = toStr(req.query.limit);
+        const limit = Math.min(Math.max(Number(rawLimit) || 50, 1), 100);
 
         const result = await pool.query(
             `SELECT p.*, sp.name AS plan_name, sp.type AS plan_type
@@ -828,15 +833,16 @@ router.get('/payments', authenticateDriver, async (req: AuthedDriverRequest, res
         res.json({
             success: true,
             payments: result.rows.map((r) => ({
-                id: r.id,
-                subscription_id: r.subscription_id,
+                id: Number(r.id),
+                subscription_id: r.subscription_id != null ? Number(r.subscription_id) : null,
+                plan_id: Number(r.plan_id),
                 reference: r.reference,
                 amount: Number(r.amount) || 0,
-                currency: r.currency,
+                currency: r.currency ?? 'GHS',
                 status: r.status,
-                provider: r.provider,
-                plan_name: r.plan_name,
-                plan_type: r.plan_type,
+                provider: r.provider ?? 'paystack',
+                plan_name: r.plan_name ?? 'Subscription',
+                plan_type: r.plan_type ?? 'monthly',
                 paid_at: r.paid_at,
                 created_at: r.created_at,
                 failure_reason: r.failure_reason,
@@ -852,15 +858,7 @@ router.get('/payments', authenticateDriver, async (req: AuthedDriverRequest, res
 });
 
 /* ===========================================================================
- * applySuccessfulSubscriptionPayment
- * -------------------------------------------------------------------------
- * Idempotent. Locks the payment row FOR UPDATE so that a verify poll, an
- * OTP submission, and a webhook retry cannot double-activate. On success:
- *
- *   - Extension: if an active paid sub exists for the SAME plan, extend
- *     expires_at by plan.duration_days. Same subscription id.
- *   - Otherwise: cancel any active/trial sub and create a fresh one
- *     starting NOW.
+ * applySuccessfulSubscriptionPayment (idempotent, transaction-safe)
  * ========================================================================= */
 async function applySuccessfulSubscriptionPayment(
     reference: string,
@@ -875,7 +873,6 @@ async function applySuccessfulSubscriptionPayment(
     try {
         await client.query('BEGIN');
 
-        /* -------- Lock the payment row --------------------------- */
         const txRes = await client.query(
             `SELECT * FROM public.subscription_payments
               WHERE reference = $1
@@ -891,7 +888,6 @@ async function applySuccessfulSubscriptionPayment(
 
         const tx = txRes.rows[0];
 
-        /* -------- Already applied? Return current state ---------- */
         if (tx.applied === true) {
             await client.query('COMMIT');
             const sub = tx.subscription_id
@@ -900,7 +896,6 @@ async function applySuccessfulSubscriptionPayment(
             return { applied: true, alreadyApplied: true, subscription: sub };
         }
 
-        /* -------- Amount check ----------------------------------- */
         const paidPesewas = Number(paystackData?.amount);
         if (!Number.isFinite(paidPesewas) || paidPesewas <= 0) {
             await client.query('ROLLBACK');
@@ -926,7 +921,6 @@ async function applySuccessfulSubscriptionPayment(
             return { applied: false, alreadyApplied: false, subscription: null };
         }
 
-        /* -------- Load the plan ---------------------------------- */
         const planRes = await client.query(
             `SELECT * FROM public.subscription_plans WHERE id = $1 LIMIT 1`,
             [tx.plan_id],
@@ -939,7 +933,6 @@ async function applySuccessfulSubscriptionPayment(
         const plan = planRes.rows[0];
         const durationDays = Number(plan.duration_days) || 30;
 
-        /* -------- Expire any stale active/trial row first -------- */
         await client.query(
             `UPDATE public.driver_subscriptions
                 SET status = 'expired', updated_at = NOW()
@@ -949,7 +942,6 @@ async function applySuccessfulSubscriptionPayment(
             [tx.driver_id],
         );
 
-        /* -------- Find the current active row -------------------- */
         const existingRes = await client.query(
             `SELECT * FROM public.driver_subscriptions
               WHERE driver_id = $1 AND status IN ('trial','active')
@@ -972,7 +964,6 @@ async function applySuccessfulSubscriptionPayment(
             existing.expires_at != null;
 
         if (isRenewal) {
-            /* -------- Renewal: extend the existing subscription -- */
             const currentExpiry = new Date(existing.expires_at);
             const base = currentExpiry > now ? currentExpiry : now;
             const newExpiry = new Date(base.getTime() + durationDays * 86_400_000);
@@ -988,7 +979,6 @@ async function applySuccessfulSubscriptionPayment(
 
             subscriptionId = Number(existing.id);
         } else {
-            /* -------- Fresh subscription ------------------------- */
             if (existing) {
                 await client.query(
                     `UPDATE public.driver_subscriptions
@@ -1023,7 +1013,6 @@ async function applySuccessfulSubscriptionPayment(
             subscriptionId = Number(created.rows[0].id);
         }
 
-        /* -------- Mark payment applied --------------------------- */
         await client.query(
             `UPDATE public.subscription_payments
                 SET applied         = true,
@@ -1050,11 +1039,7 @@ async function applySuccessfulSubscriptionPayment(
 }
 
 /* ===========================================================================
- * Paystack webhook handler (exported — wire it in server.ts, see notes).
- *
- * Only subscription references (prefix "SUB-") are handled here; wallet
- * webhooks are handled by the wallet module. Idempotent: if a verify poll
- * already credited the subscription, this is a no-op.
+ * Paystack webhook handler
  * ========================================================================= */
 export async function handleSubscriptionWebhook(
     rawBody: Buffer,
@@ -1079,7 +1064,6 @@ export async function handleSubscriptionWebhook(
         return { status: 200, body: { received: true } };
     }
 
-    // Wallet top-ups have their own webhook. Ignore anything else.
     if (!reference.startsWith('SUB-')) {
         return { status: 200, body: { received: true, skipped: true } };
     }
