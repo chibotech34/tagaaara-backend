@@ -27,6 +27,13 @@ type PaymentStatus =
     | 'success' | 'pending' | 'pay_offline'
     | 'send_otp' | 'failed' | 'reversed' | 'refunded';
 
+/**
+ * Settled-only vocabulary accepted by `subscription_payments.status`
+ * (PostgreSQL CHECK constraint). In-flight Paystack statuses such as
+ * `pay_offline` and `send_otp` MUST NOT be written here.
+ */
+type DbPaymentStatus = 'pending' | 'success' | 'failed' | 'reversed' | 'refunded';
+
 /* --------------------------------------------------------------------------- */
 /* Helpers                                                                     */
 /* --------------------------------------------------------------------------- */
@@ -60,6 +67,11 @@ function normalizeGhanaMobileNumber(value: unknown): string | null {
     return null;
 }
 
+/**
+ * Rich, Paystack-facing status (keeps `pay_offline` / `send_otp`).
+ * Used for HTTP responses so the Flutter client can distinguish
+ * "approve on your phone" from "enter the SMS code".
+ */
 function normaliseStatus(value: unknown): PaymentStatus {
     const s = String(value ?? 'pending').toLowerCase();
     const allowed: PaymentStatus[] = [
@@ -67,6 +79,28 @@ function normaliseStatus(value: unknown): PaymentStatus {
         'failed', 'reversed', 'refunded',
     ];
     return allowed.includes(s as PaymentStatus) ? (s as PaymentStatus) : 'pending';
+}
+
+/**
+ * DB-safe status mapper.
+ *
+ * Maps whatever Paystack returns (including in-flight states like
+ * `pay_offline` and `send_otp`) into the **settled** vocabulary that
+ * `subscription_payments.status` is allowed to contain.
+ *
+ * The HTTP response to the Flutter client keeps the fuller vocabulary
+ * (via `normaliseStatus`) so the UI can distinguish "approve on your
+ * phone" from "enter the SMS code". Only the DB write is narrowed.
+ */
+function toDbPaymentStatus(paystackStatus: unknown): DbPaymentStatus {
+    const s = String(paystackStatus ?? '').toLowerCase();
+    if (s === 'success' || s === 'successful' || s === 'completed') return 'success';
+    if (s === 'failed') return 'failed';
+    if (s === 'reversed') return 'reversed';
+    if (s === 'refunded') return 'refunded';
+    // pay_offline, send_otp, otp, needs_otp, ongoing, processing, queued,
+    // abandoned, pending, '' → money not settled yet
+    return 'pending';
 }
 
 function statusMessage(status: PaymentStatus): string {
@@ -557,7 +591,10 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
             });
         }
 
+        // Rich status for the client (may be 'pay_offline' / 'send_otp').
         const status = normaliseStatus(charge.status);
+        // Narrow status for the DB CHECK constraint.
+        const dbStatus = toDbPaymentStatus(charge.status);
 
         await pool.query(
             `UPDATE public.subscription_payments
@@ -565,7 +602,7 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
                     paystack_init = $2::jsonb,
                     updated_at = NOW()
               WHERE reference = $3`,
-            [status, JSON.stringify(charge.raw), reference],
+            [dbStatus, JSON.stringify(charge.raw), reference],
         );
 
         const failed = status === 'failed' || status === 'reversed';
@@ -640,7 +677,10 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
             });
         }
 
+        // Rich status for the client.
         const status = normaliseStatus(submitted.status);
+        // Narrow status for the DB CHECK constraint.
+        const dbStatus = toDbPaymentStatus(submitted.status);
 
         await pool.query(
             `UPDATE public.subscription_payments
@@ -648,7 +688,7 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
                     paystack_verify = $2::jsonb,
                     updated_at = NOW()
               WHERE reference = $3 AND applied = false`,
-            [status, JSON.stringify(submitted.raw), reference],
+            [dbStatus, JSON.stringify(submitted.raw), reference],
         );
 
         if (status === 'success') {
@@ -778,7 +818,7 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
                 `UPDATE public.subscription_payments
                     SET status = $1, paystack_verify = $2::jsonb, updated_at = NOW()
                   WHERE reference = $3 AND applied = false`,
-                [status, JSON.stringify(verified.raw), reference],
+                [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), reference],
             );
 
             return res.json({
@@ -792,7 +832,7 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
             `UPDATE public.subscription_payments
                 SET status = $1, paystack_verify = $2::jsonb, updated_at = NOW()
               WHERE reference = $3 AND applied = false`,
-            [status, JSON.stringify(verified.raw), reference],
+            [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), reference],
         );
 
         return res.json({
