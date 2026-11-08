@@ -27,18 +27,12 @@ type PaymentStatus =
     | 'success' | 'pending' | 'pay_offline'
     | 'send_otp' | 'failed' | 'reversed' | 'refunded';
 
-/**
- * Settled-only vocabulary accepted by `subscription_payments.status`
- * (PostgreSQL CHECK constraint). In-flight Paystack statuses such as
- * `pay_offline` and `send_otp` MUST NOT be written here.
- */
 type DbPaymentStatus = 'pending' | 'success' | 'failed' | 'reversed' | 'refunded';
 
 /* --------------------------------------------------------------------------- */
 /* Helpers                                                                     */
 /* --------------------------------------------------------------------------- */
 
-/** Safe string coercion (Express v5 params/query/headers can be string[]). */
 function toStr(value: unknown): string {
     if (typeof value === 'string') return value.trim();
     if (Array.isArray(value)) {
@@ -67,11 +61,6 @@ function normalizeGhanaMobileNumber(value: unknown): string | null {
     return null;
 }
 
-/**
- * Rich, Paystack-facing status (keeps `pay_offline` / `send_otp`).
- * Used for HTTP responses so the Flutter client can distinguish
- * "approve on your phone" from "enter the SMS code".
- */
 function normaliseStatus(value: unknown): PaymentStatus {
     const s = String(value ?? 'pending').toLowerCase();
     const allowed: PaymentStatus[] = [
@@ -81,9 +70,6 @@ function normaliseStatus(value: unknown): PaymentStatus {
     return allowed.includes(s as PaymentStatus) ? (s as PaymentStatus) : 'pending';
 }
 
-/**
- * DB-safe status mapper.
- */
 function toDbPaymentStatus(paystackStatus: unknown): DbPaymentStatus {
     const s = String(paystackStatus ?? '').toLowerCase();
     if (s === 'success' || s === 'successful' || s === 'completed') return 'success';
@@ -717,7 +703,9 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
         }
 
         if (status === 'failed' || status === 'reversed') {
-            const gatewayResponse = submitted.raw?.data?.gateway_response || submitted.raw?.message || '';
+            // FIX: Cast to any to avoid TypeScript error
+            const rawData = (submitted.raw?.data ?? submitted.raw ?? {}) as any;
+            const gatewayResponse = rawData?.gateway_response || rawData?.message || '';
             const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
 
             return res.json({
@@ -790,7 +778,9 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
         }
 
         const status = normaliseStatus(verified.status);
-        const paystackData = verified.raw?.data ?? verified.raw ?? {};
+
+        // FIX: Cast to any to avoid TypeScript error
+        const paystackData = (verified.raw?.data ?? verified.raw ?? {}) as any;
 
         if (status === 'success') {
             const result = await applySuccessfulSubscriptionPayment(reference, paystackData);
@@ -816,7 +806,7 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
         }
 
         if (status === 'failed' || status === 'reversed') {
-            const gatewayResponse = paystackData?.gateway_response || verified.raw?.message || '';
+            const gatewayResponse = paystackData?.gateway_response || paystackData?.message || '';
             const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
 
             await pool.query(
