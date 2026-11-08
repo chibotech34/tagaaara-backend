@@ -83,14 +83,6 @@ function normaliseStatus(value: unknown): PaymentStatus {
 
 /**
  * DB-safe status mapper.
- *
- * Maps whatever Paystack returns (including in-flight states like
- * `pay_offline` and `send_otp`) into the **settled** vocabulary that
- * `subscription_payments.status` is allowed to contain.
- *
- * The HTTP response to the Flutter client keeps the fuller vocabulary
- * (via `normaliseStatus`) so the UI can distinguish "approve on your
- * phone" from "enter the SMS code". Only the DB write is narrowed.
  */
 function toDbPaymentStatus(paystackStatus: unknown): DbPaymentStatus {
     const s = String(paystackStatus ?? '').toLowerCase();
@@ -98,8 +90,6 @@ function toDbPaymentStatus(paystackStatus: unknown): DbPaymentStatus {
     if (s === 'failed') return 'failed';
     if (s === 'reversed') return 'reversed';
     if (s === 'refunded') return 'refunded';
-    // pay_offline, send_otp, otp, needs_otp, ongoing, processing, queued,
-    // abandoned, pending, '' → money not settled yet
     return 'pending';
 }
 
@@ -119,6 +109,25 @@ function statusMessage(status: PaymentStatus): string {
     }
 }
 
+/**
+ * Translates Paystack gateway errors (like "Insufficient funds") into
+ * clean, user-facing messages.
+ */
+function getUserFriendlyErrorMessage(rawMessage: string): string {
+    const lower = rawMessage.toLowerCase();
+
+    if (
+        lower.includes('insufficient') ||
+        lower.includes('funds') ||
+        lower.includes('balance') ||
+        lower.includes('declined')
+    ) {
+        return 'Insufficient balance in your Mobile Money wallet. Please top up and try again.';
+    }
+
+    return rawMessage;
+}
+
 async function expireStaleSubscriptions(driverId: number): Promise<void> {
     await pool.query(
         `UPDATE public.driver_subscriptions
@@ -131,13 +140,6 @@ async function expireStaleSubscriptions(driverId: number): Promise<void> {
     );
 }
 
-/**
- * Serialize a `driver_subscriptions` row for the client.
- *
- * IMPORTANT: `pg` returns BIGINT (`id`, `driver_id`, `plan_id`) and
- * NUMERIC (`price_paid`) columns as **strings**. The Flutter models
- * expect real numbers, so every numeric field must be coerced here.
- */
 function subscriptionRowToJson(row: any) {
     return {
         id: Number(row.id),
@@ -569,8 +571,8 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
                 },
             });
         } catch (err: any) {
-            const failureMessage =
-                err?.message || 'Could not start the payment.';
+            const rawMessage = err?.message || 'Could not start the payment.';
+            const failureMessage = getUserFriendlyErrorMessage(rawMessage);
 
             await pool.query(
                 `UPDATE public.subscription_payments
@@ -591,9 +593,7 @@ router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, 
             });
         }
 
-        // Rich status for the client (may be 'pay_offline' / 'send_otp').
         const status = normaliseStatus(charge.status);
-        // Narrow status for the DB CHECK constraint.
         const dbStatus = toDbPaymentStatus(charge.status);
 
         await pool.query(
@@ -669,17 +669,16 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
         try {
             submitted = await submitOtp({ reference, otp });
         } catch (err: any) {
+            const rawMessage = err?.message || 'The verification code could not be accepted.';
             return res.status(400).json({
                 success: false,
                 status: 'send_otp',
                 code: 'OTP_SUBMISSION_FAILED',
-                message: err?.message || 'The verification code could not be accepted.',
+                message: getUserFriendlyErrorMessage(rawMessage),
             });
         }
 
-        // Rich status for the client.
         const status = normaliseStatus(submitted.status);
-        // Narrow status for the DB CHECK constraint.
         const dbStatus = toDbPaymentStatus(submitted.status);
 
         await pool.query(
@@ -718,10 +717,13 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
         }
 
         if (status === 'failed' || status === 'reversed') {
+            const gatewayResponse = submitted.raw?.data?.gateway_response || submitted.raw?.message || '';
+            const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
+
             return res.json({
                 success: false,
                 status,
-                message: statusMessage(status),
+                message: failureMessage,
             });
         }
 
@@ -814,17 +816,20 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
         }
 
         if (status === 'failed' || status === 'reversed') {
+            const gatewayResponse = paystackData?.gateway_response || verified.raw?.message || '';
+            const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
+
             await pool.query(
                 `UPDATE public.subscription_payments
-                    SET status = $1, paystack_verify = $2::jsonb, updated_at = NOW()
-                  WHERE reference = $3 AND applied = false`,
-                [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), reference],
+                    SET status = $1, paystack_verify = $2::jsonb, failure_reason = $3, updated_at = NOW()
+                  WHERE reference = $4 AND applied = false`,
+                [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), failureMessage, reference],
             );
 
             return res.json({
                 success: false,
                 status,
-                message: statusMessage(status),
+                message: failureMessage,
             });
         }
 
@@ -1123,13 +1128,17 @@ export async function handleSubscriptionWebhook(
     }
 
     if (event === 'charge.failed') {
+        const gatewayResponse = data?.gateway_response || '';
+        const failureMessage = getUserFriendlyErrorMessage(gatewayResponse);
+
         await pool.query(
             `UPDATE public.subscription_payments
                 SET status = 'failed',
                     paystack_verify = $1::jsonb,
+                    failure_reason = $2,
                     updated_at = NOW()
-              WHERE reference = $2 AND applied = false`,
-            [JSON.stringify(payload), reference],
+              WHERE reference = $3 AND applied = false`,
+            [JSON.stringify(payload), failureMessage || 'Payment failed.', reference],
         );
     }
 
