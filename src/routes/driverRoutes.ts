@@ -28,13 +28,6 @@ const router = Router();
 |--------------------------------------------------------------------------
 | OTP endpoints (unauthenticated)
 |--------------------------------------------------------------------------
-|
-| Mounts:
-|   POST /api/drivers/otp/send
-|   POST /api/drivers/otp/verify
-|
-| Phone-ownership verification only — no Firebase token required.
-|--------------------------------------------------------------------------
 */
 
 router.use('/otp', createOtpRouter('driver'));
@@ -42,19 +35,6 @@ router.use('/otp', createOtpRouter('driver'));
 /*
 |--------------------------------------------------------------------------
 | Subscription endpoints (Firebase-authenticated)
-|--------------------------------------------------------------------------
-|
-| Mounts:
-|   GET  /api/drivers/subscription/plans
-|   GET  /api/drivers/subscription/current
-|   POST /api/drivers/subscription/activate-trial
-|   POST /api/drivers/subscription/initialize
-|   POST /api/drivers/subscription/submit-otp
-|   GET  /api/drivers/subscription/verify/:reference
-|   GET  /api/drivers/subscription/payments
-|
-| Must be mounted BEFORE the /:uid/... routes so the literal
-| "subscription" prefix is not swallowed by the wildcard param routes.
 |--------------------------------------------------------------------------
 */
 
@@ -391,6 +371,32 @@ router.post(
                 });
             }
 
+            // ----------------------------------------------------------
+            // Determine the initial status.
+            //
+            // New drivers are created as 'approved' so they can go
+            // online and accept rides immediately after registration
+            // and subscription activation. We no longer gate going
+            // online on a manual admin review.
+            //
+            // The client may send an explicit status (e.g. 'active'),
+            // but we whitelist it so nothing unexpected (e.g. 'banned')
+            // can be injected through the request body.
+            // ----------------------------------------------------------
+            const ALLOWED_INITIAL_STATUSES = [
+                'approved',
+                'active',
+                'pending',
+            ];
+            const requestedStatus =
+                typeof req.body?.status === 'string'
+                    ? req.body.status.toLowerCase().trim()
+                    : '';
+            const initialStatus =
+                ALLOWED_INITIAL_STATUSES.includes(requestedStatus)
+                    ? requestedStatus
+                    : 'approved';
+
             const result = await pool.query(
                 `
                 INSERT INTO public.drivers (
@@ -453,7 +459,7 @@ router.post(
                     $23,
                     false,
                     false,
-                    'pending',
+                    $24,
                     5.0,
                     0,
                     0,
@@ -491,6 +497,7 @@ router.post(
                     mobile_money_provider ||
                     null,
                     mobile_money_number || null,
+                    initialStatus,
                 ],
             );
 
@@ -1782,19 +1789,25 @@ router.post(
             const driver =
                 driverResult.rows[0];
 
+            // Only explicit disciplinary states block going online.
+            // 'pending', 'active', 'approved' are all allowed.
+            const BLOCKED_STATUSES = [
+                'rejected',
+                'suspended',
+                'deactivated',
+            ];
+
             if (
                 isOnline &&
-                driver.status !==
-                'approved'
+                BLOCKED_STATUSES.includes(
+                    String(driver.status),
+                )
             ) {
                 return res.status(403).json({
                     success: false,
-                    message:
-                        'Cannot go online. Driver account is not approved.',
-                    code:
-                        'NOT_APPROVED',
-                    status:
-                        driver.status,
+                    message: `Cannot go online. Driver account is ${driver.status}. Please contact support.`,
+                    code: 'ACCOUNT_BLOCKED',
+                    status: driver.status,
                 });
             }
 
@@ -1992,19 +2005,28 @@ router.patch(
                         });
                 }
 
+                // Same guard as /update-status: only explicit
+                // disciplinary states block going online.
+                const BLOCKED_STATUSES = [
+                    'rejected',
+                    'suspended',
+                    'deactivated',
+                ];
+
                 if (
-                    check.rows[0]
-                        .status !==
-                    'approved'
+                    BLOCKED_STATUSES.includes(
+                        String(
+                            check.rows[0]
+                                .status,
+                        ),
+                    )
                 ) {
                     return res
                         .status(403)
                         .json({
                             success: false,
-                            message:
-                                'Cannot go online. Driver account is not approved.',
-                            code:
-                                'NOT_APPROVED',
+                            message: `Cannot go online. Driver account is ${check.rows[0].status}.`,
+                            code: 'ACCOUNT_BLOCKED',
                             status:
                                 check.rows[0]
                                     .status,
