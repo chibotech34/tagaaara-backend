@@ -379,22 +379,34 @@ router.post(
             // and subscription activation. We no longer gate going
             // online on a manual admin review.
             //
-            // The client may send an explicit status (e.g. 'active'),
-            // but we whitelist it so nothing unexpected (e.g. 'banned')
-            // can be injected through the request body.
+            // drivers_status_check only permits:
+            //   pending | approved | rejected | suspended | deactivated
+            //
+            // Historically this list also contained 'active', which is
+            // NOT a valid value on the check constraint and caused every
+            // insert to fail with 23514. The whitelist is now narrowed
+            // so any request value (including legacy 'active') is
+            // coerced to 'approved' before it reaches Postgres.
             // ----------------------------------------------------------
             const ALLOWED_INITIAL_STATUSES = [
                 'approved',
-                'active',
                 'pending',
-            ];
+            ] as const;
+
             const requestedStatus =
                 typeof req.body?.status === 'string'
                     ? req.body.status.toLowerCase().trim()
                     : '';
-            const initialStatus =
-                ALLOWED_INITIAL_STATUSES.includes(requestedStatus)
-                    ? requestedStatus
+
+            const initialStatus:
+                | (typeof ALLOWED_INITIAL_STATUSES)[number]
+                | 'approved' =
+                (ALLOWED_INITIAL_STATUSES as readonly string[]).includes(
+                    requestedStatus,
+                )
+                    ? (requestedStatus as
+                        | 'approved'
+                        | 'pending')
                     : 'approved';
 
             const result = await pool.query(
@@ -527,6 +539,20 @@ router.post(
                     message:
                         'A driver with this UID, phone number, or vehicle registration already exists.',
                     code: 'DRIVER_DUPLICATE',
+                });
+            }
+
+            if (dbError.code === '23514') {
+                // Check-constraint violation. Historically produced by
+                // drivers_status_check when 'active' was sent. Now that
+                // the whitelist is narrowed this should not happen, but
+                // we surface a precise error if it ever does.
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Registration rejected because a field failed a database constraint.',
+                    code: 'DB_CONSTRAINT_VIOLATION',
+                    detail: dbError.detail,
                 });
             }
 
