@@ -309,6 +309,18 @@ router.get('/plans', verifyFirebaseToken, async (_req, res) => {
 
 /**
  * GET /current
+ *
+ * Returns the most recent subscription row (if any), plus a top-level
+ * `trial_used` that is *history-based* — it is TRUE if the passenger has
+ * ever consumed a trial, regardless of whether the current row is the
+ * trial or a paid plan.
+ *
+ * Notes:
+ *  - Uses `LEFT JOIN` so a row whose plan was later deactivated/renamed
+ *    doesn't vanish from the client.
+ *  - Paid rows are stored with `trial_used = FALSE`, so computing the
+ *    flag from the current row alone would wrongly allow a second trial
+ *    after a paid period expires.
  */
 router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
     try {
@@ -322,33 +334,40 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
         }
         const passenger = await passengerForUid(uid);
         if (!passenger) {
-            return res.status(200).json({ success: true, subscription: null });
+            return res.status(200).json({
+                success: true,
+                subscription: null,
+                trial_used: false,
+            });
         }
+
+        // History-based trial_used.
+        const usedRes = await pool.query(
+            `SELECT EXISTS(
+               SELECT 1 FROM public.passenger_subscriptions
+                WHERE passenger_id = $1 AND trial_used = TRUE
+             ) AS used`,
+            [passenger.id],
+        );
+        const trialUsedEver = usedRes.rows[0].used === true;
 
         const r = await pool.query(
             `SELECT s.id, s.plan_id, s.status, s.starts_at, s.expires_at,
-              s.is_trial, s.trial_used, s.price_paid, s.currency,
-              p.name AS plan_name, p.type AS plan_type
-         FROM public.passenger_subscriptions s
-         JOIN public.subscription_plans p ON p.id = s.plan_id
-        WHERE s.passenger_id = $1
-        ORDER BY s.created_at DESC
-        LIMIT 1`,
+                    s.is_trial, s.trial_used, s.price_paid, s.currency,
+                    p.name AS plan_name, p.type AS plan_type
+               FROM public.passenger_subscriptions s
+               LEFT JOIN public.subscription_plans p ON p.id = s.plan_id
+              WHERE s.passenger_id = $1
+              ORDER BY s.created_at DESC
+              LIMIT 1`,
             [passenger.id],
         );
 
         if (r.rows.length === 0) {
-            const t = await pool.query(
-                `SELECT EXISTS(
-           SELECT 1 FROM public.passenger_subscriptions
-            WHERE passenger_id = $1 AND trial_used = TRUE
-         ) AS used`,
-                [passenger.id],
-            );
             return res.status(200).json({
                 success: true,
                 subscription: null,
-                trial_used: t.rows[0].used,
+                trial_used: trialUsedEver,
             });
         }
 
@@ -364,11 +383,12 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
 
         return res.status(200).json({
             success: true,
+            trial_used: trialUsedEver,
             subscription: {
                 id: row.id,
                 plan_id: row.plan_id,
-                plan_name: row.plan_name,
-                plan_type: row.plan_type,
+                plan_name: row.plan_name ?? 'Subscription',
+                plan_type: row.plan_type ?? '',
                 status,
                 starts_at: row.starts_at,
                 expires_at: row.expires_at,
