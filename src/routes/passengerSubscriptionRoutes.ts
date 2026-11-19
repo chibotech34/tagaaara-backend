@@ -1,16 +1,3 @@
-// src/routes/passengerSubscriptionRoutes.ts
-//
-// Passenger subscription endpoints. Shares public.subscription_plans with
-// the driver flow. Persists state to:
-//   - public.passenger_subscriptions          (current state)
-//   - public.passenger_subscription_payments  (history, plan_id mapping)
-//   - public.paystack_transactions            (Paystack raw audit log)
-//
-// Mounted by passengerRoutes.ts at:  /api/passengers/subscription/*
-//
-// Required env:
-//   PAYSTACK_SECRET_KEY   (same secret used by driver subscription flow)
-
 import {
     Router,
     Request,

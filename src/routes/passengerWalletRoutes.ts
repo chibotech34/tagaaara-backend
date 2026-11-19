@@ -65,10 +65,58 @@ function statusMessage(status: PaymentStatus): string {
     }
 }
 
-function validProvider(value: unknown): value is PaystackProvider {
-    return ['mtn', 'vod', 'atl'].includes(
-        String(value ?? '').trim().toLowerCase(),
-    );
+/* --------------------------------------------------------------------------
+ * Provider normalisation.
+ *
+ * The server's canonical Paystack mobile-money codes are:
+ *     'mtn'  → MTN Mobile Money
+ *     'vod'  → Vodafone / Telecel Cash
+ *     'atl'  → AirtelTigo Money
+ *
+ * The Flutter client may send UI labels ("MTN Mobile Money"), snake_case
+ * ("mtn_momo"), kebab-case ("mtn-momo"), or historical brand names
+ * ("Telecel", "Tigo"). We normalise all of them to the canonical code
+ * before anything reaches Paystack.
+ * -------------------------------------------------------------------------- */
+
+const PROVIDER_ALIASES: Record<string, PaystackProvider> = {
+    // --- MTN ---
+    mtn: 'mtn',
+    'mtn momo': 'mtn',
+    'mtn mobile money': 'mtn',
+
+    // --- Vodafone / Telecel ---
+    vod: 'vod',
+    vodafone: 'vod',
+    'vodafone cash': 'vod',
+    telecel: 'vod',
+    'telecel cash': 'vod',
+
+    // --- AirtelTigo / Tigo ---
+    atl: 'atl',
+    airteltigo: 'atl',
+    'airteltigo money': 'atl',
+    tigo: 'atl',
+    'tigo cash': 'atl',
+};
+
+/**
+ * Normalise any user-supplied provider string to a `PaystackProvider`.
+ *
+ * - Trims whitespace
+ * - Lowercases
+ * - Collapses `_`, `-`, and runs of whitespace into a single space
+ * - Looks up the canonical code in `PROVIDER_ALIASES`
+ *
+ * Returns `null` for unknown values so the caller can respond with a
+ * descriptive 400.
+ */
+function normalizeProvider(value: unknown): PaystackProvider | null {
+    const raw = String(value ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_-]+/g, ' ');
+    return PROVIDER_ALIASES[raw] ?? null;
 }
 
 function amountToGHS(value: unknown): number {
@@ -818,9 +866,6 @@ router.post(
 
 /* ==========================================================================
  * GET /passengers/wallet/pending-payment-ride
- *
- * Now also returns the driver's phone and MoMo details so the payment
- * dialog can display them.
  * ========================================================================== */
 
 router.get(
@@ -1198,16 +1243,22 @@ async function initializePayment(
             .json({ success: false, message: 'Unauthenticated.' });
 
     const providedPhone = String(req.body?.phone ?? '').trim();
-    const providerText = String(req.body?.provider ?? '')
-        .trim()
-        .toLowerCase();
+    const rawProvider = String(req.body?.provider ?? '').trim();
+    const provider = normalizeProvider(rawProvider);
     const amountInput = Number(req.body?.amount);
     const rideId = Number(req.body?.ride_id);
 
-    if (!validProvider(providerText)) {
+    // Self-diagnosing provider gate: echo what we received so the client
+    // (and the developer) can see exactly which value failed validation.
+    if (!provider) {
         return res.status(400).json({
             success: false,
-            message: 'Unsupported mobile money provider.',
+            code: 'INVALID_PROVIDER',
+            message:
+                `Unsupported mobile money provider "${rawProvider || '(none)'}". ` +
+                `Allowed values: mtn, vod, atl.`,
+            receivedProvider: rawProvider || null,
+            allowedProviders: ['mtn', 'vod', 'atl'],
         });
     }
 
@@ -1295,7 +1346,6 @@ async function initializePayment(
             }
         }
 
-        const provider = providerText as PaystackProvider;
         const email =
             (req.decodedToken as any)?.email ||
             passenger.email ||
@@ -1365,11 +1415,17 @@ async function initializePayment(
             provider,
             ...(purpose === 'ride_payment' ? { rideId } : {}),
         });
-    } catch (error) {
+    } catch (error: any) {
         console.error(`Initialize ${purpose} failed:`, error);
+        // Surface the real error so the client stops guessing. If
+        // `paystackService.ts` throws "unknown mobile money provider",
+        // it will now be visible to the caller instead of being masked
+        // by a generic message.
         return res.status(500).json({
             success: false,
+            code: 'INITIALIZE_FAILED',
             message:
+                error?.message ??
                 'Could not initiate the Mobile Money payment. Please try again.',
         });
     }
@@ -1518,11 +1574,13 @@ async function submitPaymentOtp(
             status,
             message: statusMessage(status),
         });
-    } catch (error) {
+    } catch (error: any) {
         console.error('OTP submission failed:', error);
         return res.status(500).json({
             success: false,
-            message: 'Failed to submit verification code.',
+            code: 'OTP_SUBMISSION_FAILED',
+            message:
+                error?.message ?? 'Failed to submit verification code.',
         });
     }
 }
@@ -1670,11 +1728,14 @@ async function verifyPayment(
             reference,
             message: statusMessage(status),
         });
-    } catch (error) {
+    } catch (error: any) {
         console.error('Payment verification failed:', error);
         return res.status(500).json({
             success: false,
-            message: 'Failed to verify payment. Please try again.',
+            code: 'PAYMENT_VERIFY_FAILED',
+            message:
+                error?.message ??
+                'Failed to verify payment. Please try again.',
         });
     }
 }
