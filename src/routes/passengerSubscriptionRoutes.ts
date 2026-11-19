@@ -96,10 +96,21 @@ async function paystackGet(path: string) {
 }
 
 function normalizeProvider(raw: string): 'mtn' | 'vod' | 'atl' | null {
-    const s = String(raw ?? '').trim().toLowerCase();
-    if (s === 'mtn') return 'mtn';
-    if (s === 'vod' || s === 'telecel' || s === 'vodafone') return 'vod';
-    if (s === 'atl' || s === 'airteltigo') return 'atl';
+    // Flutter sends Ghana Paystack codes (mtn-gh, vod-gh, atl-gh).
+    // Paystack's /charge endpoint expects the short provider codes.
+    const s = String(raw ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/[_\s]/g, '-');
+
+    if (['mtn', 'mtn-gh'].includes(s)) return 'mtn';
+    if (['vod', 'vod-gh', 'telecel', 'telecel-gh', 'vodafone', 'vodafone-gh'].includes(s)) {
+        return 'vod';
+    }
+    if (['atl', 'atl-gh', 'airteltigo', 'airteltigo-gh', 'airtel-tigo'].includes(s)) {
+        return 'atl';
+    }
+
     return null;
 }
 
