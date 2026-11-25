@@ -1,238 +1,51 @@
 // src/routes/driverSubscriptionRoutes.ts
 import { Router, Request, Response, NextFunction } from 'express';
+
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
-import {
-    initializeMobileMoneyCharge,
-    submitOtp,
-    verifyTransaction,
-    generateReference,
-    fromPesewas,
-    verifyWebhookSignature,
-    type PaystackProvider,
-} from '../services/paystackService';
 
+// ── Paystack config ─────────────────────────────────────────────────
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY || '';
+const PAYSTACK_BASE = 'https://api.paystack.co';
+
+// ── Router ──────────────────────────────────────────────────────────
 const router = Router();
 
-/* --------------------------------------------------------------------------- */
-/* Types                                                                       */
-/* --------------------------------------------------------------------------- */
+/* ===================================================================
+ * Auth middleware
+ * ================================================================ */
 
-interface AuthedDriverRequest extends Request {
+interface AuthedRequest extends Request {
     driverId?: number;
-    firebaseUid?: string;
+    driverUid?: string;
 }
 
-type PaymentStatus =
-    | 'success' | 'pending' | 'pay_offline'
-    | 'send_otp' | 'failed' | 'reversed' | 'refunded';
-
-type DbPaymentStatus = 'pending' | 'success' | 'failed' | 'reversed' | 'refunded';
-
-/* --------------------------------------------------------------------------- */
-/* Helpers                                                                     */
-/* --------------------------------------------------------------------------- */
-
-function toStr(value: unknown): string {
-    if (typeof value === 'string') return value.trim();
-    if (Array.isArray(value)) {
-        const first = value[0];
-        return typeof first === 'string' ? first.trim() : '';
-    }
-    if (value === undefined || value === null) return '';
-    return String(value).trim();
-}
-
-function toPaystackProvider(value: unknown): PaystackProvider | null {
-    const s = String(value ?? '').trim().toLowerCase();
-    if (!s) return null;
-    if (s === 'mtn' || s === 'mtn-gh' || s.includes('mtn')) return 'mtn';
-    if (s === 'vod' || s === 'vod-gh' || s.includes('vod') || s.includes('telecel')) return 'vod';
-    if (s === 'atl' || s === 'atl-gh' || s.includes('atl') || s.includes('airtel')) return 'atl';
-    return null;
-}
-
-function normalizeGhanaMobileNumber(value: unknown): string | null {
-    if (value === null || value === undefined) return null;
-    const n = String(value).trim().replace(/\s+/g, '').replace(/-/g, '');
-    if (/^0\d{9}$/.test(n)) return n;
-    if (/^\+233\d{9}$/.test(n)) return `0${n.substring(4)}`;
-    if (/^233\d{9}$/.test(n)) return `0${n.substring(3)}`;
-    return null;
-}
-
-function normaliseStatus(value: unknown): PaymentStatus {
-    const s = String(value ?? 'pending').toLowerCase();
-    const allowed: PaymentStatus[] = [
-        'success', 'pending', 'pay_offline', 'send_otp',
-        'failed', 'reversed', 'refunded',
-    ];
-    return allowed.includes(s as PaymentStatus) ? (s as PaymentStatus) : 'pending';
-}
-
-function toDbPaymentStatus(paystackStatus: unknown): DbPaymentStatus {
-    const s = String(paystackStatus ?? '').toLowerCase();
-    if (s === 'success' || s === 'successful' || s === 'completed') return 'success';
-    if (s === 'failed') return 'failed';
-    if (s === 'reversed') return 'reversed';
-    if (s === 'refunded') return 'refunded';
-    return 'pending';
-}
-
-function statusMessage(status: PaymentStatus): string {
-    switch (status) {
-        case 'success':
-            return 'Subscription payment confirmed.';
-        case 'pay_offline':
-            return 'Check your phone and approve the Mobile Money prompt.';
-        case 'send_otp':
-            return 'Enter the verification code sent to your phone.';
-        case 'failed':
-        case 'reversed':
-            return 'The payment was not successful. Please try again.';
-        default:
-            return 'Your payment is processing. Please wait for confirmation.';
-    }
-}
-
-/**
- * Translates Paystack gateway errors (like "Insufficient funds") into
- * clean, user-facing messages.
- */
-function getUserFriendlyErrorMessage(rawMessage: string): string {
-    const lower = rawMessage.toLowerCase();
-
-    if (
-        lower.includes('insufficient') ||
-        lower.includes('funds') ||
-        lower.includes('balance') ||
-        lower.includes('declined')
-    ) {
-        return 'Insufficient balance in your Mobile Money wallet. Please top up and try again.';
-    }
-
-    return rawMessage;
-}
-
-async function expireStaleSubscriptions(driverId: number): Promise<void> {
-    await pool.query(
-        `UPDATE public.driver_subscriptions
-            SET status = 'expired', updated_at = NOW()
-          WHERE driver_id = $1
-            AND status IN ('trial','active')
-            AND expires_at IS NOT NULL
-            AND expires_at <= NOW()`,
-        [driverId],
-    );
-}
-
-function subscriptionRowToJson(row: any) {
-    return {
-        id: Number(row.id),
-        driver_id: Number(row.driver_id),
-        plan_id: Number(row.plan_id),
-        plan_name: row.plan_name ?? 'Subscription',
-        plan_type: row.plan_type ?? 'monthly',
-        status: row.status,
-        starts_at: row.starts_at,
-        expires_at: row.expires_at,
-        is_trial: row.is_trial === true,
-        trial_used: row.has_used_trial ?? row.trial_used ?? false,
-        currency: row.currency ?? 'GHS',
-        price_paid: Number(row.price_paid) || 0,
-    };
-}
-
-async function fetchSubscription(subscriptionId: number | null) {
-    if (!subscriptionId) return null;
-
-    const r = await pool.query(
-        `SELECT ds.*,
-                sp.name AS plan_name,
-                sp.type AS plan_type,
-                EXISTS (
-                    SELECT 1 FROM public.driver_subscriptions t
-                     WHERE t.driver_id = ds.driver_id
-                       AND t.is_trial   = true
-                ) AS has_used_trial
-           FROM public.driver_subscriptions ds
-           JOIN public.subscription_plans  sp ON sp.id = ds.plan_id
-          WHERE ds.id = $1
-          LIMIT 1`,
-        [subscriptionId],
-    );
-
-    return r.rows.length ? subscriptionRowToJson(r.rows[0]) : null;
-}
-
-/* --------------------------------------------------------------------------- */
-/* Firebase auth middleware                                                    */
-/* --------------------------------------------------------------------------- */
-
-async function authenticateDriver(
-    req: AuthedDriverRequest,
+const requireDriver = async (
+    req: AuthedRequest,
     res: Response,
     next: NextFunction,
-): Promise<void> {
+): Promise<void> => {
+    const header = req.headers.authorization || '';
+    if (!header.startsWith('Bearer ')) {
+        res.status(401).json({
+            success: false,
+            message: 'Missing Authorization header.',
+            code: 'AUTH_HEADER_MISSING',
+        });
+        return;
+    }
+    const token = header.substring('Bearer '.length).trim();
+    if (!token) {
+        res.status(401).json({
+            success: false,
+            message: 'Firebase ID token is missing.',
+            code: 'AUTH_TOKEN_MISSING',
+        });
+        return;
+    }
+
     try {
-        const authHeader = toStr(req.headers.authorization);
-
-        if (!authHeader || !authHeader.startsWith('Bearer ')) {
-            res.status(401).json({
-                success: false,
-                message: 'Missing or invalid Authorization header.',
-                code: 'AUTH_HEADER_MISSING',
-            });
-            return;
-        }
-
-        const token = authHeader.substring('Bearer '.length).trim();
-        if (!token) {
-            res.status(401).json({
-                success: false,
-                message: 'Firebase ID token is missing.',
-                code: 'AUTH_TOKEN_MISSING',
-            });
-            return;
-        }
-
-        let decoded;
-        try {
-            decoded = await firebaseAuth.verifyIdToken(token, true);
-        } catch (err: any) {
-            const code = err?.code;
-            if (code === 'auth/id-token-expired') {
-                res.status(401).json({
-                    success: false,
-                    message: 'Session expired. Please sign in again.',
-                    code: 'AUTH_TOKEN_EXPIRED',
-                });
-                return;
-            }
-            if (code === 'auth/id-token-revoked') {
-                res.status(401).json({
-                    success: false,
-                    message: 'Session revoked. Please sign in again.',
-                    code: 'AUTH_TOKEN_REVOKED',
-                });
-                return;
-            }
-            res.status(401).json({
-                success: false,
-                message: 'Firebase authentication failed.',
-                code: 'AUTH_TOKEN_INVALID',
-            });
-            return;
-        }
-
-        if (!decoded?.uid) {
-            res.status(401).json({
-                success: false,
-                message: 'Invalid token payload.',
-                code: 'AUTH_TOKEN_INVALID',
-            });
-            return;
-        }
+        const decoded = await firebaseAuth.verifyIdToken(token);
 
         const driver = await pool.query(
             `SELECT id FROM public.drivers WHERE uid = $1 LIMIT 1`,
@@ -242,897 +55,705 @@ async function authenticateDriver(
         if (driver.rows.length === 0) {
             res.status(404).json({
                 success: false,
-                message: 'Driver account not found.',
+                message: 'Driver not found.',
                 code: 'DRIVER_NOT_FOUND',
             });
             return;
         }
 
-        req.driverId = Number(driver.rows[0].id);
-        req.firebaseUid = decoded.uid;
+        req.driverUid = decoded.uid;
+        req.driverId = driver.rows[0].id;
         next();
-    } catch (err) {
-        console.error('Subscription auth error:', err);
-        res.status(500).json({
+    } catch (err: any) {
+        console.error('❌ Firebase verify failed:', err?.message ?? err);
+        res.status(401).json({
             success: false,
-            message: 'Authentication failed.',
-            code: 'AUTHENTICATION_FAILED',
+            message: 'Firebase authentication failed.',
+            code: 'AUTH_TOKEN_INVALID',
         });
     }
+};
+
+/* ===================================================================
+ * Helpers
+ * ================================================================ */
+
+/**
+ * Express types `req.params.x` as `string | string[]` (repeatable params).
+ * Everything we pass to Postgres / Paystack / fetch must be a single
+ * string, so collapse the array case here once instead of at every
+ * call site.
+ */
+const firstParam = (v: string | string[] | undefined): string => {
+    if (v === undefined) return '';
+    return Array.isArray(v) ? (v[0] ?? '') : v;
+};
+
+function toPaystackProvider(code: string): 'mtn' | 'vod' | 'atl' | null {
+    const lower = String(code || '').toLowerCase();
+    if (lower.includes('mtn')) return 'mtn';
+    if (lower.includes('vod') || lower.includes('telecel')) return 'vod';
+    if (
+        lower.includes('atl') ||
+        lower.includes('airtel') ||
+        lower.includes('tigo')
+    ) {
+        return 'atl';
+    }
+    return null;
 }
 
-/* ===========================================================================
+async function paystackRequest(
+    path: string,
+    method: 'GET' | 'POST' = 'GET',
+    body?: Record<string, unknown>,
+): Promise<{ ok: boolean; status: number; data: any }> {
+    const res = await fetch(`${PAYSTACK_BASE}${path}`, {
+        method,
+        headers: {
+            Authorization: `Bearer ${PAYSTACK_SECRET}`,
+            'Content-Type': 'application/json',
+        },
+        body: body ? JSON.stringify(body) : undefined,
+    });
+
+    let data: any = {};
+    try {
+        data = await res.json();
+    } catch {
+        /* ignore */
+    }
+    return { ok: res.ok, status: res.status, data };
+}
+
+/** Load a driver subscription with its plan & driver info joined in. */
+async function loadSubscription(driverId: number): Promise<any | null> {
+    const result = await pool.query(
+        `SELECT
+        ds.id,
+        ds.driver_id,
+        ds.plan_id,
+        ds.status,
+        ds.starts_at,
+        ds.expires_at,
+        ds.created_at,
+        ds.updated_at,
+        sp.name          AS plan_name,
+        sp.type          AS plan_type,
+        sp.price         AS plan_price,
+        sp.currency      AS plan_currency,
+        sp.duration_days AS plan_duration_days,
+        d.trial_used
+     FROM public.driver_subscriptions ds
+     JOIN public.subscription_plans sp ON sp.id = ds.plan_id
+     JOIN public.drivers d             ON d.id  = ds.driver_id
+     WHERE ds.driver_id = $1
+     ORDER BY ds.created_at DESC
+     LIMIT 1`,
+        [driverId],
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const row = result.rows[0];
+
+    // Auto-expire stale active subscriptions so the client sees the truth.
+    if (
+        row.status === 'active' &&
+        row.expires_at &&
+        new Date(row.expires_at).getTime() <= Date.now()
+    ) {
+        await pool.query(
+            `UPDATE public.driver_subscriptions
+          SET status = 'expired', updated_at = NOW()
+        WHERE id = $1`,
+            [row.id],
+        );
+        row.status = 'expired';
+    }
+
+    // Normalise the shape Flutter expects.
+    return {
+        ...row,
+        type: row.plan_type,        // DriverSubscription reads `type`
+        trial_used: !!row.trial_used,
+    };
+}
+
+/* ===================================================================
  * GET /api/drivers/subscription/plans
- * ========================================================================= */
-router.get('/plans', authenticateDriver, async (_req, res) => {
+ * ================================================================ */
+
+router.get('/plans', async (_req: Request, res: Response) => {
     try {
         const result = await pool.query(
             `SELECT id, name, type, price, currency, duration_days,
-                    description, is_active, sort_order
-               FROM public.subscription_plans
-              WHERE is_active = true
-              ORDER BY sort_order ASC, id ASC`,
+              is_active, sort_order
+         FROM public.subscription_plans
+        WHERE is_active = true
+        ORDER BY sort_order NULLS LAST, id ASC`,
         );
 
-        res.json({
-            success: true,
-            plans: result.rows.map((r) => ({
-                id: Number(r.id),
-                name: r.name,
-                type: r.type,
-                price: Number(r.price) || 0,
-                currency: r.currency ?? 'GHS',
-                duration_days: Number(r.duration_days) || 0,
-                description: r.description ?? null,
-                is_active: r.is_active === true,
-            })),
-        });
-    } catch (err) {
-        console.error('GET /subscription/plans:', err);
-        res.status(500).json({
+        return res.status(200).json({ success: true, plans: result.rows });
+    } catch (err: any) {
+        console.error('❌ /plans:', err?.message ?? err);
+        return res.status(500).json({
             success: false,
-            message: 'Failed to load subscription plans.',
+            message: 'Failed to fetch subscription plans.',
         });
     }
 });
 
-/* ===========================================================================
+/* ===================================================================
  * GET /api/drivers/subscription/current
- * ========================================================================= */
-router.get('/current', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    try {
-        const driverId = req.driverId!;
-        await expireStaleSubscriptions(driverId);
+ * ================================================================ */
 
-        const result = await pool.query(
-            `SELECT ds.*,
-                    sp.name AS plan_name,
-                    sp.type AS plan_type,
-                    EXISTS (
-                        SELECT 1 FROM public.driver_subscriptions t
-                         WHERE t.driver_id = ds.driver_id
-                           AND t.is_trial   = true
-                    ) AS has_used_trial
-               FROM public.driver_subscriptions ds
-               JOIN public.subscription_plans  sp ON sp.id = ds.plan_id
-              WHERE ds.driver_id = $1
-              ORDER BY
-                    CASE ds.status
-                        WHEN 'active' THEN 0
-                        WHEN 'trial'  THEN 1
-                        ELSE 2
-                    END,
-                    ds.created_at DESC
-              LIMIT 1`,
-            [driverId],
-        );
-
-        if (result.rows.length === 0) {
-            return res.json({ success: true, subscription: null });
-        }
-
-        res.json({
-            success: true,
-            subscription: subscriptionRowToJson(result.rows[0]),
-        });
-    } catch (err) {
-        console.error('GET /subscription/current:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to load current subscription.',
-        });
-    }
-});
-
-/* ===========================================================================
- * POST /api/drivers/subscription/activate-trial
- * ========================================================================= */
-router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    const client = await pool.connect();
-
-    try {
-        const driverId = req.driverId!;
-        await client.query('BEGIN');
-
-        const used = await client.query(
-            `SELECT 1 FROM public.driver_subscriptions
-              WHERE driver_id = $1 AND is_trial = true
-              LIMIT 1`,
-            [driverId],
-        );
-
-        if (used.rows.length > 0) {
-            await client.query('ROLLBACK');
-            return res.status(409).json({
-                success: false,
-                code: 'TRIAL_ALREADY_USED',
-                message: 'Your free trial has already been used. Please choose a paid plan.',
-            });
-        }
-
-        const planRes = await client.query(
-            `SELECT * FROM public.subscription_plans
-              WHERE type = 'trial' AND is_active = true
-              LIMIT 1`,
-        );
-
-        if (planRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({
-                success: false,
-                message: 'Free trial is not currently available.',
-            });
-        }
-
-        const plan = planRes.rows[0];
-
-        await client.query(
-            `UPDATE public.driver_subscriptions
-                SET status = 'cancelled',
-                    cancelled_at = NOW(),
-                    cancellation_reason = 'replaced by trial activation',
-                    updated_at = NOW()
-              WHERE driver_id = $1 AND status IN ('active','trial')`,
-            [driverId],
-        );
-
-        const created = await client.query(
-            `INSERT INTO public.driver_subscriptions
-                (driver_id, plan_id, status, starts_at, expires_at,
-                 is_trial, trial_used, price_paid, currency)
-             VALUES (
-                $1, $2, 'trial',
-                NOW(),
-                NOW() + make_interval(days => $3::int),
-                true, true, 0, $4
-             )
-             RETURNING *`,
-            [driverId, plan.id, Number(plan.duration_days), plan.currency],
-        );
-
-        await client.query('COMMIT');
-
-        const sub = {
-            ...created.rows[0],
-            plan_name: plan.name,
-            plan_type: plan.type,
-            has_used_trial: true,
-        };
-
-        return res.status(201).json({
-            success: true,
-            message: 'Free trial activated.',
-            subscription: subscriptionRowToJson(sub),
-        });
-    } catch (err) {
-        try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-        console.error('POST /subscription/activate-trial:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to activate free trial.',
-        });
-    } finally {
-        client.release();
-    }
-});
-
-/* ===========================================================================
- * POST /api/drivers/subscription/initialize
- * ========================================================================= */
-router.post('/initialize', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    const driverId = req.driverId!;
-    const uid = req.firebaseUid!;
-
-    try {
-        const planId = Number(req.body?.plan_id);
-        if (!Number.isInteger(planId) || planId <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'plan_id is required.',
-            });
-        }
-
-        const provider = toPaystackProvider(req.body?.provider);
-        if (!provider) {
-            return res.status(400).json({
-                success: false,
-                message: 'Unsupported mobile money provider.',
-            });
-        }
-
-        const providedPhone = normalizeGhanaMobileNumber(req.body?.phone);
-
-        const planRes = await pool.query(
-            `SELECT * FROM public.subscription_plans
-              WHERE id = $1 AND is_active = true
-              LIMIT 1`,
-            [planId],
-        );
-
-        if (planRes.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Plan not found or inactive.',
-            });
-        }
-
-        const plan = planRes.rows[0];
-
-        if (plan.type === 'trial' || Number(plan.price) <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: 'Use /activate-trial for the free trial.',
-            });
-        }
-
-        const driverRes = await pool.query(
-            `SELECT id, email, phone, mobile_money_number
-               FROM public.drivers
-              WHERE id = $1
-              LIMIT 1`,
-            [driverId],
-        );
-
-        if (driverRes.rows.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'Driver not found.',
-            });
-        }
-
-        const driver = driverRes.rows[0];
-
-        let phone = providedPhone;
-        if (!phone) {
-            const acct = await pool.query(
-                `SELECT mobile_money_number
-                   FROM public.driver_payment_accounts
-                  WHERE driver_id = $1 AND is_active = true
-                  LIMIT 1`,
-                [driverId],
-            );
-            phone =
-                normalizeGhanaMobileNumber(acct.rows[0]?.mobile_money_number) ||
-                normalizeGhanaMobileNumber(driver.mobile_money_number) ||
-                normalizeGhanaMobileNumber(driver.phone);
-        }
-
-        if (!phone) {
-            return res.status(400).json({
-                success: false,
-                code: 'PHONE_REQUIRED',
-                message: 'No mobile money number on file. Please add one or pass one in the request body.',
-            });
-        }
-
-        const email =
-            driver.email || `driver+${uid.slice(0, 8)}@tegaara.app`;
-
-        const amountGHS = Number(plan.price);
-        const reference = `SUB-${generateReference('topup', uid)}`;
-
-        await pool.query(
-            `INSERT INTO public.subscription_payments
-                (driver_id, plan_id, reference, amount, currency,
-                 status, provider, channel, phone)
-             VALUES ($1, $2, $3, $4, $5,
-                     'pending', 'paystack', 'mobile_money', $6)`,
-            [driverId, plan.id, reference, amountGHS, plan.currency, phone],
-        );
-
-        let charge;
+router.get(
+    '/current',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
         try {
-            charge = await initializeMobileMoneyCharge({
+            const subscription = await loadSubscription(req.driverId!);
+            return res.status(200).json({ success: true, subscription });
+        } catch (err: any) {
+            console.error('❌ /current:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to fetch current subscription.',
+            });
+        }
+    },
+);
+
+/* ===================================================================
+ * POST /api/drivers/subscription/trial     ← THE MISSING ROUTE
+ * ================================================================ */
+
+router.post(
+    '/trial',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            const driver = await client.query(
+                `SELECT id, trial_used FROM public.drivers WHERE id = $1 FOR UPDATE`,
+                [req.driverId!],
+            );
+
+            if (driver.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res
+                    .status(404)
+                    .json({ success: false, message: 'Driver not found.' });
+            }
+
+            if (driver.rows[0].trial_used === true) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    success: false,
+                    message: 'The free trial has already been used.',
+                    code: 'TRIAL_ALREADY_USED',
+                });
+            }
+
+            // Block re-activation if any active subscription already exists.
+            const active = await client.query(
+                `SELECT id FROM public.driver_subscriptions
+          WHERE driver_id = $1
+            AND status = 'active'
+            AND (expires_at IS NULL OR expires_at > NOW())
+          LIMIT 1`,
+                [req.driverId!],
+            );
+            if (active.rows.length > 0) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({
+                    success: false,
+                    message: 'You already have an active subscription.',
+                    code: 'SUBSCRIPTION_ALREADY_ACTIVE',
+                });
+            }
+
+            const plan = await client.query(
+                `SELECT id FROM public.subscription_plans
+          WHERE type = 'trial' AND is_active = true
+          ORDER BY sort_order NULLS LAST, id ASC
+          LIMIT 1`,
+            );
+            if (plan.rows.length === 0) {
+                await client.query('ROLLBACK');
+                return res.status(503).json({
+                    success: false,
+                    message: 'Trial plan is not configured.',
+                    code: 'TRIAL_PLAN_MISSING',
+                });
+            }
+
+            await client.query(
+                `INSERT INTO public.driver_subscriptions
+            (driver_id, plan_id, status, starts_at, expires_at)
+         VALUES ($1, $2, 'active', NOW(), NOW() + INTERVAL '7 days')`,
+                [req.driverId!, plan.rows[0].id],
+            );
+
+            await client.query(
+                `UPDATE public.drivers
+            SET trial_used = true, updated_at = NOW()
+          WHERE id = $1`,
+                [req.driverId!],
+            );
+
+            await client.query('COMMIT');
+
+            const subscription = await loadSubscription(req.driverId!);
+            return res.status(201).json({ success: true, subscription });
+        } catch (err: any) {
+            await client.query('ROLLBACK');
+            console.error('❌ /trial:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                message: 'Could not activate free trial.',
+                code: 'TRIAL_ACTIVATION_FAILED',
+            });
+        } finally {
+            client.release();
+        }
+    },
+);
+
+/* ===================================================================
+ * POST /api/drivers/subscription/initialize
+ * ================================================================ */
+
+router.post(
+    '/initialize',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            const { plan_id, provider, phone } = req.body ?? {};
+
+            if (!plan_id) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'plan_id is required.',
+                    code: 'PLAN_ID_MISSING',
+                });
+            }
+
+            const psProvider = toPaystackProvider(String(provider || ''));
+            if (!psProvider) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Invalid Mobile Money provider.',
+                    code: 'INVALID_PROVIDER',
+                });
+            }
+
+            if (!phone || String(phone).replace(/\D/g, '').length < 10) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'A valid phone number is required.',
+                    code: 'INVALID_PHONE',
+                });
+            }
+
+            const plan = await pool.query(
+                `SELECT id, price, currency FROM public.subscription_plans
+          WHERE id = $1 AND is_active = true`,
+                [plan_id],
+            );
+            if (plan.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Plan not found.',
+                    code: 'PLAN_NOT_FOUND',
+                });
+            }
+
+            const p = plan.rows[0];
+            const amountPesewas = Math.round(Number(p.price) * 100);
+            if (!amountPesewas || amountPesewas < 100) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Plan amount is invalid.',
+                    code: 'INVALID_AMOUNT',
+                });
+            }
+
+            // Email is required by Paystack.
+            const driver = await pool.query(
+                `SELECT email FROM public.drivers WHERE id = $1`,
+                [req.driverId!],
+            );
+            const email =
+                driver.rows[0]?.email || `driver-${req.driverId}@tegaara.app`;
+
+            const charge = await paystackRequest('/charge', 'POST', {
                 email,
-                amountGHS,
-                phone,
-                provider,
-                reference,
-                metadata: {
-                    purpose: 'driver_subscription',
-                    planId: plan.id,
-                    planType: plan.type,
-                    driverId,
-                    userFirebaseUid: uid,
+                amount: amountPesewas,
+                currency: p.currency || 'GHS',
+                mobile_money: {
+                    phone: String(phone).replace(/\D/g, ''),
+                    provider: psProvider,
                 },
             });
-        } catch (err: any) {
-            const rawMessage = err?.message || 'Could not start the payment.';
-            const failureMessage = getUserFriendlyErrorMessage(rawMessage);
 
-            await pool.query(
-                `UPDATE public.subscription_payments
-                    SET status = 'failed',
-                        failure_reason = $1,
-                        updated_at = NOW()
-                  WHERE reference = $2 AND applied = false`,
-                [failureMessage, reference],
-            );
+            const data = charge.data?.data ?? {};
+            const reference: string = data.reference || '';
+            const status: string = (data.status || '').toLowerCase();
 
-            return res.status(200).json({
-                success: false,
-                reference,
-                status: 'failed',
-                message: failureMessage,
-                displayText: failureMessage,
-                needs_otp: false,
-            });
-        }
-
-        const status = normaliseStatus(charge.status);
-        const dbStatus = toDbPaymentStatus(charge.status);
-
-        await pool.query(
-            `UPDATE public.subscription_payments
-                SET status = $1,
-                    paystack_init = $2::jsonb,
-                    updated_at = NOW()
-              WHERE reference = $3`,
-            [dbStatus, JSON.stringify(charge.raw), reference],
-        );
-
-        const failed = status === 'failed' || status === 'reversed';
-
-        return res.status(200).json({
-            success: !failed,
-            reference,
-            status,
-            displayText: charge.displayText || statusMessage(status),
-            message: charge.displayText || statusMessage(status),
-            needs_otp: status === 'send_otp',
-            amount: amountGHS,
-            currency: plan.currency,
-        });
-    } catch (err) {
-        console.error('POST /subscription/initialize:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Could not initiate the subscription payment.',
-        });
-    }
-});
-
-/* ===========================================================================
- * POST /api/drivers/subscription/submit-otp
- * ========================================================================= */
-router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    const driverId = req.driverId!;
-    const reference = toStr(req.body?.reference);
-    const otp = toStr(req.body?.otp);
-
-    if (!reference) {
-        return res.status(400).json({ success: false, message: 'Reference is required.' });
-    }
-    if (!/^\d{4,8}$/.test(otp)) {
-        return res.status(400).json({ success: false, message: 'Enter a valid verification code.' });
-    }
-
-    try {
-        const txRes = await pool.query(
-            `SELECT * FROM public.subscription_payments
-              WHERE reference = $1 AND driver_id = $2
-              LIMIT 1`,
-            [reference, driverId],
-        );
-
-        if (txRes.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Payment not found.' });
-        }
-
-        const tx = txRes.rows[0];
-
-        if (tx.applied === true) {
-            const sub = await fetchSubscription(tx.subscription_id);
-            return res.json({
-                success: true,
-                status: 'success',
-                alreadyApplied: true,
-                subscription: sub,
-            });
-        }
-
-        let submitted;
-        try {
-            submitted = await submitOtp({ reference, otp });
-        } catch (err: any) {
-            const rawMessage = err?.message || 'The verification code could not be accepted.';
-            return res.status(400).json({
-                success: false,
-                status: 'send_otp',
-                code: 'OTP_SUBMISSION_FAILED',
-                message: getUserFriendlyErrorMessage(rawMessage),
-            });
-        }
-
-        const status = normaliseStatus(submitted.status);
-        const dbStatus = toDbPaymentStatus(submitted.status);
-
-        await pool.query(
-            `UPDATE public.subscription_payments
-                SET status = $1,
-                    paystack_verify = $2::jsonb,
-                    updated_at = NOW()
-              WHERE reference = $3 AND applied = false`,
-            [dbStatus, JSON.stringify(submitted.raw), reference],
-        );
-
-        if (status === 'success') {
-            const result = await applySuccessfulSubscriptionPayment(
-                reference,
-                submitted.raw?.data ?? submitted.raw ?? {},
-            );
-
-            if (!result.applied) {
-                return res.status(503).json({
+            if (!charge.ok && !reference) {
+                return res.status(502).json({
                     success: false,
-                    status: 'pending',
-                    code: 'PAYMENT_CREDIT_PENDING',
-                    reference,
+                    status: 'failed',
                     message:
-                        'Payment received but the subscription update is not yet confirmed. ' +
-                        'Do not pay again; check the status shortly.',
+                        charge.data?.message ||
+                        'Could not start the payment. Please try again.',
                 });
             }
 
-            return res.json({
-                success: true,
-                status: 'success',
-                alreadyApplied: result.alreadyApplied,
-                subscription: result.subscription,
-            });
-        }
-
-        if (status === 'failed' || status === 'reversed') {
-            // FIX: Cast to any to avoid TypeScript error
-            const rawData = (submitted.raw?.data ?? submitted.raw ?? {}) as any;
-            const gatewayResponse = rawData?.gateway_response || rawData?.message || '';
-            const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
-
-            return res.json({
-                success: false,
-                status,
-                message: failureMessage,
-            });
-        }
-
-        return res.json({
-            success: true,
-            status,
-            needs_otp: status === 'send_otp',
-            message: statusMessage(status),
-        });
-    } catch (err) {
-        console.error('POST /subscription/submit-otp:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to submit verification code.',
-        });
-    }
-});
-
-/* ===========================================================================
- * GET /api/drivers/subscription/verify/:reference
- * ========================================================================= */
-router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    const driverId = req.driverId!;
-    const reference = toStr(req.params.reference);
-
-    if (!reference) {
-        return res.status(400).json({ success: false, message: 'Reference is required.' });
-    }
-
-    try {
-        const txRes = await pool.query(
-            `SELECT * FROM public.subscription_payments
-              WHERE reference = $1 AND driver_id = $2
-              LIMIT 1`,
-            [reference, driverId],
-        );
-
-        if (txRes.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'Payment not found.' });
-        }
-
-        const tx = txRes.rows[0];
-
-        if (tx.applied === true) {
-            const sub = await fetchSubscription(tx.subscription_id);
-            return res.json({
-                success: true,
-                status: 'success',
-                alreadyApplied: true,
-                subscription: sub,
-            });
-        }
-
-        let verified;
-        try {
-            verified = await verifyTransaction(reference);
-        } catch {
-            return res.json({
-                success: true,
-                status: 'pending',
-                reference,
-                message: statusMessage('pending'),
-            });
-        }
-
-        const status = normaliseStatus(verified.status);
-
-        // FIX: Cast to any to avoid TypeScript error
-        const paystackData = (verified.raw?.data ?? verified.raw ?? {}) as any;
-
-        if (status === 'success') {
-            const result = await applySuccessfulSubscriptionPayment(reference, paystackData);
-
-            if (!result.applied) {
-                return res.status(503).json({
+            if (!reference) {
+                return res.status(502).json({
                     success: false,
-                    status: 'pending',
-                    code: 'PAYMENT_CREDIT_PENDING',
-                    reference,
-                    message:
-                        'Payment confirmed but the subscription is not yet active. ' +
-                        'Do not pay again; check the status shortly.',
+                    status: 'failed',
+                    message: 'Payment provider did not return a reference.',
                 });
             }
 
-            return res.json({
-                success: true,
-                status: 'success',
-                alreadyApplied: result.alreadyApplied,
-                subscription: result.subscription,
-            });
-        }
-
-        if (status === 'failed' || status === 'reversed') {
-            const gatewayResponse = paystackData?.gateway_response || paystackData?.message || '';
-            const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
-
+            // Persist a pending payment record so verify/webhook can reconcile.
             await pool.query(
-                `UPDATE public.subscription_payments
-                    SET status = $1, paystack_verify = $2::jsonb, failure_reason = $3, updated_at = NOW()
-                  WHERE reference = $4 AND applied = false`,
-                [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), failureMessage, reference],
-            );
-
-            return res.json({
-                success: false,
-                status,
-                message: failureMessage,
-            });
-        }
-
-        await pool.query(
-            `UPDATE public.subscription_payments
-                SET status = $1, paystack_verify = $2::jsonb, updated_at = NOW()
-              WHERE reference = $3 AND applied = false`,
-            [toDbPaymentStatus(verified.status), JSON.stringify(verified.raw), reference],
-        );
-
-        return res.json({
-            success: true,
-            status,
-            reference,
-            needs_otp: status === 'send_otp',
-            message: statusMessage(status),
-        });
-    } catch (err) {
-        console.error('GET /subscription/verify:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to verify the payment.',
-        });
-    }
-});
-
-/* ===========================================================================
- * GET /api/drivers/subscription/payments
- * ========================================================================= */
-router.get('/payments', authenticateDriver, async (req: AuthedDriverRequest, res) => {
-    try {
-        const driverId = req.driverId!;
-        const rawLimit = toStr(req.query.limit);
-        const limit = Math.min(Math.max(Number(rawLimit) || 50, 1), 100);
-
-        const result = await pool.query(
-            `SELECT p.*, sp.name AS plan_name, sp.type AS plan_type
-               FROM public.subscription_payments p
-               JOIN public.subscription_plans  sp ON sp.id = p.plan_id
-              WHERE p.driver_id = $1
-              ORDER BY p.created_at DESC
-              LIMIT $2`,
-            [driverId, limit],
-        );
-
-        res.json({
-            success: true,
-            payments: result.rows.map((r) => ({
-                id: Number(r.id),
-                subscription_id: r.subscription_id != null ? Number(r.subscription_id) : null,
-                plan_id: Number(r.plan_id),
-                reference: r.reference,
-                amount: Number(r.amount) || 0,
-                currency: r.currency ?? 'GHS',
-                status: r.status,
-                provider: r.provider ?? 'paystack',
-                plan_name: r.plan_name ?? 'Subscription',
-                plan_type: r.plan_type ?? 'monthly',
-                paid_at: r.paid_at,
-                created_at: r.created_at,
-                failure_reason: r.failure_reason,
-            })),
-        });
-    } catch (err) {
-        console.error('GET /subscription/payments:', err);
-        res.status(500).json({
-            success: false,
-            message: 'Failed to load payment history.',
-        });
-    }
-});
-
-/* ===========================================================================
- * applySuccessfulSubscriptionPayment (idempotent, transaction-safe)
- * ========================================================================= */
-async function applySuccessfulSubscriptionPayment(
-    reference: string,
-    paystackData: Record<string, any>,
-): Promise<{
-    applied: boolean;
-    alreadyApplied: boolean;
-    subscription: any | null;
-}> {
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-
-        const txRes = await client.query(
-            `SELECT * FROM public.subscription_payments
-              WHERE reference = $1
-              LIMIT 1
-              FOR UPDATE`,
-            [reference],
-        );
-
-        if (txRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return { applied: false, alreadyApplied: false, subscription: null };
-        }
-
-        const tx = txRes.rows[0];
-
-        if (tx.applied === true) {
-            await client.query('COMMIT');
-            const sub = tx.subscription_id
-                ? await fetchSubscription(tx.subscription_id)
-                : null;
-            return { applied: true, alreadyApplied: true, subscription: sub };
-        }
-
-        const paidPesewas = Number(paystackData?.amount);
-        if (!Number.isFinite(paidPesewas) || paidPesewas <= 0) {
-            await client.query('ROLLBACK');
-            return { applied: false, alreadyApplied: false, subscription: null };
-        }
-
-        const paidGHS = fromPesewas(paidPesewas);
-        const expectedGHS = Number(tx.amount) || 0;
-
-        if (Math.abs(paidGHS - expectedGHS) > 0.01) {
-            console.error('Subscription amount mismatch:', {
-                reference, paidGHS, expectedGHS,
-            });
-            await client.query(
-                `UPDATE public.subscription_payments
-                    SET paystack_verify = $1::jsonb,
-                        failure_reason  = 'Amount mismatch',
-                        updated_at      = NOW()
-                  WHERE reference = $2 AND applied = false`,
-                [JSON.stringify(paystackData), reference],
-            );
-            await client.query('COMMIT');
-            return { applied: false, alreadyApplied: false, subscription: null };
-        }
-
-        const planRes = await client.query(
-            `SELECT * FROM public.subscription_plans WHERE id = $1 LIMIT 1`,
-            [tx.plan_id],
-        );
-        if (planRes.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return { applied: false, alreadyApplied: false, subscription: null };
-        }
-
-        const plan = planRes.rows[0];
-        const durationDays = Number(plan.duration_days) || 30;
-
-        await client.query(
-            `UPDATE public.driver_subscriptions
-                SET status = 'expired', updated_at = NOW()
-              WHERE driver_id = $1
-                AND status IN ('trial','active')
-                AND expires_at <= NOW()`,
-            [tx.driver_id],
-        );
-
-        const existingRes = await client.query(
-            `SELECT * FROM public.driver_subscriptions
-              WHERE driver_id = $1 AND status IN ('trial','active')
-              ORDER BY created_at DESC
-              LIMIT 1
-              FOR UPDATE`,
-            [tx.driver_id],
-        );
-
-        const existing = existingRes.rows[0] ?? null;
-        const now = new Date();
-
-        let subscriptionId: number;
-
-        const isRenewal =
-            existing != null &&
-            existing.status === 'active' &&
-            existing.is_trial !== true &&
-            Number(existing.plan_id) === Number(plan.id) &&
-            existing.expires_at != null;
-
-        if (isRenewal) {
-            const currentExpiry = new Date(existing.expires_at);
-            const base = currentExpiry > now ? currentExpiry : now;
-            const newExpiry = new Date(base.getTime() + durationDays * 86_400_000);
-
-            await client.query(
-                `UPDATE public.driver_subscriptions
-                    SET expires_at  = $1,
-                        price_paid  = price_paid + $2,
-                        updated_at  = NOW()
-                  WHERE id = $3`,
-                [newExpiry, expectedGHS, existing.id],
-            );
-
-            subscriptionId = Number(existing.id);
-        } else {
-            if (existing) {
-                await client.query(
-                    `UPDATE public.driver_subscriptions
-                        SET status = 'cancelled',
-                            cancelled_at        = NOW(),
-                            cancellation_reason = 'replaced by new plan purchase',
-                            updated_at          = NOW()
-                      WHERE id = $1`,
-                    [existing.id],
-                );
-            }
-
-            const expiresAt = new Date(now.getTime() + durationDays * 86_400_000);
-
-            const created = await client.query(
-                `INSERT INTO public.driver_subscriptions
-                    (driver_id, plan_id, status, starts_at, expires_at,
-                     is_trial, trial_used, price_paid, currency)
-                 VALUES ($1, $2, 'active', $3, $4,
-                         false, false, $5, $6)
-                 RETURNING id`,
+                `INSERT INTO public.driver_subscription_payments
+            (driver_id, plan_id, reference, amount, currency, provider, phone,
+             status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW())
+         ON CONFLICT (reference) DO NOTHING`,
                 [
-                    tx.driver_id,
-                    plan.id,
-                    now,
-                    expiresAt,
-                    expectedGHS,
-                    plan.currency,
+                    req.driverId!,
+                    p.id,
+                    reference,
+                    Number(p.price),
+                    p.currency || 'GHS',
+                    psProvider,
+                    String(phone),
                 ],
             );
 
-            subscriptionId = Number(created.rows[0].id);
+            const needsOtp =
+                status === 'send_otp' || status === 'send-otp' || status === 'otp';
+
+            return res.status(200).json({
+                success: true,
+                reference,
+                status: status || 'pending',
+                needs_otp: needsOtp,
+                message: data.display_text || charge.data?.message || '',
+                displayText: data.display_text || charge.data?.message || '',
+            });
+        } catch (err: any) {
+            console.error('❌ /initialize:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                status: 'failed',
+                message: 'Could not start the payment.',
+            });
+        }
+    },
+);
+
+/* ===================================================================
+ * POST /api/drivers/subscription/submit-otp
+ * ================================================================ */
+
+router.post(
+    '/submit-otp',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            const { reference, otp } = req.body ?? {};
+            if (!reference || !otp) {
+                return res.status(400).json({
+                    success: false,
+                    status: 'send_otp',
+                    code: 'OTP_SUBMISSION_FAILED',
+                    message: 'reference and otp are required.',
+                });
+            }
+
+            const otpRes = await paystackRequest('/charge/submit_otp', 'POST', {
+                reference,
+                otp,
+            });
+
+            const data = otpRes.data?.data ?? {};
+            const status: string = (data.status || '').toLowerCase();
+
+            // Wrong OTP → still needs a fresh code
+            if (!otpRes.ok && (status === 'send_otp' || otpRes.status === 400)) {
+                return res.status(400).json({
+                    success: false,
+                    status: 'send_otp',
+                    code: 'OTP_SUBMISSION_FAILED',
+                    message: otpRes.data?.message || 'Incorrect OTP. Try again.',
+                });
+            }
+
+            if (
+                status === 'success' ||
+                status === 'successful' ||
+                status === 'completed'
+            ) {
+                return await finalizeSuccessfulCharge(reference, req.driverId!, res);
+            }
+
+            return res.status(200).json({
+                success: false,
+                status: status || 'pending',
+                needs_otp: false,
+                message: otpRes.data?.message || '',
+            });
+        } catch (err: any) {
+            console.error('❌ /submit-otp:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                status: 'pending',
+                message: 'Could not submit verification code.',
+            });
+        }
+    },
+);
+
+/* ===================================================================
+ * GET /api/drivers/subscription/verify/:reference
+ * ================================================================ */
+
+router.get(
+    '/verify/:reference',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            // ⭐ req.params.reference is `string | string[]` — collapse it here.
+            const reference = firstParam(req.params.reference);
+
+            if (!reference) {
+                return res.status(400).json({
+                    success: false,
+                    status: 'failed',
+                    message: 'Missing payment reference.',
+                });
+            }
+
+            // 1) Already applied?
+            const payment = await pool.query(
+                `SELECT status, plan_id FROM public.driver_subscription_payments
+          WHERE reference = $1 AND driver_id = $2
+          LIMIT 1`,
+                [reference, req.driverId!],
+            );
+            if (payment.rows.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    status: 'failed',
+                    message: 'Payment reference not found.',
+                });
+            }
+            if (payment.rows[0].status === 'success') {
+                const subscription = await loadSubscription(req.driverId!);
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    alreadyApplied: true,
+                    subscription,
+                });
+            }
+
+            // 2) Ask Paystack
+            const check = await paystackRequest(
+                `/charge/${encodeURIComponent(reference)}`,
+                'GET',
+            );
+            const data = check.data?.data ?? {};
+            const status: string = (data.status || '').toLowerCase();
+
+            if (
+                status === 'success' ||
+                status === 'successful' ||
+                status === 'completed'
+            ) {
+                return await finalizeSuccessfulCharge(
+                    reference,
+                    req.driverId!,
+                    res,
+                    payment.rows[0].plan_id,
+                );
+            }
+
+            if (status === 'send_otp' || status === 'send-otp') {
+                return res.status(200).json({
+                    success: false,
+                    status: 'send_otp',
+                    needs_otp: true,
+                    message: data.display_text || '',
+                });
+            }
+
+            if (status === 'failed' || status === 'reversed') {
+                await pool.query(
+                    `UPDATE public.driver_subscription_payments
+              SET status = $2, updated_at = NOW()
+            WHERE reference = $1`,
+                    [reference, status],
+                );
+                return res.status(200).json({
+                    success: false,
+                    status,
+                    message: check.data?.message || 'Payment failed.',
+                });
+            }
+
+            return res.status(200).json({
+                success: false,
+                status: status || 'pending',
+                message: check.data?.message || 'Payment pending.',
+            });
+        } catch (err: any) {
+            console.error('❌ /verify:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                status: 'pending',
+                message: 'Could not verify payment.',
+            });
+        }
+    },
+);
+
+/** Shared "charge is paid → activate subscription" tail. */
+async function finalizeSuccessfulCharge(
+    reference: string,
+    driverId: number,
+    res: Response,
+    knownPlanId?: number,
+): Promise<Response> {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const pay = await client.query(
+            `SELECT id, plan_id, status FROM public.driver_subscription_payments
+        WHERE reference = $1 AND driver_id = $2
+        FOR UPDATE`,
+            [reference, driverId],
+        );
+
+        if (pay.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({
+                success: false,
+                status: 'failed',
+                message: 'Payment record not found.',
+            });
         }
 
+        const row = pay.rows[0];
+
+        if (row.status === 'success') {
+            await client.query('COMMIT');
+            const subscription = await loadSubscription(driverId);
+            return res.status(200).json({
+                success: true,
+                status: 'success',
+                alreadyApplied: true,
+                subscription,
+            });
+        }
+
+        const planId = knownPlanId ?? row.plan_id;
+        const plan = await client.query(
+            `SELECT duration_days FROM public.subscription_plans WHERE id = $1`,
+            [planId],
+        );
+        const days = Number(plan.rows[0]?.duration_days) || 30;
+
         await client.query(
-            `UPDATE public.subscription_payments
-                SET applied         = true,
-                    status          = 'success',
-                    subscription_id = $1,
-                    paystack_verify = $2::jsonb,
-                    paid_at         = NOW(),
-                    updated_at      = NOW()
-              WHERE reference = $3 AND applied = false`,
-            [subscriptionId, JSON.stringify(paystackData), reference],
+            `INSERT INTO public.driver_subscriptions
+          (driver_id, plan_id, status, starts_at, expires_at)
+       VALUES ($1, $2, 'active', NOW(), NOW() + ($3 || ' days')::interval)`,
+            [driverId, planId, String(days)],
+        );
+
+        await client.query(
+            `UPDATE public.driver_subscription_payments
+          SET status = 'success', paid_at = NOW(), updated_at = NOW()
+        WHERE id = $1`,
+            [row.id],
         );
 
         await client.query('COMMIT');
 
-        const sub = await fetchSubscription(subscriptionId);
-        return { applied: true, alreadyApplied: false, subscription: sub };
-    } catch (err) {
-        try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-        console.error(`Failed to apply subscription payment ${reference}:`, err);
-        return { applied: false, alreadyApplied: false, subscription: null };
+        const subscription = await loadSubscription(driverId);
+        return res.status(200).json({
+            success: true,
+            status: 'success',
+            alreadyApplied: false,
+            subscription,
+        });
+    } catch (err: any) {
+        await client.query('ROLLBACK');
+        console.error('❌ finalizeSuccessfulCharge:', err?.message ?? err);
+        return res.status(503).json({
+            success: false,
+            status: 'pending',
+            code: 'PAYMENT_CREDIT_PENDING',
+            message: 'Payment confirmed. Activating subscription…',
+        });
     } finally {
         client.release();
     }
 }
 
-/* ===========================================================================
- * Paystack webhook handler
- * ========================================================================= */
-export async function handleSubscriptionWebhook(
-    rawBody: Buffer,
-    signature: string | undefined,
-): Promise<{ status: number; body: any }> {
-    if (!verifyWebhookSignature(rawBody, signature)) {
-        return { status: 401, body: { success: false, message: 'Invalid signature.' } };
-    }
+/* ===================================================================
+ * GET /api/drivers/subscription/payments
+ * ================================================================ */
 
-    let payload: any;
-    try {
-        payload = JSON.parse(rawBody.toString('utf8'));
-    } catch {
-        return { status: 400, body: { success: false, message: 'Invalid JSON.' } };
-    }
+router.get(
+    '/payments',
+    requireDriver,
+    async (req: AuthedRequest, res: Response) => {
+        try {
+            const limit = Math.min(
+                Math.max(Number(req.query.limit) || 50, 1),
+                200,
+            );
 
-    const event = String(payload?.event ?? '');
-    const data = payload?.data ?? {};
-    const reference = String(data?.reference ?? '');
+            const result = await pool.query(
+                `SELECT
+            dsp.id,
+            dsp.reference,
+            dsp.amount,
+            dsp.currency,
+            dsp.provider,
+            dsp.status,
+            dsp.paid_at,
+            dsp.created_at,
+            sp.name AS plan_name
+         FROM public.driver_subscription_payments dsp
+         LEFT JOIN public.subscription_plans sp ON sp.id = dsp.plan_id
+         WHERE dsp.driver_id = $1
+         ORDER BY dsp.created_at DESC
+         LIMIT $2`,
+                [req.driverId!, limit],
+            );
 
-    if (!reference) {
-        return { status: 200, body: { received: true } };
-    }
-
-    if (!reference.startsWith('SUB-')) {
-        return { status: 200, body: { received: true, skipped: true } };
-    }
-
-    const txRes = await pool.query(
-        `SELECT * FROM public.subscription_payments WHERE reference = $1 LIMIT 1`,
-        [reference],
-    );
-
-    if (txRes.rows.length === 0) {
-        return { status: 200, body: { received: true, unknown: true } };
-    }
-
-    if (event === 'charge.success') {
-        const result = await applySuccessfulSubscriptionPayment(reference, data);
-        return { status: 200, body: { received: true, applied: result.applied } };
-    }
-
-    if (event === 'charge.failed') {
-        const gatewayResponse = data?.gateway_response || '';
-        const failureMessage = getUserFriendlyErrorMessage(gatewayResponse);
-
-        await pool.query(
-            `UPDATE public.subscription_payments
-                SET status = 'failed',
-                    paystack_verify = $1::jsonb,
-                    failure_reason = $2,
-                    updated_at = NOW()
-              WHERE reference = $3 AND applied = false`,
-            [JSON.stringify(payload), failureMessage || 'Payment failed.', reference],
-        );
-    }
-
-    return { status: 200, body: { received: true } };
-}
+            return res.status(200).json({ success: true, payments: result.rows });
+        } catch (err: any) {
+            console.error('❌ /payments:', err?.message ?? err);
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to fetch payment history.',
+            });
+        }
+    },
+);
 
 export default router;
