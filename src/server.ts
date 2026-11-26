@@ -1,3 +1,4 @@
+
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -27,8 +28,8 @@ import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
 
-// ❌ Removed: import otpRoutes from "./routes/otpRoutes";
-// Firebase Phone Auth now handles OTP on the client. No Zavu, no server OTP routes.
+// ✅ ADDED: Server-side OTP routes
+import { createOtpRouter } from './routes/otpRouterFactory';
 
 /*
 |--------------------------------------------------------------------------
@@ -100,19 +101,6 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| ❌ REMOVED: app.use("/api/auth", otpRoutes);
-|
-| Firebase Phone Auth now sends & verifies OTPs on the client.
-| The backend only verifies the resulting Firebase ID token
-| (via verifyFirebaseToken inside passengerRoutes).
-|
-| If you still have a /routes/otpRoutes.js file that uses Zavu,
-| delete it.
-|--------------------------------------------------------------------------
-*/
-
-/*
-|--------------------------------------------------------------------------
 | BODY PARSERS
 |--------------------------------------------------------------------------
 |
@@ -132,6 +120,41 @@ app.use(
         extended: true,
         limit: '10mb',
     }),
+);
+
+/*
+|--------------------------------------------------------------------------
+| PUBLIC OTP ROUTES
+|--------------------------------------------------------------------------
+|
+| These endpoints use Sailup OTP verification.
+|
+| They MUST be registered before protected driver and passenger
+| routes and before adminAuth.
+|
+| Endpoints:
+|
+|   POST /api/drivers/otp/send
+|   POST /api/drivers/otp/verify
+|
+|   POST /api/passengers/otp/send
+|   POST /api/passengers/otp/verify
+|
+| OTP verification does not require an existing Firebase ID token.
+| After successful verification, the backend returns a Firebase
+| custom token for the client to sign in with.
+|
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/drivers/otp',
+    createOtpRouter('driver'),
+);
+
+app.use(
+    '/api/passengers/otp',
+    createOtpRouter('passenger'),
 );
 
 /*
@@ -282,10 +305,11 @@ app.use(
 | Passenger Routes
 |--------------------------------------------------------------------------
 |
-| Passenger registration and login are now backed entirely by
-| Firebase Phone Authentication. The client sends a Firebase ID
-| token; passengerRoutes verifies it and reads the verified phone
-| number from decoded.phone_number.
+| Passenger registration and login are backed by the OTP flow.
+| After successful OTP verification, the client signs in using
+| the Firebase custom token returned by the backend.
+|
+| Protected passenger endpoints still require Firebase authentication.
 |
 |--------------------------------------------------------------------------
 */
