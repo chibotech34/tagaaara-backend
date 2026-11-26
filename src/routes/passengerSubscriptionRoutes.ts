@@ -5,6 +5,7 @@ import {
     NextFunction,
 } from 'express';
 
+import { randomBytes } from 'crypto';
 import pool from '../config/database';
 import { firebaseAuth } from '../config/firebase';
 
@@ -12,118 +13,20 @@ const router = Router();
 
 const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET_KEY ?? '';
 const PAYSTACK_BASE = 'https://api.paystack.co';
-
-// ─────────────────────────────────────────────────────────────────────────
-// TYPES & AUTH MIDDLEWARE (mirrors the one in passengerRoutes.ts)
-// ─────────────────────────────────────────────────────────────────────────
+const PAYSTACK_TIMEOUT_MS = 20_000;
 
 interface AuthReq extends Request {
-    decodedToken?: { uid: string; email?: string };
+    decodedToken?: {
+        uid: string;
+        email?: string;
+    };
 }
 
-const verifyFirebaseToken = async (
-    req: AuthReq,
-    res: Response,
-    next: NextFunction,
-): Promise<void> => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        res.status(401).json({
-            success: false,
-            code: 'AUTH_HEADER_MISSING',
-            message: 'Missing or invalid Authorization header.',
-        });
-        return;
-    }
-    const token = authHeader.substring('Bearer '.length).trim();
-    if (!token) {
-        res.status(401).json({
-            success: false,
-            code: 'AUTH_TOKEN_MISSING',
-            message: 'Firebase ID token is missing.',
-        });
-        return;
-    }
-    try {
-        const decoded = await firebaseAuth.verifyIdToken(token);
-        req.decodedToken = { uid: decoded.uid, email: decoded.email };
-        next();
-    } catch (err) {
-        console.error('❌ [passenger-sub] token verify failed:', err);
-        res.status(401).json({
-            success: false,
-            code: 'AUTH_TOKEN_INVALID',
-            message: 'Firebase authentication failed.',
-        });
-    }
-};
-
-// ─────────────────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────────────────
-
-const getUid = (req: AuthReq): string | null =>
-    req.decodedToken?.uid ?? null;
-
-async function passengerForUid(uid: string) {
-    const r = await pool.query(
-        `SELECT id, firebase_uid, full_name, phone, email
-       FROM public.passengers
-      WHERE firebase_uid = $1
-      LIMIT 1`,
-        [uid],
-    );
-    return r.rows[0] ?? null;
+interface PaystackResponse {
+    status?: boolean;
+    message?: string;
+    data?: Record<string, any>;
 }
-
-async function paystackPost(path: string, body: unknown) {
-    const res = await fetch(`${PAYSTACK_BASE}${path}`, {
-        method: 'POST',
-        headers: {
-            Authorization: `Bearer ${PAYSTACK_SECRET}`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-    return { ok: res.ok, status: res.status, json: await res.json() };
-}
-
-async function paystackGet(path: string) {
-    const res = await fetch(`${PAYSTACK_BASE}${path}`, {
-        headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` },
-    });
-    return { ok: res.ok, status: res.status, json: await res.json() };
-}
-
-function normalizeProvider(raw: string): 'mtn' | 'vod' | 'atl' | null {
-    // Flutter sends Ghana Paystack codes (mtn-gh, vod-gh, atl-gh).
-    // Paystack's /charge endpoint expects the short provider codes.
-    const s = String(raw ?? '')
-        .trim()
-        .toLowerCase()
-        .replace(/[_\s]/g, '-');
-
-    if (['mtn', 'mtn-gh'].includes(s)) return 'mtn';
-    if (['vod', 'vod-gh', 'telecel', 'telecel-gh', 'vodafone', 'vodafone-gh'].includes(s)) {
-        return 'vod';
-    }
-    if (['atl', 'atl-gh', 'airteltigo', 'airteltigo-gh', 'airtel-tigo'].includes(s)) {
-        return 'atl';
-    }
-
-    return null;
-}
-
-function makeReference(uid: string): string {
-    const short = uid.substring(0, 10).replace(/[^a-zA-Z0-9]/g, '');
-    const ts = Date.now();
-    const rand = Math.random().toString(16).slice(2, 10);
-    return `TEG-SUB-PASS-${short}-${ts}-${rand}`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// SUBSCRIPTION ACTIVATION
-// ─────────────────────────────────────────────────────────────────────────
 
 interface Plan {
     id: number;
@@ -134,195 +37,594 @@ interface Plan {
     duration_days: number;
 }
 
+interface PaymentForVerification {
+    reference: string;
+    amount: string | number;
+    currency: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Authentication                                                            */
+/* -------------------------------------------------------------------------- */
+
+const verifyFirebaseToken = async (
+    req: AuthReq,
+    res: Response,
+    next: NextFunction,
+): Promise<void> => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader?.startsWith('Bearer ')) {
+        res.status(401).json({
+            success: false,
+            code: 'AUTH_HEADER_MISSING',
+            message: 'Authentication required.',
+        });
+        return;
+    }
+
+    const token = authHeader.substring(7).trim();
+
+    if (!token) {
+        res.status(401).json({
+            success: false,
+            code: 'AUTH_TOKEN_MISSING',
+            message: 'Authentication token is missing.',
+        });
+        return;
+    }
+
+    try {
+        const decoded = await firebaseAuth.verifyIdToken(token);
+
+        req.decodedToken = {
+            uid: decoded.uid,
+            email: decoded.email,
+        };
+
+        next();
+    } catch (error) {
+        console.error(
+            '[passenger-sub] Firebase token verification failed:',
+            (error as Error).message,
+        );
+
+        res.status(401).json({
+            success: false,
+            code: 'AUTH_TOKEN_INVALID',
+            message: 'Authentication failed. Please log in again.',
+        });
+    }
+};
+
+function getUid(req: AuthReq): string | null {
+    return req.decodedToken?.uid ?? null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Paystack helpers                                                           */
+/* -------------------------------------------------------------------------- */
+
+async function paystackRequest(
+    path: string,
+    method: 'GET' | 'POST',
+    body?: unknown,
+): Promise<{ ok: boolean; status: number; json: PaystackResponse }> {
+    if (!PAYSTACK_SECRET) {
+        throw new Error('PAYSTACK_SECRET_KEY is not configured.');
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(
+        () => controller.abort(),
+        PAYSTACK_TIMEOUT_MS,
+    );
+
+    try {
+        const response = await fetch(`${PAYSTACK_BASE}${path}`, {
+            method,
+            headers: {
+                Authorization: `Bearer ${PAYSTACK_SECRET}`,
+                'Content-Type': 'application/json',
+                Accept: 'application/json',
+            },
+            ...(method === 'POST'
+                ? { body: JSON.stringify(body ?? {}) }
+                : {}),
+            signal: controller.signal,
+        });
+
+        const raw = await response.text();
+
+        let json: PaystackResponse;
+
+        try {
+            json = JSON.parse(raw) as PaystackResponse;
+        } catch {
+            throw new Error(
+                `Paystack returned an unreadable response (HTTP ${response.status}).`,
+            );
+        }
+
+        if (!response.ok || json.status !== true) {
+            throw new Error(
+                json.message ||
+                `Paystack request failed (HTTP ${response.status}).`,
+            );
+        }
+
+        return {
+            ok: response.ok,
+            status: response.status,
+            json,
+        };
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function paystackPost(
+    path: string,
+    body: unknown,
+) {
+    return paystackRequest(path, 'POST', body);
+}
+
+async function paystackGet(path: string) {
+    return paystackRequest(path, 'GET');
+}
+
+/* -------------------------------------------------------------------------- */
+/* General helpers                                                            */
+/* -------------------------------------------------------------------------- */
+
+function normalizeProvider(
+    raw: string,
+): 'mtn' | 'vod' | 'atl' | null {
+    const value = String(raw ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/[_\s]/g, '-');
+
+    if (['mtn', 'mtn-gh'].includes(value)) {
+        return 'mtn';
+    }
+
+    if (
+        [
+            'vod',
+            'vod-gh',
+            'telecel',
+            'telecel-gh',
+            'vodafone',
+            'vodafone-gh',
+        ].includes(value)
+    ) {
+        return 'vod';
+    }
+
+    if (
+        [
+            'atl',
+            'atl-gh',
+            'airteltigo',
+            'airteltigo-gh',
+            'airtel-tigo',
+        ].includes(value)
+    ) {
+        return 'atl';
+    }
+
+    return null;
+}
+
+function makeReference(uid: string): string {
+    const shortUid = uid
+        .substring(0, 10)
+        .replace(/[^a-zA-Z0-9]/g, '');
+
+    return [
+        'TEG-SUB-PASS',
+        shortUid,
+        Date.now(),
+        randomBytes(8).toString('hex'),
+    ].join('-');
+}
+
+function validReference(reference: string): boolean {
+    return /^[A-Za-z0-9_-]{10,100}$/.test(reference);
+}
+
+function normalizeCurrency(value: unknown): string {
+    return String(value || 'GHS').trim().toUpperCase();
+}
+
+function amountInPesewas(value: string | number): number | null {
+    const amount = Number(value);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return null;
+    }
+
+    const pesewas = Math.round(amount * 100);
+
+    if (!Number.isSafeInteger(pesewas) || pesewas <= 0) {
+        return null;
+    }
+
+    // Reject values with more than two meaningful decimal places.
+    if (Math.abs(amount * 100 - pesewas) > 0.000001) {
+        return null;
+    }
+
+    return pesewas;
+}
+
+function validatePaystackTransaction(
+    data: Record<string, any>,
+    payment: PaymentForVerification,
+): boolean {
+    const expectedAmount = amountInPesewas(payment.amount);
+    const receivedAmount = Number(data.amount);
+
+    return (
+        data.status === 'success' &&
+        String(data.reference ?? '') === payment.reference &&
+        expectedAmount !== null &&
+        Number.isSafeInteger(receivedAmount) &&
+        receivedAmount === expectedAmount &&
+        String(data.currency ?? '').trim().toUpperCase() ===
+        normalizeCurrency(payment.currency)
+    );
+}
+
+function safePaystackMessage(
+    data: Record<string, any> | undefined,
+    fallback: string,
+): string {
+    const value =
+        data?.display_text ??
+        data?.gateway_response ??
+        data?.message;
+
+    return typeof value === 'string' && value.trim()
+        ? value.trim().slice(0, 500)
+        : fallback;
+}
+
+async function passengerForUid(uid: string) {
+    const result = await pool.query(
+        `SELECT id, firebase_uid, full_name, phone, email
+         FROM public.passengers
+         WHERE firebase_uid = $1
+         LIMIT 1`,
+        [uid],
+    );
+
+    return result.rows[0] ?? null;
+}
+
 /**
- * Idempotently mark a pending `passenger_subscription_payments` row as
- * success and create the corresponding `passenger_subscriptions` row.
+ * A reference is only usable by the passenger who owns the payment.
+ * Return 404 for both missing and foreign references to avoid leaking
+ * whether another passenger's reference exists.
+ */
+async function getPassengerPayment(
+    reference: string,
+    uid: string,
+) {
+    const result = await pool.query(
+        `SELECT
+            psp.id,
+            psp.passenger_id,
+            psp.plan_id,
+            psp.amount,
+            psp.currency,
+            psp.status,
+            psp.applied,
+            psp.subscription_id,
+            p.firebase_uid
+         FROM public.passenger_subscription_payments psp
+         INNER JOIN public.passengers p
+            ON p.id = psp.passenger_id
+         WHERE psp.reference = $1
+           AND p.firebase_uid = $2
+         LIMIT 1`,
+        [reference, uid],
+    );
+
+    return result.rows[0] ?? null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Subscription activation                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Call this only after an independent Paystack transaction verification
+ * has confirmed reference, amount, currency and successful status.
  *
- * If there is already an active subscription (e.g. a trial) the new paid
- * period extends from its expiry, not from now.
+ * It is idempotent: an already-applied payment cannot create a second
+ * subscription.
  */
 async function activateFromReference(
     reference: string,
-): Promise<{ success: boolean; status: string; message: string }> {
+): Promise<{
+    success: boolean;
+    status: string;
+    message: string;
+}> {
     const client = await pool.connect();
+
     try {
         await client.query('BEGIN');
 
-        const pay = await client.query(
-            `SELECT id, passenger_id, plan_id, amount, currency, status, applied
-         FROM public.passenger_subscription_payments
-        WHERE reference = $1
-        LIMIT 1
-        FOR UPDATE`,
+        const paymentResult = await client.query(
+            `SELECT
+                id,
+                passenger_id,
+                plan_id,
+                amount,
+                currency,
+                status,
+                applied
+             FROM public.passenger_subscription_payments
+             WHERE reference = $1
+             LIMIT 1
+             FOR UPDATE`,
             [reference],
         );
 
-        if (pay.rows.length === 0) {
+        if (paymentResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            return { success: false, status: 'failed', message: 'Reference not found.' };
+
+            return {
+                success: false,
+                status: 'failed',
+                message: 'Payment reference not found.',
+            };
         }
 
-        const row = pay.rows[0];
-        if (row.applied) {
+        const payment = paymentResult.rows[0];
+
+        if (payment.applied === true) {
             await client.query('COMMIT');
-            return { success: true, status: 'success', message: 'Already applied.' };
+
+            return {
+                success: true,
+                status: 'success',
+                message: 'Subscription already activated.',
+            };
         }
 
-        const plan = await client.query(
-            `SELECT id, name, type, price, currency, duration_days
-         FROM public.subscription_plans
-        WHERE id = $1
-        LIMIT 1`,
-            [row.plan_id],
-        );
-        if (plan.rows.length === 0) {
+        if (payment.status !== 'pending') {
             await client.query('ROLLBACK');
-            return { success: false, status: 'failed', message: 'Plan not found.' };
-        }
-        const p = plan.rows[0] as Plan;
-        const days = Number(p.duration_days) || 30;
 
-        // If there is an existing active sub, extend from its expiry.
-        const existing = await client.query(
-            `SELECT id, expires_at
-         FROM public.passenger_subscriptions
-        WHERE passenger_id = $1
-          AND status IN ('trial', 'active')
-          AND (expires_at IS NULL OR expires_at > NOW())
-        ORDER BY created_at DESC
-        LIMIT 1`,
-            [row.passenger_id],
+            return {
+                success: false,
+                status: String(payment.status),
+                message: 'Payment is not eligible for activation.',
+            };
+        }
+
+        // Serialize all subscription changes for this passenger.
+        const passengerResult = await client.query(
+            `SELECT id
+             FROM public.passengers
+             WHERE id = $1
+             LIMIT 1
+             FOR UPDATE`,
+            [payment.passenger_id],
         );
+
+        if (passengerResult.rows.length === 0) {
+            throw new Error('Passenger record no longer exists.');
+        }
+
+        const planResult = await client.query(
+            `SELECT id, name, type, price, currency, duration_days
+             FROM public.subscription_plans
+             WHERE id = $1
+             LIMIT 1`,
+            [payment.plan_id],
+        );
+
+        if (planResult.rows.length === 0) {
+            throw new Error('Subscription plan not found.');
+        }
+
+        const plan = planResult.rows[0] as Plan;
+        const durationDays = Number(plan.duration_days);
+
+        if (
+            String(plan.type).toLowerCase() === 'trial' ||
+            !Number.isInteger(durationDays) ||
+            durationDays <= 0
+        ) {
+            throw new Error('Invalid paid subscription plan.');
+        }
+
+        // The payment amount/currency are the immutable snapshot captured
+        // when the charge was initialized. Do not compare against today's
+        // plan price: an administrator may have changed the plan since then.
+        if (amountInPesewas(payment.amount) === null) {
+            throw new Error('Invalid stored payment amount.');
+        }
+
+        const existingResult = await client.query(
+            `SELECT id, expires_at
+             FROM public.passenger_subscriptions
+             WHERE passenger_id = $1
+               AND status IN ('trial', 'active')
+               AND (
+                    expires_at IS NULL
+                    OR expires_at > NOW()
+               )
+             ORDER BY expires_at DESC NULLS FIRST, created_at DESC
+             LIMIT 1
+             FOR UPDATE`,
+            [payment.passenger_id],
+        );
+
+        const existingExpiry = existingResult.rows[0]?.expires_at;
+
+        // Use the database clock to decide whether the old period is active.
+        const clockResult = await client.query(
+            `SELECT NOW() AS now`,
+        );
+
+        const databaseNow = new Date(clockResult.rows[0].now);
+        const expiryDate = existingExpiry
+            ? new Date(existingExpiry)
+            : null;
 
         const startAt =
-            existing.rows[0]?.expires_at &&
-                new Date(existing.rows[0].expires_at) > new Date()
-                ? new Date(existing.rows[0].expires_at)
-                : new Date();
+            expiryDate && expiryDate.getTime() > databaseNow.getTime()
+                ? expiryDate
+                : databaseNow;
 
         const expiresAt = new Date(
-            startAt.getTime() + days * 24 * 60 * 60 * 1000,
+            startAt.getTime() +
+            durationDays * 24 * 60 * 60 * 1000,
         );
 
-        // Retire any currently active row before inserting the new one, so the
-        // partial unique index (idx_passenger_subs_one_active) stays satisfied.
+        // The passenger row lock prevents concurrent trial/paid activations
+        // that use this same locking convention.
         await client.query(
             `UPDATE public.passenger_subscriptions
-          SET status = 'expired',
-              updated_at = NOW()
-        WHERE passenger_id = $1
-          AND status IN ('trial', 'active')`,
-            [row.passenger_id],
+             SET status = 'expired',
+                 updated_at = NOW()
+             WHERE passenger_id = $1
+               AND status IN ('trial', 'active')`,
+            [payment.passenger_id],
         );
 
-        const sub = await client.query(
+        const subscriptionResult = await client.query(
             `INSERT INTO public.passenger_subscriptions
-         (passenger_id, plan_id, status, starts_at, expires_at,
-          is_trial, trial_used, price_paid, currency)
-       VALUES ($1, $2, 'active', $3, $4, FALSE, FALSE, $5, $6)
-       RETURNING id`,
+                (
+                    passenger_id,
+                    plan_id,
+                    status,
+                    starts_at,
+                    expires_at,
+                    is_trial,
+                    trial_used,
+                    price_paid,
+                    currency
+                )
+             VALUES ($1, $2, 'active', $3, $4, FALSE, FALSE, $5, $6)
+             RETURNING id`,
             [
-                row.passenger_id,
-                row.plan_id,
+                payment.passenger_id,
+                payment.plan_id,
                 startAt.toISOString(),
                 expiresAt.toISOString(),
-                Number(row.amount),
-                row.currency || 'GHS',
+                Number(payment.amount),
+                normalizeCurrency(payment.currency),
             ],
         );
 
+        const subscriptionId = subscriptionResult.rows[0].id;
+
         await client.query(
             `UPDATE public.passenger_subscription_payments
-          SET status = 'success',
-              applied = TRUE,
-              paid_at = NOW(),
-              subscription_id = $1,
-              updated_at = NOW()
-        WHERE reference = $2`,
-            [sub.rows[0].id, reference],
+             SET status = 'success',
+                 applied = TRUE,
+                 paid_at = NOW(),
+                 subscription_id = $1,
+                 updated_at = NOW()
+             WHERE id = $2`,
+            [subscriptionId, payment.id],
         );
 
-        // Audit-log mirror in the shared paystack_transactions table.
         await client.query(
             `UPDATE public.paystack_transactions
-          SET status = 'success',
-              applied = TRUE,
-              completed_at = NOW(),
-              updated_at = NOW()
-        WHERE reference = $1`,
+             SET status = 'success',
+                 applied = TRUE,
+                 completed_at = NOW(),
+                 updated_at = NOW()
+             WHERE reference = $1
+               AND purpose = 'passenger_subscription'`,
             [reference],
         );
 
         await client.query('COMMIT');
+
         return {
             success: true,
             status: 'success',
-            message: 'Subscription activated.',
+            message: 'Subscription activated successfully.',
         };
-    } catch (err) {
+    } catch (error) {
         try {
             await client.query('ROLLBACK');
-        } catch { /* ignore */ }
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] activate failed:', e.message);
+        } catch {
+            // Preserve the original error.
+        }
+
+        console.error(
+            '[passenger-sub] activation failed:',
+            (error as Error).message,
+        );
+
         return {
             success: false,
             status: 'failed',
-            message: e.message || 'Activation failed.',
+            message: 'Subscription activation failed.',
         };
     } finally {
         client.release();
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// ROUTES
-// ─────────────────────────────────────────────────────────────────────────
+/* -------------------------------------------------------------------------- */
+/* GET /plans                                                                 */
+/* -------------------------------------------------------------------------- */
 
-/**
- * GET /plans
- * Public-ish list of active plans (auth still required, but no scope filter
- * — the plans table is shared with drivers).
- */
 router.get('/plans', verifyFirebaseToken, async (_req, res) => {
     try {
-        const r = await pool.query(
-            `SELECT id, name, type, price, currency, duration_days,
-              description, is_active, sort_order
-         FROM public.subscription_plans
-        WHERE is_active = TRUE
-        ORDER BY sort_order, id`,
+        const result = await pool.query(
+            `SELECT
+                id,
+                name,
+                type,
+                price,
+                currency,
+                duration_days,
+                description,
+                is_active,
+                sort_order
+             FROM public.subscription_plans
+             WHERE is_active = TRUE
+             ORDER BY sort_order, id`,
         );
-        return res.status(200).json({ success: true, plans: r.rows });
-    } catch (err) {
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] /plans:', e.message);
+
+        return res.status(200).json({
+            success: true,
+            plans: result.rows,
+        });
+    } catch (error) {
+        console.error(
+            '[passenger-sub] /plans:',
+            (error as Error).message,
+        );
+
         return res.status(500).json({
             success: false,
             code: 'PLANS_FETCH_FAILED',
-            message: e.message,
+            message: 'Unable to retrieve subscription plans.',
         });
     }
 });
 
-/**
- * GET /current
- *
- * Returns the most recent subscription row (if any), plus a top-level
- * `trial_used` that is *history-based* — it is TRUE if the passenger has
- * ever consumed a trial, regardless of whether the current row is the
- * trial or a paid plan.
- *
- * Notes:
- *  - Uses `LEFT JOIN` so a row whose plan was later deactivated/renamed
- *    doesn't vanish from the client.
- *  - Paid rows are stored with `trial_used = FALSE`, so computing the
- *    flag from the current row alone would wrongly allow a second trial
- *    after a paid period expires.
- */
+/* -------------------------------------------------------------------------- */
+/* GET /current                                                               */
+/* -------------------------------------------------------------------------- */
+
 router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
     try {
         const uid = getUid(req);
+
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -330,7 +632,9 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
                 message: 'Authenticated user not found.',
             });
         }
+
         const passenger = await passengerForUid(uid);
+
         if (!passenger) {
             return res.status(200).json({
                 success: true,
@@ -339,29 +643,41 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        // History-based trial_used.
-        const usedRes = await pool.query(
-            `SELECT EXISTS(
-               SELECT 1 FROM public.passenger_subscriptions
-                WHERE passenger_id = $1 AND trial_used = TRUE
-             ) AS used`,
-            [passenger.id],
-        );
-        const trialUsedEver = usedRes.rows[0].used === true;
-
-        const r = await pool.query(
-            `SELECT s.id, s.plan_id, s.status, s.starts_at, s.expires_at,
-                    s.is_trial, s.trial_used, s.price_paid, s.currency,
-                    p.name AS plan_name, p.type AS plan_type
-               FROM public.passenger_subscriptions s
-               LEFT JOIN public.subscription_plans p ON p.id = s.plan_id
-              WHERE s.passenger_id = $1
-              ORDER BY s.created_at DESC
-              LIMIT 1`,
+        const usedResult = await pool.query(
+            `SELECT EXISTS (
+                SELECT 1
+                FROM public.passenger_subscriptions
+                WHERE passenger_id = $1
+                  AND trial_used = TRUE
+            ) AS used`,
             [passenger.id],
         );
 
-        if (r.rows.length === 0) {
+        const trialUsedEver = usedResult.rows[0].used === true;
+
+        const subscriptionResult = await pool.query(
+            `SELECT
+                s.id,
+                s.plan_id,
+                s.status,
+                s.starts_at,
+                s.expires_at,
+                s.is_trial,
+                s.trial_used,
+                s.price_paid,
+                s.currency,
+                p.name AS plan_name,
+                p.type AS plan_type
+             FROM public.passenger_subscriptions s
+             LEFT JOIN public.subscription_plans p
+                ON p.id = s.plan_id
+             WHERE s.passenger_id = $1
+             ORDER BY s.created_at DESC, s.id DESC
+             LIMIT 1`,
+            [passenger.id],
+        );
+
+        if (subscriptionResult.rows.length === 0) {
             return res.status(200).json({
                 success: true,
                 subscription: null,
@@ -369,12 +685,13 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const row = r.rows[0];
-        let status: string = row.status;
+        const row = subscriptionResult.rows[0];
+        let status = String(row.status);
+
         if (
             (status === 'active' || status === 'trial') &&
             row.expires_at &&
-            new Date(row.expires_at) <= new Date()
+            new Date(row.expires_at).getTime() <= Date.now()
         ) {
             status = 'expired';
         }
@@ -396,38 +713,54 @@ router.get('/current', verifyFirebaseToken, async (req: AuthReq, res) => {
                 currency: row.currency,
             },
         });
-    } catch (err) {
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] /current:', e.message);
+    } catch (error) {
+        console.error(
+            '[passenger-sub] /current:',
+            (error as Error).message,
+        );
+
         return res.status(500).json({
             success: false,
             code: 'SUB_CURRENT_FAILED',
-            message: e.message,
+            message: 'Unable to retrieve current subscription.',
         });
     }
 });
 
-/**
- * POST /trial
- *
- * Activates the free trial exactly once per passenger. Safe to call twice —
- * second call returns 409 TRIAL_ALREADY_USED.
- */
+/* -------------------------------------------------------------------------- */
+/* POST /trial                                                                */
+/* -------------------------------------------------------------------------- */
+
 router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
     const client = await pool.connect();
+
     try {
         const uid = getUid(req);
+
         if (!uid) {
-            client.release();
             return res.status(401).json({
                 success: false,
                 code: 'AUTH_USER_MISSING',
                 message: 'Authenticated user not found.',
             });
         }
-        const passenger = await passengerForUid(uid);
-        if (!passenger) {
-            client.release();
+
+        await client.query('BEGIN');
+
+        // Lock the passenger row. Trial activation and paid activation both
+        // lock this row, serializing subscription changes for this passenger.
+        const passengerResult = await client.query(
+            `SELECT id
+             FROM public.passengers
+             WHERE firebase_uid = $1
+             LIMIT 1
+             FOR UPDATE`,
+            [uid],
+        );
+
+        if (passengerResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+
             return res.status(404).json({
                 success: false,
                 code: 'PASSENGER_NOT_FOUND',
@@ -435,16 +768,20 @@ router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        await client.query('BEGIN');
+        const passengerId = passengerResult.rows[0].id;
 
-        const used = await client.query(
-            `SELECT 1 FROM public.passenger_subscriptions
-        WHERE passenger_id = $1 AND trial_used = TRUE LIMIT 1`,
-            [passenger.id],
+        const usedResult = await client.query(
+            `SELECT 1
+             FROM public.passenger_subscriptions
+             WHERE passenger_id = $1
+               AND trial_used = TRUE
+             LIMIT 1`,
+            [passengerId],
         );
-        if (used.rows.length > 0) {
+
+        if (usedResult.rows.length > 0) {
             await client.query('ROLLBACK');
-            client.release();
+
             return res.status(409).json({
                 success: false,
                 code: 'TRIAL_ALREADY_USED',
@@ -452,17 +789,22 @@ router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const active = await client.query(
-            `SELECT 1 FROM public.passenger_subscriptions
-        WHERE passenger_id = $1
-          AND status IN ('trial','active')
-          AND (expires_at IS NULL OR expires_at > NOW())
-        LIMIT 1`,
-            [passenger.id],
+        const activeResult = await client.query(
+            `SELECT 1
+             FROM public.passenger_subscriptions
+             WHERE passenger_id = $1
+               AND status IN ('trial', 'active')
+               AND (
+                    expires_at IS NULL
+                    OR expires_at > NOW()
+               )
+             LIMIT 1`,
+            [passengerId],
         );
-        if (active.rows.length > 0) {
+
+        if (activeResult.rows.length > 0) {
             await client.query('ROLLBACK');
-            client.release();
+
             return res.status(409).json({
                 success: false,
                 code: 'ALREADY_ACTIVE',
@@ -470,14 +812,18 @@ router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const planRes = await client.query(
-            `SELECT id, duration_days FROM public.subscription_plans
-        WHERE type = 'trial' AND is_active = TRUE
-        ORDER BY id LIMIT 1`,
+        const planResult = await client.query(
+            `SELECT id, duration_days
+             FROM public.subscription_plans
+             WHERE type = 'trial'
+               AND is_active = TRUE
+             ORDER BY id
+             LIMIT 1`,
         );
-        if (planRes.rows.length === 0) {
+
+        if (planResult.rows.length === 0) {
             await client.query('ROLLBACK');
-            client.release();
+
             return res.status(503).json({
                 success: false,
                 code: 'NO_TRIAL_PLAN',
@@ -485,54 +831,86 @@ router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const planId = planRes.rows[0].id;
-        const days = Number(planRes.rows[0].duration_days) || 7;
+        const plan = planResult.rows[0];
+        const days = Number(plan.duration_days);
 
-        const ins = await client.query(
+        if (!Number.isInteger(days) || days <= 0) {
+            throw new Error('Invalid trial plan duration.');
+        }
+
+        const insertResult = await client.query(
             `INSERT INTO public.passenger_subscriptions
-         (passenger_id, plan_id, status, starts_at, expires_at,
-          is_trial, trial_used, price_paid, currency)
-       VALUES
-         ($1, $2, 'trial', NOW(), NOW() + ($3 || ' days')::interval,
-          TRUE, TRUE, 0, 'GHS')
-       RETURNING id, status, starts_at, expires_at, is_trial, trial_used`,
-            [passenger.id, planId, String(days)],
+                (
+                    passenger_id,
+                    plan_id,
+                    status,
+                    starts_at,
+                    expires_at,
+                    is_trial,
+                    trial_used,
+                    price_paid,
+                    currency
+                )
+             VALUES (
+                $1,
+                $2,
+                'trial',
+                NOW(),
+                NOW() + ($3 * INTERVAL '1 day'),
+                TRUE,
+                TRUE,
+                0,
+                'GHS'
+             )
+             RETURNING
+                id,
+                status,
+                starts_at,
+                expires_at,
+                is_trial,
+                trial_used`,
+            [passengerId, plan.id, days],
         );
 
         await client.query('COMMIT');
 
         return res.status(201).json({
             success: true,
-            subscription: ins.rows[0],
+            subscription: insertResult.rows[0],
         });
-    } catch (err) {
+    } catch (error) {
         try {
             await client.query('ROLLBACK');
-        } catch { /* ignore */ }
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] /trial:', e.message);
+        } catch {
+            // Ignore rollback errors.
+        }
+
+        console.error(
+            '[passenger-sub] /trial:',
+            (error as Error).message,
+        );
+
         return res.status(500).json({
             success: false,
             code: 'TRIAL_FAILED',
-            message: e.message,
+            message: 'Unable to activate free trial.',
         });
     } finally {
         client.release();
     }
 });
 
-/**
- * POST /initialize
- *
- * Body: { plan_id: number, provider: 'MTN'|'VOD'|'ATL', phone: string }
- *
- * Creates the passenger_subscription_payments row + audit row, then
- * fires a Paystack mobile-money charge. Returns a reference the client
- * polls via /verify/:reference (or resolves via /submit-otp).
- */
+/* -------------------------------------------------------------------------- */
+/* POST /initialize                                                           */
+/* -------------------------------------------------------------------------- */
+
 router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
+    let reference: string | null = null;
+    let paymentCreated = false;
+
     try {
         const uid = getUid(req);
+
         if (!uid) {
             return res.status(401).json({
                 success: false,
@@ -540,15 +918,17 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
                 message: 'Authenticated user not found.',
             });
         }
+
         if (!PAYSTACK_SECRET) {
             return res.status(503).json({
                 success: false,
                 code: 'PAYSTACK_NOT_CONFIGURED',
-                message: 'Paystack is not configured on the server.',
+                message: 'Payment service is not configured.',
             });
         }
 
         const passenger = await passengerForUid(uid);
+
         if (!passenger) {
             return res.status(404).json({
                 success: false,
@@ -558,24 +938,33 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
         }
 
         const planId = Number(req.body?.plan_id);
-        const provider = normalizeProvider(String(req.body?.provider ?? ''));
-        const phone = String(req.body?.phone ?? passenger.phone ?? '').trim();
+        const provider = normalizeProvider(
+            String(req.body?.provider ?? ''),
+        );
 
-        if (!Number.isInteger(planId) || planId <= 0) {
+        const phone = String(
+            req.body?.phone ?? passenger.phone ?? '',
+        ).trim();
+
+        const phoneDigits = phone.replace(/\D/g, '');
+
+        if (!Number.isSafeInteger(planId) || planId <= 0) {
             return res.status(400).json({
                 success: false,
                 code: 'INVALID_PLAN',
-                message: 'plan_id is required.',
+                message: 'A valid plan_id is required.',
             });
         }
+
         if (!provider) {
             return res.status(400).json({
                 success: false,
                 code: 'INVALID_PROVIDER',
-                message: 'Unknown mobile money provider.',
+                message: 'Unsupported mobile money provider.',
             });
         }
-        if (phone.replace(/\D/g, '').length < 10) {
+
+        if (phoneDigits.length < 10 || phoneDigits.length > 15) {
             return res.status(400).json({
                 success: false,
                 code: 'INVALID_PHONE',
@@ -583,378 +972,733 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const planRes = await pool.query(
-            `SELECT id, name, type, price, currency, duration_days
-         FROM public.subscription_plans
-        WHERE id = $1 AND is_active = TRUE
-        LIMIT 1`,
+        const planResult = await pool.query(
+            `SELECT
+                id,
+                name,
+                type,
+                price,
+                currency,
+                duration_days
+             FROM public.subscription_plans
+             WHERE id = $1
+               AND is_active = TRUE
+             LIMIT 1`,
             [planId],
         );
-        if (planRes.rows.length === 0) {
+
+        if (planResult.rows.length === 0) {
             return res.status(404).json({
                 success: false,
                 code: 'PLAN_NOT_FOUND',
-                message: 'Plan not found.',
+                message: 'Subscription plan not found.',
             });
         }
-        const plan = planRes.rows[0] as Plan;
+
+        const plan = planResult.rows[0] as Plan;
+
+        if (String(plan.type).toLowerCase() === 'trial') {
+            return res.status(400).json({
+                success: false,
+                code: 'INVALID_PAID_PLAN',
+                message: 'Free trial plans cannot be purchased.',
+            });
+        }
+
+        const currency = normalizeCurrency(plan.currency);
+
+        if (currency !== 'GHS') {
+            return res.status(400).json({
+                success: false,
+                code: 'UNSUPPORTED_CURRENCY',
+                message: 'Mobile Money subscriptions currently support GHS only.',
+            });
+        }
+
         const amount = Number(plan.price);
-        if (!Number.isFinite(amount) || amount <= 0) {
+        const amountPesewas = amountInPesewas(amount);
+
+        if (amountPesewas === null) {
             return res.status(400).json({
                 success: false,
                 code: 'INVALID_PLAN_PRICE',
-                message: 'Plan price must be greater than zero.',
+                message: 'Subscription plan has an invalid price.',
             });
         }
 
-        const reference = makeReference(uid);
         const email =
-            passenger.email || `passenger_${passenger.id}@tegaara.app`;
+            String(passenger.email ?? '').trim() ||
+            `passenger_${passenger.id}@tegaara.app`;
 
-        // Pre-flight rows so a dropped client still leaves an audit trail.
-        await pool.query(
-            `INSERT INTO public.passenger_subscription_payments
-         (passenger_id, plan_id, reference, amount, currency, status,
-          provider, channel, phone)
-       VALUES
-         ($1, $2, $3, $4, $5, 'pending',
-          'paystack', 'mobile_money', $6)`,
-            [
-                passenger.id,
-                planId,
-                reference,
-                amount,
-                plan.currency || 'GHS',
-                phone,
-            ],
-        );
+        reference = makeReference(uid);
 
-        await pool.query(
-            `INSERT INTO public.paystack_transactions
-         (reference, user_firebase_uid, purpose, amount, status,
-          channel, provider, phone, passenger_id)
-       VALUES
-         ($1, $2, 'passenger_subscription', $3, 'pending',
-          'mobile_money', $4, $5, $6)
-       ON CONFLICT (reference) DO NOTHING`,
-            [reference, uid, amount, provider, phone, passenger.id],
-        );
+        // Create both records atomically before contacting Paystack.
+        const client = await pool.connect();
+
+        try {
+            await client.query('BEGIN');
+
+            await client.query(
+                `INSERT INTO public.passenger_subscription_payments
+                    (
+                        passenger_id,
+                        plan_id,
+                        reference,
+                        amount,
+                        currency,
+                        status,
+                        provider,
+                        channel,
+                        phone
+                    )
+                 VALUES ($1, $2, $3, $4, $5, 'pending',
+                         'paystack', 'mobile_money', $6)`,
+                [
+                    passenger.id,
+                    planId,
+                    reference,
+                    amount,
+                    currency,
+                    phone,
+                ],
+            );
+
+            await client.query(
+                `INSERT INTO public.paystack_transactions
+                    (
+                        reference,
+                        user_firebase_uid,
+                        purpose,
+                        amount,
+                        status,
+                        channel,
+                        provider,
+                        phone,
+                        passenger_id
+                    )
+                 VALUES (
+                    $1, $2, 'passenger_subscription', $3,
+                    'pending', 'mobile_money', $4, $5, $6
+                 )`,
+                [
+                    reference,
+                    uid,
+                    amount,
+                    provider,
+                    phone,
+                    passenger.id,
+                ],
+            );
+
+            await client.query('COMMIT');
+            paymentCreated = true;
+        } catch (error) {
+            try {
+                await client.query('ROLLBACK');
+            } catch {
+                // Ignore rollback errors.
+            }
+            throw error;
+        } finally {
+            client.release();
+        }
 
         const charge = await paystackPost('/charge', {
             email,
-            amount: Math.round(amount * 100),
-            currency: plan.currency || 'GHS',
+            amount: amountPesewas,
+            currency,
             reference,
-            mobile_money: { phone, provider },
+            mobile_money: {
+                phone,
+                provider,
+            },
         });
 
-        const chData = (charge.json as { data?: Record<string, unknown> })?.data ?? {};
-        const chStatus = String(chData.status ?? '').toLowerCase();
-        const chMessage = String(
-            (chData.display_text as string) ||
-            (chData.message as string) ||
-            ((charge.json as { message?: string })?.message ?? ''),
+        const chargeData = charge.json.data ?? {};
+        const chargeStatus = String(
+            chargeData.status ?? '',
+        ).toLowerCase();
+
+        const chargeMessage = safePaystackMessage(
+            chargeData,
+            'Payment request submitted.',
         );
 
         await pool.query(
             `UPDATE public.passenger_subscription_payments
-          SET paystack_init = $1::jsonb,
-              status = CASE
-                WHEN $2 = 'success' THEN 'success'
-                WHEN $2 = 'failed'  THEN 'failed'
-                ELSE 'pending'
-              END,
-              updated_at = NOW()
-        WHERE reference = $3`,
-            [JSON.stringify(charge.json ?? {}), chStatus || 'pending', reference],
+             SET paystack_init = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $2`,
+            [JSON.stringify(charge.json), reference],
         );
 
         await pool.query(
             `UPDATE public.paystack_transactions
-          SET status = $1,
-              paystack_init = $2::jsonb,
-              updated_at = NOW()
-        WHERE reference = $3`,
-            [chStatus || 'pending', JSON.stringify(charge.json ?? {}), reference],
+             SET paystack_init = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $2`,
+            [JSON.stringify(charge.json), reference],
         );
 
-        if (chStatus === 'success') {
-            const activated = await activateFromReference(reference);
+        if (chargeStatus === 'failed') {
+            await pool.query(
+                `UPDATE public.passenger_subscription_payments
+                 SET status = 'failed',
+                     failure_reason = $1,
+                     updated_at = NOW()
+                 WHERE reference = $2
+                   AND status = 'pending'`,
+                [chargeMessage, reference],
+            );
+
+            await pool.query(
+                `UPDATE public.paystack_transactions
+                 SET status = 'failed',
+                     updated_at = NOW()
+                 WHERE reference = $1`,
+                [reference],
+            );
+
+            return res.status(400).json({
+                success: false,
+                code: 'CHARGE_FAILED',
+                reference,
+                message: chargeMessage,
+            });
+        }
+
+        if (chargeStatus === 'success') {
+            // Do not trust the charge response alone. Verify independently.
+            const verification = await paystackGet(
+                `/transaction/verify/${encodeURIComponent(reference)}`,
+            );
+
+            const verifiedData = verification.json.data ?? {};
+
+            await pool.query(
+                `UPDATE public.passenger_subscription_payments
+                 SET paystack_verify = $1::jsonb,
+                     updated_at = NOW()
+                 WHERE reference = $2`,
+                [JSON.stringify(verification.json), reference],
+            );
+
+            await pool.query(
+                `UPDATE public.paystack_transactions
+                 SET paystack_verify = $1::jsonb,
+                     updated_at = NOW()
+                 WHERE reference = $2`,
+                [JSON.stringify(verification.json), reference],
+            );
+
+            if (
+                validatePaystackTransaction(verifiedData, {
+                    reference,
+                    amount,
+                    currency,
+                })
+            ) {
+                const activated = await activateFromReference(reference);
+
+                return res.status(200).json({
+                    success: activated.success,
+                    reference,
+                    needs_otp: false,
+                    status: activated.status,
+                    message: activated.message,
+                });
+            }
+
             return res.status(200).json({
                 success: true,
                 reference,
                 needs_otp: false,
-                status: activated.success ? 'success' : 'pending',
-                message: chMessage,
+                status: 'pending',
+                message: 'Payment is awaiting final verification.',
             });
         }
 
-        if (chStatus === 'send_otp') {
+        if (chargeStatus === 'send_otp') {
             return res.status(200).json({
                 success: true,
                 reference,
                 needs_otp: true,
                 status: 'pending',
-                message: chMessage || 'Enter the OTP sent to your phone.',
+                message: chargeMessage || 'Enter the OTP sent to your phone.',
             });
         }
 
-        if (chStatus === 'pay_offline') {
+        if (
+            chargeStatus === 'pay_offline' ||
+            chargeStatus === 'pending' ||
+            chargeStatus === ''
+        ) {
             return res.status(200).json({
                 success: true,
                 reference,
                 needs_otp: false,
                 status: 'pending',
-                message: chMessage || 'Authorize the payment on your phone.',
+                message: chargeMessage ||
+                    'Authorize the payment on your phone.',
             });
         }
 
-        if (chStatus === 'failed') {
-            await pool.query(
-                `UPDATE public.passenger_subscription_payments
-            SET status = 'failed',
-                failure_reason = $1,
-                paystack_verify = $2::jsonb,
-                updated_at = NOW()
-          WHERE reference = $3`,
-                [chMessage || 'Charge failed.', JSON.stringify(charge.json ?? {}), reference],
-            );
-            return res.status(400).json({
-                success: false,
-                code: 'CHARGE_FAILED',
-                message: chMessage || 'Charge failed.',
-                reference,
-            });
-        }
-
-        // Pending / unknown status — client polls /verify/:reference.
+        // Unknown statuses are left pending for /verify to reconcile.
         return res.status(200).json({
             success: true,
             reference,
             needs_otp: false,
             status: 'pending',
-            message: chMessage,
+            message: chargeMessage,
         });
-    } catch (err) {
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] /initialize:', e.message);
-        return res.status(500).json({
+    } catch (error) {
+        console.error(
+            '[passenger-sub] /initialize:',
+            (error as Error).message,
+        );
+
+        // If Paystack timed out after receiving the charge, the charge may
+        // still complete. Return the reference so the client can poll /verify.
+        if (paymentCreated && reference) {
+            return res.status(202).json({
+                success: true,
+                reference,
+                needs_otp: false,
+                status: 'pending',
+                message: 'Payment status is being checked. Please do not start another payment yet.',
+            });
+        }
+
+        return res.status(502).json({
             success: false,
             code: 'INITIALIZE_FAILED',
-            message: e.message,
+            message: 'Unable to initialize payment. Please try again.',
         });
     }
 });
 
-/**
- * POST /submit-otp
- *
- * Body: { reference: string, otp: string }
- * For Paystack's `send_otp` flow.
- */
-router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
-    try {
-        const reference = String(req.body?.reference ?? '').trim();
-        const otp = String(req.body?.otp ?? '').trim();
-        if (!reference || !otp) {
-            return res.status(400).json({
-                success: false,
-                code: 'MISSING_FIELDS',
-                message: 'reference and otp are required.',
-            });
-        }
+/* -------------------------------------------------------------------------- */
+/* POST /submit-otp                                                           */
+/* -------------------------------------------------------------------------- */
 
-        const tx = await pool.query(
-            `SELECT id, status FROM public.passenger_subscription_payments
-        WHERE reference = $1 LIMIT 1`,
-            [reference],
+router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
+    const uid = getUid(req);
+
+    if (!uid) {
+        return res.status(401).json({
+            success: false,
+            code: 'AUTH_USER_MISSING',
+            message: 'Authenticated user not found.',
+        });
+    }
+
+    const reference = String(req.body?.reference ?? '').trim();
+    const otp = String(req.body?.otp ?? '').trim();
+
+    if (
+        !validReference(reference) ||
+        !/^\d{4,8}$/.test(otp)
+    ) {
+        return res.status(400).json({
+            success: false,
+            code: 'INVALID_FIELDS',
+            message: 'A valid payment reference and OTP are required.',
+        });
+    }
+
+    if (!PAYSTACK_SECRET) {
+        return res.status(503).json({
+            success: false,
+            code: 'PAYSTACK_NOT_CONFIGURED',
+            message: 'Payment service is not configured.',
+        });
+    }
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Lock this payment while submitting the OTP to prevent concurrent
+        // OTP submissions for the same reference.
+        const paymentResult = await client.query(
+            `SELECT
+                psp.id,
+                psp.passenger_id,
+                psp.amount,
+                psp.currency,
+                psp.status,
+                psp.applied,
+                p.firebase_uid
+             FROM public.passenger_subscription_payments psp
+             INNER JOIN public.passengers p
+                ON p.id = psp.passenger_id
+             WHERE psp.reference = $1
+               AND p.firebase_uid = $2
+             LIMIT 1
+             FOR UPDATE OF psp`,
+            [reference, uid],
         );
-        if (tx.rows.length === 0) {
+
+        if (paymentResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+
             return res.status(404).json({
                 success: false,
                 code: 'TX_NOT_FOUND',
-                message: 'Reference not found.',
+                message: 'Payment not found.',
             });
         }
-        if (tx.rows[0].status === 'success') {
-            return res.status(200).json({ success: true, status: 'success' });
-        }
 
-        const submit = await paystackPost('/charge/submit_otp', { otp, reference });
-        const data = (submit.json as { data?: Record<string, unknown> })?.data ?? {};
-        const st = String(data.status ?? '').toLowerCase();
+        const payment = paymentResult.rows[0];
 
-        await pool.query(
-            `UPDATE public.passenger_subscription_payments
-          SET paystack_verify = $1::jsonb,
-              updated_at = NOW()
-        WHERE reference = $2`,
-            [JSON.stringify(submit.json ?? {}), reference],
-        );
-        await pool.query(
-            `UPDATE public.paystack_transactions
-          SET otp_code = $1,
-              otp_saved_at = NOW(),
-              paystack_verify = $2::jsonb,
-              updated_at = NOW()
-        WHERE reference = $3`,
-            [otp, JSON.stringify(submit.json ?? {}), reference],
-        );
+        if (payment.applied || payment.status === 'success') {
+            await client.query('COMMIT');
 
-        if (st === 'success') {
-            const activated = await activateFromReference(reference);
             return res.status(200).json({
-                success: activated.success,
-                status: activated.success ? 'success' : 'pending',
-                message: activated.message,
+                success: true,
+                status: 'success',
+                message: 'Subscription already activated.',
             });
         }
 
-        if (st === 'send_otp' || st === 'pending' || st === '') {
+        if (payment.status !== 'pending') {
+            await client.query('ROLLBACK');
+
+            return res.status(409).json({
+                success: false,
+                code: 'PAYMENT_NOT_PENDING',
+                message: 'This payment cannot accept an OTP.',
+            });
+        }
+
+        const submit = await paystackPost(
+            '/charge/submit_otp',
+            { otp, reference },
+        );
+
+        const submitData = submit.json.data ?? {};
+        const submitStatus = String(
+            submitData.status ?? '',
+        ).toLowerCase();
+
+        // Never persist the OTP. Only persist Paystack's response.
+        await client.query(
+            `UPDATE public.passenger_subscription_payments
+             SET paystack_verify = $1::jsonb,
+                 updated_at = NOW()
+             WHERE id = $2`,
+            [JSON.stringify(submit.json), payment.id],
+        );
+
+        await client.query(
+            `UPDATE public.paystack_transactions
+             SET paystack_verify = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $2`,
+            [JSON.stringify(submit.json), reference],
+        );
+
+        await client.query('COMMIT');
+
+        if (
+            submitStatus === 'send_otp' ||
+            submitStatus === 'pending' ||
+            submitStatus === ''
+        ) {
             return res.status(200).json({
                 success: false,
                 status: 'pending',
                 code: 'OTP_REQUIRED',
-                message:
-                    (data.display_text as string) || 'Incorrect OTP. Try again.',
+                message: safePaystackMessage(
+                    submitData,
+                    'OTP verification is still pending. Check the code and try again.',
+                ),
             });
         }
 
-        const failMessage =
-            (data.display_text as string) ||
-            ((submit.json as { message?: string })?.message ?? 'Verification failed.');
+        if (submitStatus === 'failed') {
+            await pool.query(
+                `UPDATE public.passenger_subscription_payments
+                 SET status = 'failed',
+                     failure_reason = $1,
+                     updated_at = NOW()
+                 WHERE reference = $2
+                   AND status = 'pending'`,
+                [
+                    safePaystackMessage(submitData, 'OTP verification failed.'),
+                    reference,
+                ],
+            );
+
+            await pool.query(
+                `UPDATE public.paystack_transactions
+                 SET status = 'failed',
+                     updated_at = NOW()
+                 WHERE reference = $1`,
+                [reference],
+            );
+
+            return res.status(400).json({
+                success: false,
+                status: 'failed',
+                code: 'OTP_FAILED',
+                message: safePaystackMessage(
+                    submitData,
+                    'OTP verification failed.',
+                ),
+            });
+        }
+
+        // Regardless of the OTP response, independently verify the actual
+        // transaction with Paystack before activating the subscription.
+        const verification = await paystackGet(
+            `/transaction/verify/${encodeURIComponent(reference)}`,
+        );
+
+        const verifiedData = verification.json.data ?? {};
 
         await pool.query(
             `UPDATE public.passenger_subscription_payments
-          SET status = 'failed',
-              failure_reason = $1,
-              updated_at = NOW()
-        WHERE reference = $2`,
-            [failMessage, reference],
+             SET paystack_verify = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $2`,
+            [JSON.stringify(verification.json), reference],
         );
 
-        return res.status(400).json({
-            success: false,
-            status: 'failed',
-            code: 'OTP_FAILED',
-            message: failMessage,
+        await pool.query(
+            `UPDATE public.paystack_transactions
+             SET paystack_verify = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $2`,
+            [JSON.stringify(verification.json), reference],
+        );
+
+        const valid = validatePaystackTransaction(
+            verifiedData,
+            {
+                reference,
+                amount: payment.amount,
+                currency: payment.currency,
+            },
+        );
+
+        if (!valid) {
+            return res.status(200).json({
+                success: false,
+                status: 'pending',
+                message: 'Payment is awaiting final verification.',
+            });
+        }
+
+        const activated = await activateFromReference(reference);
+
+        return res.status(200).json({
+            success: activated.success,
+            status: activated.status,
+            message: activated.message,
         });
-    } catch (err) {
-        const e = err as { message?: string };
-        console.error('❌ [passenger-sub] /submit-otp:', e.message);
-        return res.status(500).json({
+    } catch (error) {
+        try {
+            await client.query('ROLLBACK');
+        } catch {
+            // The transaction may already have committed.
+        }
+
+        console.error(
+            '[passenger-sub] /submit-otp:',
+            (error as Error).message,
+        );
+
+        return res.status(502).json({
             success: false,
             code: 'OTP_SUBMIT_FAILED',
-            message: e.message,
+            message: 'Unable to process OTP with the payment provider.',
         });
+    } finally {
+        client.release();
     }
 });
 
-/**
- * POST /verify/:reference
- *
- * Polled by the client after `initialize`. Calls Paystack's verify endpoint
- * and, on success, activates the subscription idempotently.
- */
+/* -------------------------------------------------------------------------- */
+/* POST /verify/:reference                                                    */
+/* -------------------------------------------------------------------------- */
+
 router.post(
     '/verify/:reference',
     verifyFirebaseToken,
     async (req: AuthReq, res) => {
         try {
-            const reference = String(req.params.reference ?? '').trim();
-            if (!reference) {
+            const uid = getUid(req);
+
+            if (!uid) {
+                return res.status(401).json({
+                    success: false,
+                    code: 'AUTH_USER_MISSING',
+                    message: 'Authenticated user not found.',
+                });
+            }
+
+            if (!PAYSTACK_SECRET) {
+                return res.status(503).json({
+                    success: false,
+                    code: 'PAYSTACK_NOT_CONFIGURED',
+                    message: 'Payment service is not configured.',
+                });
+            }
+
+            const reference = String(
+                req.params.reference ?? '',
+            ).trim();
+
+            if (!validReference(reference)) {
                 return res.status(400).json({
                     success: false,
                     code: 'INVALID_REFERENCE',
-                    message: 'Reference required.',
+                    message: 'Invalid payment reference.',
                 });
             }
 
-            const tx = await pool.query(
-                `SELECT id, status, applied
-           FROM public.passenger_subscription_payments
-          WHERE reference = $1 LIMIT 1`,
-                [reference],
-            );
-            if (tx.rows.length === 0) {
+            // Ownership check happens before calling Paystack.
+            const payment = await getPassengerPayment(reference, uid);
+
+            if (!payment) {
                 return res.status(404).json({
                     success: false,
                     code: 'TX_NOT_FOUND',
-                    message: 'Reference not found.',
-                });
-            }
-            if (tx.rows[0].applied) {
-                return res.status(200).json({
-                    success: true,
-                    status: 'success',
-                    message: 'Already applied.',
+                    message: 'Payment not found.',
                 });
             }
 
-            const verify = await paystackGet(
+            if (payment.applied) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'success',
+                    message: 'Subscription already activated.',
+                });
+            }
+
+            if (payment.status !== 'pending') {
+                return res.status(200).json({
+                    success: false,
+                    status: payment.status,
+                    message: 'Payment is no longer pending.',
+                });
+            }
+
+            const verification = await paystackGet(
                 `/transaction/verify/${encodeURIComponent(reference)}`,
             );
-            const data = (verify.json as { data?: Record<string, unknown> })?.data ?? {};
-            const st = String(data.status ?? 'pending').toLowerCase();
-            const msg = String(
-                (data.gateway_response as string) ||
-                (data.message as string) ||
-                ((verify.json as { message?: string })?.message ?? ''),
+
+            const data = verification.json.data ?? {};
+            const status = String(
+                data.status ?? 'pending',
+            ).toLowerCase();
+
+            const message = safePaystackMessage(
+                data,
+                'Payment is still processing.',
             );
 
             await pool.query(
                 `UPDATE public.passenger_subscription_payments
-            SET paystack_verify = $1::jsonb,
-                updated_at = NOW()
-          WHERE reference = $2`,
-                [JSON.stringify(verify.json ?? {}), reference],
-            );
-            await pool.query(
-                `UPDATE public.paystack_transactions
-            SET paystack_verify = $1::jsonb,
-                status = CASE WHEN $2 = 'success' THEN 'success' ELSE status END,
-                updated_at = NOW()
-          WHERE reference = $3`,
-                [JSON.stringify(verify.json ?? {}), st, reference],
+                 SET paystack_verify = $1::jsonb,
+                     updated_at = NOW()
+                 WHERE reference = $2`,
+                [JSON.stringify(verification.json), reference],
             );
 
-            if (st === 'success') {
+            await pool.query(
+                `UPDATE public.paystack_transactions
+                 SET paystack_verify = $1::jsonb,
+                     updated_at = NOW()
+                 WHERE reference = $2`,
+                [JSON.stringify(verification.json), reference],
+            );
+
+            if (status === 'success') {
+                const valid = validatePaystackTransaction(
+                    data,
+                    {
+                        reference,
+                        amount: payment.amount,
+                        currency: payment.currency,
+                    },
+                );
+
+                if (!valid) {
+                    console.error(
+                        '[passenger-sub] Paystack verification mismatch:',
+                        reference,
+                    );
+
+                    return res.status(409).json({
+                        success: false,
+                        code: 'PAYMENT_VALIDATION_FAILED',
+                        status: 'pending',
+                        message: 'Payment details could not be verified.',
+                    });
+                }
+
                 const activated = await activateFromReference(reference);
+
                 return res.status(200).json({
                     success: activated.success,
-                    status: activated.success ? 'success' : 'pending',
+                    status: activated.status,
                     message: activated.message,
                 });
             }
 
-            if (st === 'failed' || st === 'reversed' || st === 'cancelled') {
+            if (
+                status === 'failed' ||
+                status === 'reversed' ||
+                status === 'cancelled'
+            ) {
+                // The passenger payment table's CHECK constraint does not
+                // permit "cancelled"; map cancellation to "failed".
+                const databaseStatus =
+                    status === 'cancelled' ? 'failed' : status;
+
                 await pool.query(
                     `UPDATE public.passenger_subscription_payments
-              SET status = $1,
-                  failure_reason = $2,
-                  updated_at = NOW()
-            WHERE reference = $3`,
-                    [st, msg || 'Payment failed.', reference],
+                     SET status = $1,
+                         failure_reason = $2,
+                         updated_at = NOW()
+                     WHERE reference = $3
+                       AND status = 'pending'`,
+                    [databaseStatus, message, reference],
                 );
+
+                await pool.query(
+                    `UPDATE public.paystack_transactions
+                     SET status = $1,
+                         updated_at = NOW()
+                     WHERE reference = $2`,
+                    [databaseStatus, reference],
+                );
+
                 return res.status(200).json({
                     success: false,
-                    status: st,
-                    message: msg || 'Payment failed.',
+                    status,
+                    message: 'Payment was not completed.',
                 });
             }
 
             return res.status(200).json({
                 success: false,
                 status: 'pending',
-                message: msg || 'Payment is still processing.',
+                message,
             });
-        } catch (err) {
-            const e = err as { message?: string };
-            console.error('❌ [passenger-sub] /verify:', e.message);
-            return res.status(500).json({
+        } catch (error) {
+            console.error(
+                '[passenger-sub] /verify:',
+                (error as Error).message,
+            );
+
+            return res.status(502).json({
                 success: false,
                 code: 'VERIFY_FAILED',
-                message: e.message,
+                message: 'Unable to verify payment at this time.',
             });
         }
     },
