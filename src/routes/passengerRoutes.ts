@@ -19,6 +19,10 @@ import { createOtpRouter } from './otpRouterFactory';
 import { verifyOtp } from '../services/otpService';
 // ---------------------------
 
+// ----- Passenger subscription integration -----
+import passengerSubscriptionRoutes from './passengerSubscriptionRoutes';
+// ----------------------------------------------
+
 const router = Router();
 
 /*
@@ -32,6 +36,22 @@ const router = Router();
 */
 
 router.use('/otp', createOtpRouter('passenger'));
+
+/*
+|--------------------------------------------------------------------------
+| Passenger subscription endpoints (authenticated)
+|--------------------------------------------------------------------------
+| Mounts:
+|   GET    /api/passengers/subscription/plans
+|   GET    /api/passengers/subscription/current
+|   POST   /api/passengers/subscription/trial
+|   POST   /api/passengers/subscription/initialize
+|   POST   /api/passengers/subscription/submit-otp
+|   POST   /api/passengers/subscription/verify/:reference
+|--------------------------------------------------------------------------
+*/
+
+router.use('/subscription', passengerSubscriptionRoutes);
 
 /* ==========================================================================
  * TYPES

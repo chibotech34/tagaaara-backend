@@ -4,12 +4,15 @@
   "description": "Unified Tegaara backend",
   "scripts": {
     "build": "tsc",
+    "build:all": "npm run build && cd ../tegaara_admin && npm run build",
     "start": "node dist/server.js",
-    "dev": "nodemon --exec ts-node src/server.ts"
+    "dev": "nodemon --exec ts-node src/server.ts",
+    "dev:all": "concurrently -k -n backend,admin -c blue,magenta \"npm run dev\" \"npm --prefix ../tegaara_admin run dev\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",
     "axios": "^1.19.0",
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -19,13 +22,16 @@
     "react-router-dom": "^7.18.2"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.2.0",
     "@types/pg": "^8.21.0",
+    "concurrently": "^10.0.7",
     "nodemon": "^3.1.14",
     "ts-node": "^10.9.2",
+    "tsx": "^4.23.15",
     "typescript": "~5.6.3"
   }
 }

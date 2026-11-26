@@ -13,8 +13,12 @@ import {
     type OtpUserType,
 } from '../models/otpModel';
 
-// ⬇️ Swapped from './smsService' (Zavu) → Sailup
-import { sendOtpSms, normalizeGhanaPhone } from './sailup.service';
+// ⬇️ Sailup SMS
+import {
+    sendOtpSms,
+    normalizeGhanaPhone,
+    type SendOtpSmsResult,
+} from './sailup.service';
 
 const OTP_LENGTH = Number(process.env.OTP_LENGTH ?? 6) || 6;
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES ?? 5) || 5;
@@ -24,12 +28,21 @@ const OTP_RESEND_COOLDOWN_SECONDS =
 const OTP_MAX_PER_HOUR = Number(process.env.OTP_MAX_PER_HOUR ?? 5) || 5;
 const OTP_SECRET = process.env.OTP_SECRET ?? 'insecure-default-change-me';
 
+/**
+ * If Sailup hasn't responded in this many milliseconds, return success
+ * to the client anyway and finish sending the SMS in the background.
+ * The OTP row is already persisted, so /otp/verify works either way.
+ */
+const OTP_SEND_FAST_ACK_MS =
+    Number(process.env.OTP_SEND_FAST_ACK_MS ?? 3000) || 3000;
+
 export const otpConfig = {
     length: OTP_LENGTH,
     ttlMinutes: OTP_TTL_MINUTES,
     maxAttempts: OTP_MAX_ATTEMPTS,
     resendCooldownSeconds: OTP_RESEND_COOLDOWN_SECONDS,
     maxPerHour: OTP_MAX_PER_HOUR,
+    fastAckMs: OTP_SEND_FAST_ACK_MS,
 };
 
 const generateCode = (): string => {
@@ -129,12 +142,66 @@ export const sendOtp = async (options: SendOtpOptions): Promise<SendOtpResult> =
         metadata: metadata ?? {},
     });
 
-    const smsResult = await sendOtpSms(normalized, code, OTP_TTL_MINUTES);
+    // -------------------------------------------------------------------
+    // SMS delivery is fire-and-race. The OTP row is already persisted,
+    // so /otp/verify will succeed regardless of whether Sailup replied
+    // before we return. We only block the client briefly (FAST_ACK_MS).
+    // -------------------------------------------------------------------
 
-    if (!smsResult.success) {
+    const smsPromise: Promise<SendOtpSmsResult> = sendOtpSms(
+        normalized,
+        code,
+        OTP_TTL_MINUTES,
+    ).catch(
+        (err): SendOtpSmsResult => ({
+            success: false,
+            error: err instanceof Error ? err.message : 'Unknown SMS error',
+        }),
+    );
+
+    const winner = await Promise.race([
+        smsPromise,
+        new Promise<null>((resolve) =>
+            setTimeout(() => resolve(null), OTP_SEND_FAST_ACK_MS),
+        ),
+    ]);
+
+    if (winner === null) {
+        // Sailup is slow — don't block the user. Let the request finish
+        // in the background and log the outcome for monitoring.
+        void smsPromise.then(
+            (r) => {
+                if (!r.success) {
+                    console.error(
+                        `[OTP] Background SMS to ${normalized} failed:`,
+                        r.error,
+                    );
+                } else {
+                    console.log(
+                        `[OTP] Background SMS to ${normalized} accepted (id=${r.providerId})`,
+                    );
+                }
+            },
+            (err) =>
+                console.error(
+                    `[OTP] Background SMS to ${normalized} threw:`,
+                    err,
+                ),
+        );
+
+        return {
+            success: true,
+            message: 'OTP sent successfully.',
+            expiresAt,
+            code: revealCode ? code : undefined,
+        };
+    }
+
+    if (!winner.success) {
         return {
             success: false,
-            message: smsResult.error ?? 'Failed to send OTP SMS. Please try again.',
+            message:
+                winner.error ?? 'Failed to send OTP SMS. Please try again.',
             errorCode: 'SMS_SEND_FAILED',
         };
     }
