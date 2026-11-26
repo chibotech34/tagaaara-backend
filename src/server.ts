@@ -10,9 +10,6 @@ import express, {
 
 import cors from 'cors';
 
-import path from 'path';   // ⭐ CHANGED
-import fs from 'fs';       // ⭐ CHANGED
-
 import pool from './config/database';
 
 // Initialize Firebase ONCE.
@@ -23,13 +20,15 @@ import {
 } from './middleware/firebaseAdmin';
 
 import passengerRoutes from './routes/passengerRoutes';
-import passengerWalletRoutes from './routes/passengerWalletRoutes';
+import passengerWalletRoutes from './routes/passengerWalletRoutes'; // ✏️ ADDED
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
-import paystackWebhookRoutes from './routes/paystackWebhookRoutes';
+
+// ❌ Removed: import otpRoutes from "./routes/otpRoutes";
+// Firebase Phone Auth now handles OTP on the client. No Zavu, no server OTP routes.
 
 /*
 |--------------------------------------------------------------------------
@@ -80,22 +79,17 @@ if (!process.env.FIREBASE_DATABASE_URL) {
 
 /*
 |--------------------------------------------------------------------------
-| Request logging (early)
-|--------------------------------------------------------------------------
-*/
-
-app.use((req, _res, next) => {
-    console.log(
-        `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`,
-    );
-    next();
-});
-
-/*
-|--------------------------------------------------------------------------
 | CORS
 |--------------------------------------------------------------------------
 */
+
+app.use((req, res, next) => {
+    console.log(
+        `[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`,
+    );
+
+    next();
+});
 
 app.use(
     cors({
@@ -106,16 +100,30 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
+| ❌ REMOVED: app.use("/api/auth", otpRoutes);
+|
+| Firebase Phone Auth now sends & verifies OTPs on the client.
+| The backend only verifies the resulting Firebase ID token
+| (via verifyFirebaseToken inside passengerRoutes).
+|
+| If you still have a /routes/otpRoutes.js file that uses Zavu,
+| delete it.
+|--------------------------------------------------------------------------
+*/
+
+/*
+|--------------------------------------------------------------------------
 | BODY PARSERS
+|--------------------------------------------------------------------------
+|
+| These MUST come before notificationRoutes, rideRoutes, etc.
+|
 |--------------------------------------------------------------------------
 */
 
 app.use(
     express.json({
         limit: '10mb',
-        verify: (req: Request, _res: Response, buf: Buffer) => {
-            (req as any).rawBody = buf;
-        },
     }),
 );
 
@@ -128,19 +136,35 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| Paystack Webhook
+| Request logging
 |--------------------------------------------------------------------------
-| POST /api/webhooks/paystack
 */
 
 app.use(
-    '/api',
-    paystackWebhookRoutes,
+    (
+        req: Request,
+        _res: Response,
+        next: NextFunction,
+    ) => {
+        console.log(
+            `➡️ ${req.method} ${req.originalUrl}`,
+        );
+
+        next();
+    },
 );
 
 /*
 |--------------------------------------------------------------------------
 | Notification Routes
+|--------------------------------------------------------------------------
+|
+| IMPORTANT:
+|
+| These routes use verifyFirebaseToken internally.
+|
+| They MUST be registered before adminAuth.
+|
 |--------------------------------------------------------------------------
 */
 
@@ -163,19 +187,27 @@ app.get(
 
             return res.status(200).json({
                 success: true,
-                message: 'Tegaara backend is running',
+                message:
+                    'Tegaara backend is running',
                 database: 'connected',
                 firebase: 'configured',
-                timestamp: new Date().toISOString(),
+                timestamp:
+                    new Date().toISOString(),
             });
         } catch (error: unknown) {
-            console.error('❌ Health check database error:', error);
+            console.error(
+                '❌ Health check database error:',
+                error,
+            );
 
-            const dbError = error as { message?: string };
+            const dbError = error as {
+                message?: string;
+            };
 
             return res.status(500).json({
                 success: false,
-                message: 'Database connection failed',
+                message:
+                    'Database connection failed',
                 database: 'disconnected',
                 firebase: 'configured',
                 error: dbError.message,
@@ -192,11 +224,20 @@ app.get(
 
 pool.query('SELECT NOW()')
     .then((result) => {
-        console.log('✅ PostgreSQL connected successfully');
-        console.log('   Server time:', result.rows[0].now);
+        console.log(
+            '✅ PostgreSQL connected successfully',
+        );
+
+        console.log(
+            '   Server time:',
+            result.rows[0].now,
+        );
     })
     .catch((error) => {
-        console.error('❌ PostgreSQL connection failed:', error);
+        console.error(
+            '❌ PostgreSQL connection failed:',
+            error,
+        );
     });
 
 /*
@@ -205,23 +246,54 @@ pool.query('SELECT NOW()')
 |--------------------------------------------------------------------------
 */
 
-app.use('/api', rideRoutes);
+app.use(
+    '/api',
+    rideRoutes,
+);
 
 /*
 |--------------------------------------------------------------------------
-| Passenger Wallet Routes  (Paystack + wallet ledger)
+| Passenger Wallet Routes
+|--------------------------------------------------------------------------
+|
+| Registered BEFORE passengerRoutes so /wallet, /transactions, etc.
+| are matched first and are not shadowed by any `/:id` route in
+| passengerRoutes.
+|
+| Endpoints:
+|
+|   GET  /api/passengers/wallet
+|   POST /api/passengers/wallet
+|   GET  /api/passengers/wallet/pending-payment-ride
+|   POST /api/passengers/wallet/topup
+|   POST /api/passengers/wallet/pay
+|   GET  /api/passengers/transactions
+|
 |--------------------------------------------------------------------------
 */
 
-app.use('/api', passengerWalletRoutes);
+app.use(
+    '/api/passengers',
+    passengerWalletRoutes, // ✏️ ADDED
+);
 
 /*
 |--------------------------------------------------------------------------
 | Passenger Routes
 |--------------------------------------------------------------------------
+|
+| Passenger registration and login are now backed entirely by
+| Firebase Phone Authentication. The client sends a Firebase ID
+| token; passengerRoutes verifies it and reads the verified phone
+| number from decoded.phone_number.
+|
+|--------------------------------------------------------------------------
 */
 
-app.use('/api/passengers', passengerRoutes);
+app.use(
+    '/api/passengers',
+    passengerRoutes,
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -229,15 +301,39 @@ app.use('/api/passengers', passengerRoutes);
 |--------------------------------------------------------------------------
 */
 
-app.use('/api/drivers', driverRoutes);
+app.use(
+    '/api/drivers',
+    driverRoutes,
+);
 
 /*
 |--------------------------------------------------------------------------
 | Driver Wallet Routes
 |--------------------------------------------------------------------------
+|
+| Driver wallet endpoints:
+|
+| GET  /api/drivers/wallet
+| GET  /api/drivers/transactions
+|
+| GET  /api/drivers/wallet/payment-account
+| POST /api/drivers/wallet/payment-account
+|
+| POST /api/drivers/wallet/topup
+|
+| POST /api/drivers/wallet/withdraw
+| GET  /api/drivers/wallet/withdrawals
+|
+| The wallet router handles driver Firebase authentication
+| internally, so it must be registered before adminAuth below.
+|
+|--------------------------------------------------------------------------
 */
 
-app.use('/api/drivers', driverWalletRoutes);
+app.use(
+    '/api/drivers',
+    driverWalletRoutes,
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -245,11 +341,20 @@ app.use('/api/drivers', driverWalletRoutes);
 |--------------------------------------------------------------------------
 */
 
-app.use('/api/maps', mapRoutes);
+app.use(
+    '/api/maps',
+    mapRoutes,
+);
 
 /*
 |--------------------------------------------------------------------------
 | PUBLIC ADMIN ROUTES
+|--------------------------------------------------------------------------
+*/
+
+/*
+|--------------------------------------------------------------------------
+| Check whether an admin exists
 |--------------------------------------------------------------------------
 */
 
@@ -258,14 +363,22 @@ app.get(
     async (_req: Request, res: Response) => {
         try {
             const result = await pool.query(
-                `SELECT id FROM public.admins LIMIT 1`,
+                `
+                SELECT id
+                FROM public.admins
+                LIMIT 1
+                `,
             );
 
             return res.status(200).json({
-                exists: result.rows.length > 0,
+                exists:
+                    result.rows.length > 0,
             });
         } catch (error: unknown) {
-            console.error('❌ Error checking admin existence:', error);
+            console.error(
+                '❌ Error checking admin existence:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
@@ -275,9 +388,18 @@ app.get(
     },
 );
 
+/*
+|--------------------------------------------------------------------------
+| Create Admin
+|--------------------------------------------------------------------------
+*/
+
 app.post(
     '/api/admin/create',
-    async (req: Request, res: Response) => {
+    async (
+        req: Request,
+        res: Response,
+    ) => {
         const {
             email,
             password,
@@ -288,139 +410,210 @@ app.post(
             accountStatus,
         } = req.body ?? {};
 
-        if (!email || !password || !fullName) {
+        if (
+            !email ||
+            !password ||
+            !fullName
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Email, password and full name are required',
+                error:
+                    'Email, password and full name are required',
             });
         }
 
         try {
-            const { firebaseAuth, realtimeDb } = await import(
+            const {
+                firebaseAuth,
+                realtimeDb,
+            } = await import(
                 './config/firebase'
             );
 
-            const normalizedEmail = String(email).trim().toLowerCase();
+            const normalizedEmail =
+                String(email)
+                    .trim()
+                    .toLowerCase();
 
-            const existingAdmin = await pool.query(
-                `
-                SELECT id
-                FROM public.admins
-                WHERE LOWER(email) = $1
-                LIMIT 1
-                `,
-                [normalizedEmail],
-            );
+            const existingAdmin =
+                await pool.query(
+                    `
+                    SELECT id
+                    FROM public.admins
+                    WHERE LOWER(email) = $1
+                    LIMIT 1
+                    `,
+                    [normalizedEmail],
+                );
 
-            if (existingAdmin.rows.length > 0) {
+            if (
+                existingAdmin.rows.length > 0
+            ) {
                 return res.status(409).json({
                     success: false,
-                    error: 'An admin with this email already exists',
+                    error:
+                        'An admin with this email already exists',
                 });
             }
 
             try {
                 const existingFirebaseUser =
-                    await firebaseAuth.getUserByEmail(normalizedEmail);
+                    await firebaseAuth.getUserByEmail(
+                        normalizedEmail,
+                    );
 
-                if (existingFirebaseUser) {
+                if (
+                    existingFirebaseUser
+                ) {
                     return res.status(409).json({
                         success: false,
-                        error: 'A Firebase user with this email already exists',
+                        error:
+                            'A Firebase user with this email already exists',
                     });
                 }
-            } catch (firebaseError: any) {
-                if (firebaseError.code !== 'auth/user-not-found') {
+            } catch (
+            firebaseError: any
+            ) {
+                if (
+                    firebaseError.code !==
+                    'auth/user-not-found'
+                ) {
                     throw firebaseError;
                 }
             }
 
-            const userRecord = await firebaseAuth.createUser({
-                email: normalizedEmail,
-                password,
-                displayName: fullName,
-            });
+            const userRecord =
+                await firebaseAuth.createUser({
+                    email:
+                        normalizedEmail,
+                    password,
+                    displayName:
+                        fullName,
+                });
 
-            const firebaseUid = userRecord.uid;
+            const firebaseUid =
+                userRecord.uid;
 
-            console.log('✅ Created Firebase admin UID:', firebaseUid);
-
-            const result = await pool.query(
-                `
-                INSERT INTO public.admins
-                (
-                    firebase_uid,
-                    email,
-                    full_name,
-                    phone_number,
-                    username,
-                    profile_photo_url,
-                    account_status,
-                    role
-                )
-                VALUES
-                (
-                    $1, $2, $3, $4, $5, $6, $7, $8
-                )
-                RETURNING *
-                `,
-                [
-                    firebaseUid,
-                    normalizedEmail,
-                    fullName,
-                    phoneNumber || null,
-                    username || null,
-                    profilePhoto || null,
-                    accountStatus || 'active',
-                    'admin',
-                ],
+            console.log(
+                '✅ Created Firebase admin UID:',
+                firebaseUid,
             );
 
-            await realtimeDb.ref(`admins/${firebaseUid}`).set({
-                firebaseUid,
-                email: normalizedEmail,
-                fullName,
-                phoneNumber: phoneNumber || '',
-                username: username || '',
-                profilePhoto: profilePhoto || '',
-                accountStatus: accountStatus || 'active',
-                role: 'admin',
-                createdAt: new Date().toISOString(),
-            });
+            const result =
+                await pool.query(
+                    `
+                    INSERT INTO public.admins
+                    (
+                        firebase_uid,
+                        email,
+                        full_name,
+                        phone_number,
+                        username,
+                        profile_photo_url,
+                        account_status,
+                        role
+                    )
+                    VALUES
+                    (
+                        $1,
+                        $2,
+                        $3,
+                        $4,
+                        $5,
+                        $6,
+                        $7,
+                        $8
+                    )
+                    RETURNING *
+                    `,
+                    [
+                        firebaseUid,
+                        normalizedEmail,
+                        fullName,
+                        phoneNumber ||
+                        null,
+                        username ||
+                        null,
+                        profilePhoto ||
+                        null,
+                        accountStatus ||
+                        'active',
+                        'admin',
+                    ],
+                );
 
-            const admin = result.rows[0];
+            await realtimeDb
+                .ref(
+                    `admins/${firebaseUid}`,
+                )
+                .set({
+                    firebaseUid,
+                    email:
+                        normalizedEmail,
+                    fullName,
+                    phoneNumber:
+                        phoneNumber || '',
+                    username:
+                        username || '',
+                    profilePhoto:
+                        profilePhoto || '',
+                    accountStatus:
+                        accountStatus ||
+                        'active',
+                    role: 'admin',
+                    createdAt:
+                        new Date().toISOString(),
+                });
+
+            const admin =
+                result.rows[0];
 
             return res.status(201).json({
                 success: true,
-                message: 'Admin created successfully',
+                message:
+                    'Admin created successfully',
                 uid: firebaseUid,
                 adminId: admin.id,
                 admin: {
                     id: admin.id,
-                    firebaseUid: admin.firebase_uid,
+                    firebaseUid:
+                        admin.firebase_uid,
                     email: admin.email,
-                    fullName: admin.full_name,
-                    phoneNumber: admin.phone_number,
-                    username: admin.username,
-                    profilePhoto: admin.profile_photo_url,
-                    accountStatus: admin.account_status,
+                    fullName:
+                        admin.full_name,
+                    phoneNumber:
+                        admin.phone_number,
+                    username:
+                        admin.username,
+                    profilePhoto:
+                        admin.profile_photo_url,
+                    accountStatus:
+                        admin.account_status,
                     role: admin.role,
-                    createdAt: admin.created_at,
+                    createdAt:
+                        admin.created_at,
                 },
             });
         } catch (error: unknown) {
-            console.error('❌ Error creating admin:', error);
+            console.error(
+                '❌ Error creating admin:',
+                error,
+            );
 
-            const firebaseError = error as {
-                code?: string;
-                message?: string;
-            };
+            const firebaseError =
+                error as {
+                    code?: string;
+                    message?: string;
+                };
 
             return res.status(500).json({
                 success: false,
                 error:
-                    firebaseError.message || 'Failed to create admin',
-                code: firebaseError.code || 'ADMIN_CREATE_FAILED',
+                    firebaseError.message ||
+                    'Failed to create admin',
+                code:
+                    firebaseError.code ||
+                    'ADMIN_CREATE_FAILED',
             });
         }
     },
@@ -430,13 +623,14 @@ app.post(
 |--------------------------------------------------------------------------
 | ADMIN AUTHENTICATION
 |--------------------------------------------------------------------------
-| ⭐ CHANGED: scope auth to /api only.
-| Everything below this line is an API route that requires a Firebase
-| token + admin record. Non-API requests (the SPA) are NOT intercepted,
-| so the SPA fallback further down works without an auth token.
+|
+| Everything below this middleware requires
+| Firebase authentication + admin lookup.
+|
+|--------------------------------------------------------------------------
 */
 
-app.use('/api', adminAuth);   // ⭐ CHANGED from: app.use(adminAuth);
+app.use(adminAuth);
 
 /*
 |--------------------------------------------------------------------------
@@ -446,29 +640,43 @@ app.use('/api', adminAuth);   // ⭐ CHANGED from: app.use(adminAuth);
 
 app.get(
     '/api/admin/me',
-    (req: AuthRequest, res: Response) => {
+    (
+        req: AuthRequest,
+        res: Response,
+    ) => {
         if (!req.adminUser) {
             return res.status(404).json({
                 success: false,
-                error: 'Admin not found',
+                error:
+                    'Admin not found',
             });
         }
 
-        const admin = req.adminUser;
+        const admin =
+            req.adminUser;
 
         return res.status(200).json({
             success: true,
             admin: {
                 id: admin.id,
-                firebaseUid: admin.firebase_uid,
+                firebaseUid:
+                    admin.firebase_uid,
                 email: admin.email,
-                fullName: admin.full_name,
-                phoneNumber: admin.phone_number,
-                username: admin.username,
-                profilePhoto: admin.profile_photo_url,
-                accountStatus: admin.account_status,
-                role: admin.role || 'admin',
-                createdAt: admin.created_at,
+                fullName:
+                    admin.full_name,
+                phoneNumber:
+                    admin.phone_number,
+                username:
+                    admin.username,
+                profilePhoto:
+                    admin.profile_photo_url,
+                accountStatus:
+                    admin.account_status,
+                role:
+                    admin.role ||
+                    'admin',
+                createdAt:
+                    admin.created_at,
             },
         });
     },
@@ -476,108 +684,55 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| Dashboard Statistics  (extended)
+| Dashboard Statistics
 |--------------------------------------------------------------------------
 */
 
 app.get(
     '/api/stats',
-    async (_req: AuthRequest, res: Response) => {
-        const safeCount = async (
-            label: string,
-            sql: string,
-            params: any[] = [],
-        ): Promise<number> => {
-            try {
-                const r = await pool.query(sql, params);
-                return Number(r.rows[0]?.v ?? 0);
-            } catch (err) {
-                console.warn(`⚠️  Stats sub-query failed [${label}]:`, err);
-                return 0;
-            }
-        };
-
+    async (
+        _req: AuthRequest,
+        res: Response,
+    ) => {
         try {
-            const [
-                totalPassengers,
-                activeDrivers,
-                activeRides,
-                todaysRevenue,
-                averageDriverRating,
-                cancelledCount,
-                totalRidesForRate,
-            ] = await Promise.all([
-                safeCount(
-                    'totalPassengers',
-                    `SELECT COUNT(*)::int AS v FROM public.passengers`,
-                ),
-                safeCount(
-                    'activeDrivers',
-                    `SELECT COUNT(*)::int AS v FROM public.drivers WHERE is_online = true`,
-                ),
-                safeCount(
-                    'activeRides',
+            const passengers =
+                await pool.query(
                     `
-                    SELECT COUNT(*)::int AS v FROM public.rides
-                    WHERE status IN
-                        ('pending','accepted','in_progress','ongoing','started')
+                    SELECT
+                        COUNT(*)::int AS count
+                    FROM public.passengers
                     `,
-                ),
-                safeCount(
-                    'todaysRevenue',
-                    `
-                    SELECT COALESCE(SUM(COALESCE(fare, 0)), 0)::float AS v
-                    FROM public.rides
-                    WHERE status = 'completed'
-                      AND DATE(COALESCE(completed_at, updated_at)) = CURRENT_DATE
-                    `,
-                ),
-                safeCount(
-                    'averageDriverRating',
-                    `
-                    SELECT COALESCE(AVG(rating), 0)::float AS v
-                    FROM public.drivers
-                    WHERE rating IS NOT NULL
-                    `,
-                ),
-                safeCount(
-                    'cancelledCount',
-                    `
-                    SELECT COUNT(*)::int AS v FROM public.rides
-                    WHERE status = 'cancelled'
-                    `,
-                ),
-                safeCount(
-                    'totalRidesForRate',
-                    `SELECT COUNT(*)::int AS v FROM public.rides`,
-                ),
-            ]);
+                );
 
-            const cancellationRate =
-                totalRidesForRate === 0
-                    ? 0
-                    : Math.round(
-                        (cancelledCount / totalRidesForRate) * 1000,
-                    ) / 10;
+            const drivers =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::int AS count
+                    FROM public.drivers
+                    WHERE is_online = true
+                    `,
+                );
 
             return res.status(200).json({
-                totalPassengers,
-                activeDrivers,
-                activeRides,
-                todaysRevenue,
-                averageDriverRating,
-                cancellationRate,
+                success: true,
+                totalPassengers:
+                    passengers.rows[0]
+                        ?.count || 0,
+                activeDrivers:
+                    drivers.rows[0]
+                        ?.count || 0,
             });
         } catch (error: unknown) {
-            console.error('❌ Stats error:', error);
+            console.error(
+                '❌ Stats error:',
+                error,
+            );
 
-            return res.status(200).json({
-                totalPassengers: 0,
-                activeDrivers: 0,
-                activeRides: 0,
-                todaysRevenue: 0,
-                averageDriverRating: 0,
-                cancellationRate: 0,
+            return res.status(500).json({
+                success: false,
+                error:
+                    'Failed to load statistics',
             });
         }
     },
@@ -591,237 +746,36 @@ app.get(
 
 app.get(
     '/api/admin/drivers',
-    async (_req: AuthRequest, res: Response) => {
+    async (
+        _req: AuthRequest,
+        res: Response,
+    ) => {
         try {
-            let result;
-
-            try {
-                result = await pool.query(`
-                    SELECT
-                        d.*,
-                        d.full_name AS name,
-                        (
-                            SELECT COUNT(*)::int
-                            FROM public.rides r
-                            WHERE r.driver_id::text = d.id::text
-                        ) AS "rideCount"
-                    FROM public.drivers d
-                    ORDER BY d.created_at DESC
-                `);
-            } catch (innerErr) {
-                console.warn(
-                    '⚠️  drivers rideCount sub-query failed, falling back to 0:',
-                    innerErr,
+            const result =
+                await pool.query(
+                    `
+                    SELECT *
+                    FROM public.drivers
+                    ORDER BY created_at DESC
+                    `,
                 );
-                result = await pool.query(`
-                    SELECT
-                        d.*,
-                        d.full_name AS name,
-                        0::int AS "rideCount"
-                    FROM public.drivers d
-                    ORDER BY d.created_at DESC
-                `);
-            }
 
             return res.status(200).json({
                 success: true,
-                drivers: result.rows,
+                drivers:
+                    result.rows,
             });
         } catch (error: unknown) {
-            console.error('❌ Error fetching drivers:', error);
-
-            return res.status(500).json({
-                success: false,
-                error: 'Failed to fetch drivers',
-            });
-        }
-    },
-);
-
-/*
-|--------------------------------------------------------------------------
-| Admin Passengers  (list)
-|--------------------------------------------------------------------------
-*/
-
-app.get(
-    '/api/admin/passengers',
-    async (_req: AuthRequest, res: Response) => {
-        try {
-            const result = await pool.query(`
-                SELECT
-                    p.id,
-                    p.full_name AS name,
-                    p.phone,
-                    p.region,
-                    p.account_status AS status,
-                    (
-                        SELECT COUNT(*)::int
-                        FROM public.rides r
-                        WHERE r.passenger_id::text = p.id::text
-                    ) AS "totalRides"
-                FROM public.passengers p
-                ORDER BY p.created_at DESC
-            `);
-
-            return res.status(200).json({
-                success: true,
-                passengers: result.rows,
-            });
-        } catch (error: unknown) {
-            console.error('❌ Admin passengers error:', error);
-
-            return res.status(500).json({
-                success: false,
-                error: 'Failed to fetch passengers',
-            });
-        }
-    },
-);
-
-/*
-|--------------------------------------------------------------------------
-| Rickshaws
-|--------------------------------------------------------------------------
-*/
-
-
-app.get(
-    '/api/rickshaws',
-    async (_req: AuthRequest, res: Response) => {
-        try {
-            const result = await pool.query(`
-                SELECT
-                    d.id,
-                    d.registration_number AS "registrationNumber",
-                    d.full_name AS driver,
-                    CASE
-                        WHEN d.is_online THEN 'active'
-                        ELSE 'inactive'
-                    END AS status,
-                    d.status AS "verificationStatus"
-                FROM public.drivers d
-                WHERE LOWER(d.vehicle_type) IN ('rickshaw', 'tricycle')
-                  AND d.registration_number IS NOT NULL
-                ORDER BY d.created_at DESC
-            `);
-
-            return res.status(200).json({
-                success: true,
-                rickshaws: result.rows,
-            });
-        } catch (error: unknown) {
-            console.error('❌ Rickshaws error:', error);
-
-            return res.status(500).json({
-                success: false,
-                error: 'Failed to fetch rickshaws',
-            });
-        }
-    },
-);
-
-
-/*
-|--------------------------------------------------------------------------
-| Finance  (transaction ledger)
-|--------------------------------------------------------------------------
-*/
-
-app.get(
-    '/api/finance',
-    async (_req: AuthRequest, res: Response) => {
-        const tables = [
-            'transactions',
-            'payments',
-            'wallet_transactions',
-        ];
-
-        for (const table of tables) {
-            try {
-                const result = await pool.query(`
-                    SELECT
-                        t.id,
-                        t.ride_id AS "rideId",
-                        COALESCE(p.full_name, 'Unknown') AS passenger,
-                        COALESCE(t.amount, 0)::float AS amount,
-                        COALESCE(t.status, 'unknown') AS status
-                    FROM public.${table} t
-                    LEFT JOIN public.passengers p
-                        ON t.passenger_id = p.id
-                    ORDER BY t.created_at DESC
-                    LIMIT 200
-                `);
-
-                return res.status(200).json({
-                    success: true,
-                    finance: result.rows,
-                });
-            } catch (err) {
-                console.warn(
-                    `⚠️  Finance table "${table}" not usable, trying next:`,
-                    (err as any)?.message ?? err,
-                );
-            }
-        }
-
-        console.warn(
-            '⚠️  No finance table found — returning empty finance list.',
-        );
-
-        return res.status(200).json({
-            success: true,
-            finance: [],
-        });
-    },
-);
-
-/*
-|--------------------------------------------------------------------------
-| Settings  (system configuration)
-|--------------------------------------------------------------------------
-*/
-
-app.get(
-    '/api/settings',
-    async (_req: AuthRequest, res: Response) => {
-        const defaults = {
-            name: 'Tegaara',
-            supportEmail: 'support@tegaara.app',
-            driverSearchRadius: '5 km',
-            sessionTimeout: '30 min',
-            notificationEnabled: true,
-        };
-
-        try {
-            const result = await pool.query(`
-                SELECT *
-                FROM public.system_settings
-                LIMIT 1
-            `);
-
-            const s = result.rows[0] ?? {};
-
-            return res.status(200).json({
-                name: s.name ?? defaults.name,
-                supportEmail:
-                    s.support_email ?? defaults.supportEmail,
-                driverSearchRadius:
-                    s.driver_search_radius ??
-                    defaults.driverSearchRadius,
-                sessionTimeout:
-                    s.session_timeout ?? defaults.sessionTimeout,
-                notificationEnabled:
-                    s.notification_enabled ??
-                    defaults.notificationEnabled,
-            });
-        } catch (err) {
-            console.warn(
-                '⚠️  public.system_settings unavailable, using defaults:',
-                (err as any)?.message ?? err,
+            console.error(
+                '❌ Error fetching drivers:',
+                error,
             );
 
-            return res.status(200).json(defaults);
+            return res.status(500).json({
+                success: false,
+                error:
+                    'Failed to fetch drivers',
+            });
         }
     },
 );
@@ -834,23 +788,53 @@ app.get(
 
 app.get(
     '/api/admin/pending-drivers',
-    async (req: AuthRequest, res: Response) => {
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
         try {
-            const page = Math.max(Number(req.query.page) || 1, 1);
-
-            const limit = Math.min(
-                Math.max(Number(req.query.limit) || 10, 1),
-                100,
+            const page = Math.max(
+                Number(
+                    req.query.page,
+                ) || 1,
+                1,
             );
 
-            const offset = (page - 1) * limit;
+            const limit =
+                Math.min(
+                    Math.max(
+                        Number(
+                            req.query
+                                .limit,
+                        ) || 10,
+                        1,
+                    ),
+                    100,
+                );
 
-            const search = String(req.query.search || '').trim();
-            const status = String(req.query.status || 'pending').trim();
+            const offset =
+                (page - 1) *
+                limit;
 
-            const params: any[] = [status];
+            const search =
+                String(
+                    req.query
+                        .search || '',
+                ).trim();
 
-            let whereClause = `WHERE d.status = $1`;
+            const status =
+                String(
+                    req.query.status ||
+                    'pending',
+                ).trim();
+
+            const params: any[] = [
+                status,
+            ];
+
+            let whereClause =
+                `WHERE d.status = $1`;
+
             let parameterIndex = 2;
 
             if (search) {
@@ -863,59 +847,83 @@ app.get(
                     )
                 `;
 
-                params.push(`%${search}%`);
+                params.push(
+                    `%${search}%`,
+                );
+
                 parameterIndex++;
             }
 
-            const countResult = await pool.query(
-                `
-                SELECT COUNT(*)::int AS total
-                FROM public.drivers d
-                ${whereClause}
-                `,
-                params,
-            );
+            const countResult =
+                await pool.query(
+                    `
+                    SELECT
+                        COUNT(*)::int AS total
+                    FROM public.drivers d
+                    ${whereClause}
+                    `,
+                    params,
+                );
 
-            const total = countResult.rows[0]?.total || 0;
+            const total =
+                countResult.rows[0]
+                    ?.total || 0;
 
-            const dataParams = [...params, limit, offset];
+            const dataParams = [
+                ...params,
+                limit,
+                offset,
+            ];
 
-            const dataResult = await pool.query(
-                `
-                SELECT
-                    d.*,
-                    a.full_name AS reviewer_name,
-                    a.id AS reviewer_id
-                FROM public.drivers d
-                LEFT JOIN public.admins a
-                    ON d.reviewer_id = a.id
-                ${whereClause}
-                ORDER BY d.created_at DESC
-                LIMIT $${parameterIndex}
-                OFFSET $${parameterIndex + 1}
-                `,
-                dataParams,
-            );
+            const dataResult =
+                await pool.query(
+                    `
+                    SELECT
+                        d.*,
+                        a.full_name AS reviewer_name,
+                        a.id AS reviewer_id
+                    FROM public.drivers d
+                    LEFT JOIN public.admins a
+                        ON d.reviewer_id = a.id
+                    ${whereClause}
+                    ORDER BY d.created_at DESC
+                    LIMIT $${parameterIndex}
+                    OFFSET $${parameterIndex + 1}
+                    `,
+                    dataParams,
+                );
 
             return res.status(200).json({
                 success: true,
-                drivers: dataResult.rows,
+                drivers:
+                    dataResult.rows,
                 pagination: {
                     page,
                     limit,
                     total,
-                    totalPages: Math.ceil(total / limit),
+                    totalPages:
+                        Math.ceil(
+                            total /
+                            limit,
+                        ),
                 },
             });
         } catch (error: unknown) {
-            console.error('❌ Pending drivers error:', error);
+            console.error(
+                '❌ Pending drivers error:',
+                error,
+            );
 
-            const dbError = error as { message?: string };
+            const dbError =
+                error as {
+                    message?: string;
+                };
 
             return res.status(500).json({
                 success: false,
                 error:
-                    dbError.message || 'Failed to fetch pending drivers',
+                    dbError.message ||
+                    'Failed to fetch pending drivers',
             });
         }
     },
@@ -929,47 +937,66 @@ app.get(
 
 app.get(
     '/api/admin/drivers/:id',
-    async (req: AuthRequest, res: Response) => {
-        const driverId = Number(req.params.id);
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
+        const driverId =
+            Number(req.params.id);
 
-        if (!Number.isInteger(driverId)) {
+        if (
+            !Number.isInteger(
+                driverId,
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid driver ID',
+                error:
+                    'Invalid driver ID',
             });
         }
 
         try {
-            const result = await pool.query(
-                `
-                SELECT
-                    d.*,
-                    a.full_name AS reviewer_name
-                FROM public.drivers d
-                LEFT JOIN public.admins a
-                    ON d.reviewer_id = a.id
-                WHERE d.id = $1
-                `,
-                [driverId],
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        d.*,
+                        a.full_name AS reviewer_name
+                    FROM public.drivers d
+                    LEFT JOIN public.admins a
+                        ON d.reviewer_id = a.id
+                    WHERE d.id = $1
+                    `,
+                    [driverId],
+                );
 
-            if (result.rows.length === 0) {
+            if (
+                result.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    error: 'Driver not found',
+                    error:
+                        'Driver not found',
                 });
             }
 
             return res.status(200).json({
                 success: true,
-                driver: result.rows[0],
+                driver:
+                    result.rows[0],
             });
         } catch (error: unknown) {
-            console.error('❌ Driver details error:', error);
+            console.error(
+                '❌ Driver details error:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to fetch driver',
+                error:
+                    'Failed to fetch driver',
             });
         }
     },
@@ -983,42 +1010,70 @@ app.get(
 
 app.post(
     '/api/admin/drivers/:id/approve',
-    async (req: AuthRequest, res: Response) => {
-        const driverId = Number(req.params.id);
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
+        const driverId =
+            Number(req.params.id);
 
-        if (!Number.isInteger(driverId)) {
+        if (
+            !Number.isInteger(
+                driverId,
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid driver ID',
+                error:
+                    'Invalid driver ID',
             });
         }
 
         if (!req.adminUser) {
             return res.status(403).json({
                 success: false,
-                error: 'Admin authentication required',
+                error:
+                    'Admin authentication required',
             });
         }
 
         try {
-            const check = await pool.query(
-                `SELECT status FROM public.drivers WHERE id = $1`,
-                [driverId],
-            );
+            const check =
+                await pool.query(
+                    `
+                    SELECT status
+                    FROM public.drivers
+                    WHERE id = $1
+                    `,
+                    [driverId],
+                );
 
-            if (check.rows.length === 0) {
+            if (
+                check.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    error: 'Driver not found',
+                    error:
+                        'Driver not found',
                 });
             }
 
-            const currentStatus = check.rows[0].status;
+            const currentStatus =
+                check.rows[0].status;
 
-            if (['approved', 'rejected'].includes(currentStatus)) {
+            if (
+                [
+                    'approved',
+                    'rejected',
+                ].includes(
+                    currentStatus,
+                )
+            ) {
                 return res.status(400).json({
                     success: false,
-                    error: `Cannot approve driver with status '${currentStatus}'`,
+                    error:
+                        `Cannot approve driver with status '${currentStatus}'`,
                 });
             }
 
@@ -1027,33 +1082,62 @@ app.post(
                 UPDATE public.drivers
                 SET
                     status = 'approved',
-                    updated_at = CURRENT_TIMESTAMP,
-                    verification_checked_at = CURRENT_TIMESTAMP,
-                    verification_checked_by = $1
+                    updated_at =
+                        CURRENT_TIMESTAMP,
+                    verification_checked_at =
+                        CURRENT_TIMESTAMP,
+                    verification_checked_by =
+                        $1
                 WHERE id = $2
                 `,
-                [req.adminUser.id, driverId],
+                [
+                    req.adminUser.id,
+                    driverId,
+                ],
             );
 
             await pool.query(
                 `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status)
-                VALUES ($1, $2, 'approve', $3, 'approved')
+                INSERT INTO
+                    public.verification_audit_log
+                (
+                    driver_id,
+                    admin_id,
+                    action,
+                    previous_status,
+                    new_status
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    'approve',
+                    $3,
+                    'approved'
+                )
                 `,
-                [driverId, req.adminUser.id, currentStatus],
+                [
+                    driverId,
+                    req.adminUser.id,
+                    currentStatus,
+                ],
             );
 
             return res.status(200).json({
                 success: true,
-                message: 'Driver approved successfully',
+                message:
+                    'Driver approved successfully',
             });
         } catch (error: unknown) {
-            console.error('❌ Approve driver error:', error);
+            console.error(
+                '❌ Approve driver error:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to approve driver',
+                error:
+                    'Failed to approve driver',
             });
         }
     },
@@ -1067,51 +1151,84 @@ app.post(
 
 app.post(
     '/api/admin/drivers/:id/reject',
-    async (req: AuthRequest, res: Response) => {
-        const driverId = Number(req.params.id);
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
+        const driverId =
+            Number(req.params.id);
 
-        const reason = String(req.body?.reason || '').trim();
+        const reason =
+            String(
+                req.body?.reason ||
+                '',
+            ).trim();
 
-        if (!Number.isInteger(driverId)) {
+        if (
+            !Number.isInteger(
+                driverId,
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid driver ID',
+                error:
+                    'Invalid driver ID',
             });
         }
 
         if (!reason) {
             return res.status(400).json({
                 success: false,
-                error: 'Rejection reason is required',
+                error:
+                    'Rejection reason is required',
             });
         }
 
         if (!req.adminUser) {
             return res.status(403).json({
                 success: false,
-                error: 'Admin authentication required',
+                error:
+                    'Admin authentication required',
             });
         }
 
         try {
-            const check = await pool.query(
-                `SELECT status FROM public.drivers WHERE id = $1`,
-                [driverId],
-            );
+            const check =
+                await pool.query(
+                    `
+                    SELECT status
+                    FROM public.drivers
+                    WHERE id = $1
+                    `,
+                    [driverId],
+                );
 
-            if (check.rows.length === 0) {
+            if (
+                check.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    error: 'Driver not found',
+                    error:
+                        'Driver not found',
                 });
             }
 
-            const currentStatus = check.rows[0].status;
+            const currentStatus =
+                check.rows[0].status;
 
-            if (['approved', 'rejected'].includes(currentStatus)) {
+            if (
+                [
+                    'approved',
+                    'rejected',
+                ].includes(
+                    currentStatus,
+                )
+            ) {
                 return res.status(400).json({
                     success: false,
-                    error: `Cannot reject driver with status '${currentStatus}'`,
+                    error:
+                        `Cannot reject driver with status '${currentStatus}'`,
                 });
             }
 
@@ -1120,34 +1237,68 @@ app.post(
                 UPDATE public.drivers
                 SET
                     status = 'rejected',
-                    updated_at = CURRENT_TIMESTAMP,
-                    verification_checked_at = CURRENT_TIMESTAMP,
-                    verification_checked_by = $1,
-                    reviewer_comment = $2
+                    updated_at =
+                        CURRENT_TIMESTAMP,
+                    verification_checked_at =
+                        CURRENT_TIMESTAMP,
+                    verification_checked_by =
+                        $1,
+                    reviewer_comment =
+                        $2
                 WHERE id = $3
                 `,
-                [req.adminUser.id, reason, driverId],
+                [
+                    req.adminUser.id,
+                    reason,
+                    driverId,
+                ],
             );
 
             await pool.query(
                 `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status, reason)
-                VALUES ($1, $2, 'reject', $3, 'rejected', $4)
+                INSERT INTO
+                    public.verification_audit_log
+                (
+                    driver_id,
+                    admin_id,
+                    action,
+                    previous_status,
+                    new_status,
+                    reason
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    'reject',
+                    $3,
+                    'rejected',
+                    $4
+                )
                 `,
-                [driverId, req.adminUser.id, currentStatus, reason],
+                [
+                    driverId,
+                    req.adminUser.id,
+                    currentStatus,
+                    reason,
+                ],
             );
 
             return res.status(200).json({
                 success: true,
-                message: 'Driver rejected successfully',
+                message:
+                    'Driver rejected successfully',
             });
         } catch (error: unknown) {
-            console.error('❌ Reject driver error:', error);
+            console.error(
+                '❌ Reject driver error:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to reject driver',
+                error:
+                    'Failed to reject driver',
             });
         }
     },
@@ -1161,51 +1312,84 @@ app.post(
 
 app.post(
     '/api/admin/drivers/:id/request-correction',
-    async (req: AuthRequest, res: Response) => {
-        const driverId = Number(req.params.id);
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
+        const driverId =
+            Number(req.params.id);
 
-        const message = String(req.body?.message || '').trim();
+        const message =
+            String(
+                req.body?.message ||
+                '',
+            ).trim();
 
-        if (!Number.isInteger(driverId)) {
+        if (
+            !Number.isInteger(
+                driverId,
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid driver ID',
+                error:
+                    'Invalid driver ID',
             });
         }
 
         if (!message) {
             return res.status(400).json({
                 success: false,
-                error: 'Correction message is required',
+                error:
+                    'Correction message is required',
             });
         }
 
         if (!req.adminUser) {
             return res.status(403).json({
                 success: false,
-                error: 'Admin authentication required',
+                error:
+                    'Admin authentication required',
             });
         }
 
         try {
-            const check = await pool.query(
-                `SELECT status FROM public.drivers WHERE id = $1`,
-                [driverId],
-            );
+            const check =
+                await pool.query(
+                    `
+                    SELECT status
+                    FROM public.drivers
+                    WHERE id = $1
+                    `,
+                    [driverId],
+                );
 
-            if (check.rows.length === 0) {
+            if (
+                check.rows.length ===
+                0
+            ) {
                 return res.status(404).json({
                     success: false,
-                    error: 'Driver not found',
+                    error:
+                        'Driver not found',
                 });
             }
 
-            const currentStatus = check.rows[0].status;
+            const currentStatus =
+                check.rows[0].status;
 
-            if (['approved', 'rejected'].includes(currentStatus)) {
+            if (
+                [
+                    'approved',
+                    'rejected',
+                ].includes(
+                    currentStatus,
+                )
+            ) {
                 return res.status(400).json({
                     success: false,
-                    error: `Cannot request correction for driver with status '${currentStatus}'`,
+                    error:
+                        `Cannot request correction for driver with status '${currentStatus}'`,
                 });
             }
 
@@ -1213,35 +1397,70 @@ app.post(
                 `
                 UPDATE public.drivers
                 SET
-                    status = 'action_required',
-                    updated_at = CURRENT_TIMESTAMP,
-                    correction_message = $1,
-                    correction_requested_at = CURRENT_TIMESTAMP,
-                    reviewer_id = $2
+                    status =
+                        'action_required',
+                    updated_at =
+                        CURRENT_TIMESTAMP,
+                    correction_message =
+                        $1,
+                    correction_requested_at =
+                        CURRENT_TIMESTAMP,
+                    reviewer_id =
+                        $2
                 WHERE id = $3
                 `,
-                [message, req.adminUser.id, driverId],
+                [
+                    message,
+                    req.adminUser.id,
+                    driverId,
+                ],
             );
 
             await pool.query(
                 `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status, reason)
-                VALUES ($1, $2, 'request_correction', $3, 'action_required', $4)
+                INSERT INTO
+                    public.verification_audit_log
+                (
+                    driver_id,
+                    admin_id,
+                    action,
+                    previous_status,
+                    new_status,
+                    reason
+                )
+                VALUES
+                (
+                    $1,
+                    $2,
+                    'request_correction',
+                    $3,
+                    'action_required',
+                    $4
+                )
                 `,
-                [driverId, req.adminUser.id, currentStatus, message],
+                [
+                    driverId,
+                    req.adminUser.id,
+                    currentStatus,
+                    message,
+                ],
             );
 
             return res.status(200).json({
                 success: true,
-                message: 'Correction requested successfully',
+                message:
+                    'Correction requested successfully',
             });
         } catch (error: unknown) {
-            console.error('❌ Correction request error:', error);
+            console.error(
+                '❌ Correction request error:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to request correction',
+                error:
+                    'Failed to request correction',
             });
         }
     },
@@ -1255,41 +1474,60 @@ app.post(
 
 app.get(
     '/api/admin/drivers/:id/audit',
-    async (req: AuthRequest, res: Response) => {
-        const driverId = Number(req.params.id);
+    async (
+        req: AuthRequest,
+        res: Response,
+    ) => {
+        const driverId =
+            Number(req.params.id);
 
-        if (!Number.isInteger(driverId)) {
+        if (
+            !Number.isInteger(
+                driverId,
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                error: 'Invalid driver ID',
+                error:
+                    'Invalid driver ID',
             });
         }
 
         try {
-            const result = await pool.query(
-                `
-                SELECT
-                    l.*,
-                    a.full_name AS admin_name
-                FROM public.verification_audit_log l
-                JOIN public.admins a
-                    ON l.admin_id = a.id
-                WHERE l.driver_id = $1
-                ORDER BY l.created_at DESC
-                `,
-                [driverId],
-            );
+            const result =
+                await pool.query(
+                    `
+                    SELECT
+                        l.*,
+                        a.full_name AS admin_name
+                    FROM
+                        public.verification_audit_log l
+                    JOIN
+                        public.admins a
+                        ON l.admin_id = a.id
+                    WHERE
+                        l.driver_id = $1
+                    ORDER BY
+                        l.created_at DESC
+                    `,
+                    [driverId],
+                );
 
             return res.status(200).json({
                 success: true,
-                audit: result.rows,
+                audit:
+                    result.rows,
             });
         } catch (error: unknown) {
-            console.error('❌ Audit log error:', error);
+            console.error(
+                '❌ Audit log error:',
+                error,
+            );
 
             return res.status(500).json({
                 success: false,
-                error: 'Failed to fetch audit log',
+                error:
+                    'Failed to fetch audit log',
             });
         }
     },
@@ -1297,86 +1535,22 @@ app.get(
 
 /*
 |--------------------------------------------------------------------------
-| 404 (API only)
+| 404
 |--------------------------------------------------------------------------
-| ⭐ CHANGED: non-API requests fall through to the SPA fallback below.
 */
 
-app.use((req: Request, res: Response, next: NextFunction) => {
-    if (req.path.startsWith('/api')) {
+app.use(
+    (
+        _req: Request,
+        res: Response,
+    ) => {
         return res.status(404).json({
             success: false,
-            error: 'Route not found',
+            error:
+                'Route not found',
         });
-    }
-    next();
-});
-
-/*
-|--------------------------------------------------------------------------
-| Serve Frontend (Vite build output → backend/public)
-|--------------------------------------------------------------------------
-| ⭐ NEW: serves the React SPA from the same Express server.
-*/
-
-// The Vite app lives in ../tegaara_admin and builds into backend/public.
-// Support the server running from backend/, backend/src/, or backend/dist/.
-const backendRoot = ['src', 'dist'].includes(path.basename(__dirname))
-    ? path.resolve(__dirname, '..')
-    : __dirname;
-const clientDist = process.env.CLIENT_DIST_DIR
-    ? path.resolve(process.env.CLIENT_DIST_DIR)
-    : path.join(backendRoot, 'public');
-const clientIndex = path.join(clientDist, 'index.html');
-
-if (fs.existsSync(clientIndex)) {
-    console.log(`📦 Serving React + TypeScript frontend from ${clientDist}`);
-
-    // Vite assets are fingerprinted, so they can be cached for a long time.
-    app.use(
-        express.static(clientDist, {
-            index: false,
-            maxAge: '1y',
-            immutable: true,
-        }),
-    );
-
-    // React Router fallback. API routes have already been handled above.
-    app.use((req: Request, res: Response, next: NextFunction) => {
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
-            return next();
-        }
-
-        // A missing file (for example /assets/missing.js) must not return HTML.
-        if (path.extname(req.path)) {
-            return next();
-        }
-
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-        return res.sendFile(clientIndex);
-    });
-} else {
-    console.warn(`⚠️  React production build not found: ${clientIndex}`);
-    console.warn(
-        '   From tegaara_admin, run `npm run build` to generate ../backend/public.',
-    );
-}
-
-/*
-|--------------------------------------------------------------------------
-| Final 404 (non-API only: e.g. POST /, or missing assets)
-|--------------------------------------------------------------------------
-*/
-
-app.use((req: Request, res: Response) => {
-    if (req.path.startsWith('/api')) {
-        return res.status(404).json({
-            success: false,
-            error: 'Route not found',
-        });
-    }
-    return res.status(404).send('Not found');
-});
+    },
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -1391,14 +1565,21 @@ app.use(
         res: Response,
         _next: NextFunction,
     ) => {
-        console.error('❌ Unhandled server error:', error);
+        console.error(
+            '❌ Unhandled server error:',
+            error,
+        );
 
-        const serverError = error as { message?: string };
+        const serverError =
+            error as {
+                message?: string;
+            };
 
         return res.status(500).json({
             success: false,
             error:
-                serverError.message || 'Internal server error',
+                serverError.message ||
+                'Internal server error',
         });
     },
 );
@@ -1409,9 +1590,24 @@ app.use(
 |--------------------------------------------------------------------------
 */
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log('======================================');
-    console.log(`🚀 Tegaara Backend running on port ${PORT}`);
-    console.log(`   http://localhost:${PORT}`);
-    console.log('======================================');
-});
+app.listen(
+    PORT,
+    '0.0.0.0',
+    () => {
+        console.log(
+            '======================================',
+        );
+
+        console.log(
+            `🚀 Tegaara Backend running on port ${PORT}`,
+        );
+
+        console.log(
+            `   http://localhost:${PORT}`,
+        );
+
+        console.log(
+            '======================================',
+        );
+    },
+);
