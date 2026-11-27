@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import { firebaseAuth } from '../config/firebase';
+import pool from '../config/database';
 
 export interface DecodedFirebaseToken {
     uid: string;
@@ -12,8 +13,22 @@ export interface DecodedFirebaseToken {
     [key: string]: unknown;
 }
 
+export interface AdminUser {
+    id: number;
+    firebase_uid: string;
+    email: string;
+    full_name: string;
+    phone_number: string | null;
+    username: string | null;
+    profile_photo_url: string | null;
+    account_status: string;
+    role: string;
+    created_at: string;
+}
+
 export interface AuthenticatedRequest extends Request {
     decodedToken?: DecodedFirebaseToken;
+    adminUser?: AdminUser;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -87,17 +102,17 @@ export const verifyFirebaseToken = async (
         return;
     }
 
-    try {
-        // `true` = check whether the token was revoked / user disabled.
-        const decodedToken = await firebaseAuth.verifyIdToken(token, true);
+    let decodedToken: DecodedFirebaseToken;
 
-        // Preserve custom claims (admin, role, roles, etc.) so downstream
-        // middleware can perform RBAC checks.
-        req.decodedToken = {
-            ...(decodedToken as unknown as DecodedFirebaseToken),
+    // STEP 1: Verify the Firebase ID token.
+    try {
+        const verifiedToken = await firebaseAuth.verifyIdToken(token, true);
+
+        decodedToken = {
+            ...(verifiedToken as unknown as DecodedFirebaseToken),
         };
 
-        next();
+        req.decodedToken = decodedToken;
     } catch (error: unknown) {
         console.error('❌ Firebase token verification failed:', error);
         const firebaseError = error as { code?: string; message?: string };
@@ -133,6 +148,74 @@ export const verifyFirebaseToken = async (
             success: false,
             message: 'Firebase authentication failed.',
             code: 'AUTH_TOKEN_INVALID',
+        });
+        return;
+    }
+
+    // STEP 2: Find the matching admin record in PostgreSQL.
+    try {
+        const result = await pool.query<AdminUser>(
+            `
+            SELECT
+                id,
+                firebase_uid,
+                email,
+                full_name,
+                phone_number,
+                username,
+                profile_photo_url,
+                account_status,
+                role,
+                created_at
+            FROM public.admins
+            WHERE firebase_uid = $1
+            LIMIT 1
+            `,
+            [decodedToken.uid]
+        );
+
+        if (result.rows.length === 0) {
+            res.status(403).json({
+                success: false,
+                message: 'No admin account is associated with this Firebase user.',
+                code: 'ADMIN_NOT_FOUND',
+            });
+            return;
+        }
+
+        const admin = result.rows[0];
+
+        // Only active admin accounts can access protected API routes.
+        if (String(admin.account_status ?? '').toLowerCase() !== 'active') {
+            res.status(403).json({
+                success: false,
+                message: 'Your admin account is not active.',
+                code: 'ADMIN_ACCOUNT_INACTIVE',
+            });
+            return;
+        }
+
+        if (String(admin.role ?? '').toLowerCase() !== 'admin') {
+            res.status(403).json({
+                success: false,
+                message: 'Admin privileges are required.',
+                code: 'ADMIN_FORBIDDEN',
+            });
+            return;
+        }
+
+        // Make the admin profile available to /api/admin/me and other routes.
+        req.adminUser = admin;
+        next();
+    } catch (error: unknown) {
+        console.error('❌ Admin database authentication error:', error);
+
+        const databaseError = error as { message?: string };
+        res.status(500).json({
+            success: false,
+            message: 'Unable to verify admin account.',
+            error: databaseError.message || 'Admin database lookup failed.',
+            code: 'ADMIN_DATABASE_ERROR',
         });
     }
 };
@@ -175,7 +258,13 @@ export const requireAdmin = (
     const emailIsAdmin =
         !!token.email && ADMIN_EMAILS.includes(token.email.toLowerCase());
 
-    if (hasAdminClaim(token) || emailIsAdmin) {
+    // A matching active admin row in public.admins is also authoritative.
+    const databaseAdmin =
+        !!req.adminUser &&
+        String(req.adminUser.account_status ?? '').toLowerCase() === 'active' &&
+        String(req.adminUser.role ?? '').toLowerCase() === 'admin';
+
+    if (databaseAdmin || hasAdminClaim(token) || emailIsAdmin) {
         next();
         return;
     }
