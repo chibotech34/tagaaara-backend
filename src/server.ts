@@ -110,6 +110,7 @@ app.use(
 /*
 |--------------------------------------------------------------------------
 <<<<<<< HEAD
+<<<<<<< HEAD
 | PAYSTACK WEBHOOK (must be registered BEFORE express.json())
 |--------------------------------------------------------------------------
 |
@@ -159,6 +160,8 @@ app.post(
 
 /*
 |--------------------------------------------------------------------------
+=======
+>>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 =======
 >>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 | BODY PARSERS
@@ -265,6 +268,7 @@ app.use('/api', rideRoutes);
 /*
 |--------------------------------------------------------------------------
 <<<<<<< HEAD
+<<<<<<< HEAD
 | Passenger Wallet Routes
 |--------------------------------------------------------------------------
 |
@@ -284,10 +288,15 @@ app.use(
 app.use('/api', passengerWalletRoutes);
 
 
+
+app.use('/api', passengerWalletRoutes);
+
+
 /*
 |--------------------------------------------------------------------------
 | Passenger Routes
 |--------------------------------------------------------------------------
+<<<<<<< HEAD
 */
 
 app.use('/api/passengers', passengerRoutes);
@@ -321,6 +330,9 @@ app.use(
     driverSubscriptionRoutes,
 );
 
+
+app.use('/api/passengers', passengerRoutes);
+
 /*
 |--------------------------------------------------------------------------
 | Driver Routes
@@ -334,11 +346,14 @@ app.use('/api/drivers', driverRoutes);
 | Driver Wallet Routes
 |--------------------------------------------------------------------------
 <<<<<<< HEAD
+<<<<<<< HEAD
 |
 | Wallet router handles driver Firebase auth internally, so it must be
 | registered before adminAuth below.
 |
 |--------------------------------------------------------------------------
+=======
+>>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 =======
 >>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 */
