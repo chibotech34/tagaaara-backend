@@ -26,9 +26,6 @@ import passengerRoutes from './routes/passengerRoutes';
 import passengerWalletRoutes from './routes/passengerWalletRoutes';
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
-import driverSubscriptionRoutes, {
-    handleSubscriptionWebhook,
-} from './routes/driverSubscriptionRoutes'; // ✏️ ADDED
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
@@ -109,61 +106,6 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-<<<<<<< HEAD
-<<<<<<< HEAD
-| PAYSTACK WEBHOOK (must be registered BEFORE express.json())
-|--------------------------------------------------------------------------
-|
-| The Paystack signature check needs the *raw* body bytes. If this is
-| mounted after express.json(), req.body is already a parsed object and
-| verifyWebhookSignature() will always return false.
-|
-|--------------------------------------------------------------------------
-*/
-
-app.post(
-    '/api/drivers/subscription/webhook',
-    express.raw({ type: 'application/json' }),
-    async (
-        req: Request,
-        res: Response,
-    ) => {
-        try {
-            const signature =
-                (req.headers[
-                    'x-paystack-signature'
-                ] as string | undefined) ?? undefined;
-
-            const result =
-                await handleSubscriptionWebhook(
-                    req.body as Buffer,
-                    signature,
-                );
-
-            return res
-                .status(result.status)
-                .json(result.body);
-        } catch (error) {
-            console.error(
-                '❌ Subscription webhook error:',
-                error,
-            );
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    'Webhook processing failed.',
-            });
-        }
-    },
-);
-
-/*
-|--------------------------------------------------------------------------
-=======
->>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
-=======
->>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 | BODY PARSERS
 |--------------------------------------------------------------------------
 */
@@ -267,69 +209,17 @@ app.use('/api', rideRoutes);
 
 /*
 |--------------------------------------------------------------------------
-<<<<<<< HEAD
-<<<<<<< HEAD
-| Passenger Wallet Routes
-|--------------------------------------------------------------------------
-|
-| Registered BEFORE passengerRoutes so /wallet, /transactions, etc.
-| are matched first and are not shadowed by any `/:id` route in
-| passengerRoutes.
-|
+| Passenger Wallet Routes  (Paystack + wallet ledger)
 |--------------------------------------------------------------------------
 */
 
-app.use(
-    '/api/passengers',
-    passengerWalletRoutes,
-);
-
-
 app.use('/api', passengerWalletRoutes);
-
-
-
-app.use('/api', passengerWalletRoutes);
-
 
 /*
 |--------------------------------------------------------------------------
 | Passenger Routes
 |--------------------------------------------------------------------------
-<<<<<<< HEAD
 */
-
-app.use('/api/passengers', passengerRoutes);
-
-/*
-|--------------------------------------------------------------------------
-| Driver Subscription Routes
-|--------------------------------------------------------------------------
-|
-| MUST be mounted BEFORE driverRoutes: driverRoutes declares generic
-| patterns like /:uid/status, /:uid/current-request and /:id/stats that
-| would otherwise shadow specific /subscription/... paths.
-|
-| Endpoints (mounted at /api/drivers/subscription):
-|
-|   GET  /plans
-|   GET  /current
-|   POST /trial                ← what api_config.dart calls
-|   POST /activate-trial       ← legacy alias (kept for safety)
-|   POST /initialize
-|   POST /submit-otp
-|   GET  /verify/:reference
-|   GET  /payments
-|   POST /webhook              ← mounted above, before express.json()
-|
-|--------------------------------------------------------------------------
-*/
-
-app.use(
-    '/api/drivers/subscription',
-    driverSubscriptionRoutes,
-);
-
 
 app.use('/api/passengers', passengerRoutes);
 
@@ -345,17 +235,6 @@ app.use('/api/drivers', driverRoutes);
 |--------------------------------------------------------------------------
 | Driver Wallet Routes
 |--------------------------------------------------------------------------
-<<<<<<< HEAD
-<<<<<<< HEAD
-|
-| Wallet router handles driver Firebase auth internally, so it must be
-| registered before adminAuth below.
-|
-|--------------------------------------------------------------------------
-=======
->>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
-=======
->>>>>>> 5a2c7bf7ae110a5ea8f0067c74c7f335a20e173a
 */
 
 app.use('/api/drivers', driverWalletRoutes);
@@ -647,10 +526,11 @@ app.get(
                 safeCount(
                     'todaysRevenue',
                     `
-                    SELECT COALESCE(SUM(COALESCE(fare, 0)), 0)::float AS v
+                    SELECT COALESCE(SUM(COALESCE(fare, amount, 0)), 0)::float AS v
                     FROM public.rides
                     WHERE status = 'completed'
-                      AND DATE(COALESCE(completed_at, updated_at)) = CURRENT_DATE
+                      AND DATE(COALESCE(completed_at, updated_at, created_at))
+                          = CURRENT_DATE
                     `,
                 ),
                 safeCount(
@@ -721,11 +601,9 @@ app.get(
                     SELECT
                         d.*,
                         d.full_name AS name,
-                        (
-                            SELECT COUNT(*)::int
-                            FROM public.rides r
-                            WHERE r.driver_id::text = d.id::text
-                        ) AS "rideCount"
+                        (SELECT COUNT(*)::int
+                         FROM public.rides r
+                         WHERE r.driver_id = d.id) AS "rideCount"
                     FROM public.drivers d
                     ORDER BY d.created_at DESC
                 `);
@@ -769,21 +647,37 @@ app.get(
     '/api/admin/passengers',
     async (_req: AuthRequest, res: Response) => {
         try {
-            const result = await pool.query(`
-                SELECT
-                    p.id,
-                    p.full_name AS name,
-                    p.phone,
-                    p.region,
-                    p.account_status AS status,
-                    (
-                        SELECT COUNT(*)::int
-                        FROM public.rides r
-                        WHERE r.passenger_id::text = p.id::text
-                    ) AS "totalRides"
-                FROM public.passengers p
-                ORDER BY p.created_at DESC
-            `);
+            let result;
+
+            try {
+                result = await pool.query(`
+                    SELECT
+                        id,
+                        full_name AS name,
+                        phone,
+                        region,
+                        status,
+                        COALESCE(total_rides, 0)::int AS "totalRides"
+                    FROM public.passengers
+                    ORDER BY created_at DESC
+                `);
+            } catch (innerErr) {
+                console.warn(
+                    '⚠️  passengers.total_rides missing, falling back to 0:',
+                    innerErr,
+                );
+                result = await pool.query(`
+                    SELECT
+                        id,
+                        full_name AS name,
+                        phone,
+                        region,
+                        status,
+                        0::int AS "totalRides"
+                    FROM public.passengers
+                    ORDER BY created_at DESC
+                `);
+            }
 
             return res.status(200).json({
                 success: true,
@@ -806,31 +700,53 @@ app.get(
 |--------------------------------------------------------------------------
 */
 
-
 app.get(
     '/api/rickshaws',
     async (_req: AuthRequest, res: Response) => {
         try {
-            const result = await pool.query(`
-                SELECT
-                    d.id,
-                    d.registration_number AS "registrationNumber",
-                    d.full_name AS driver,
-                    CASE
-                        WHEN d.is_online THEN 'active'
-                        ELSE 'inactive'
-                    END AS status,
-                    d.status AS "verificationStatus"
-                FROM public.drivers d
-                WHERE LOWER(d.vehicle_type) IN ('rickshaw', 'tricycle')
-                  AND d.registration_number IS NOT NULL
-                ORDER BY d.created_at DESC
-            `);
+            try {
+                const result = await pool.query(`
+                    SELECT
+                        r.id,
+                        r.registration_number AS "registrationNumber",
+                        COALESCE(d.full_name, 'Unassigned') AS driver,
+                        r.status,
+                        COALESCE(r.verification_status, r.status) AS "verificationStatus"
+                    FROM public.rickshaws r
+                    LEFT JOIN public.drivers d ON r.driver_id = d.id
+                    ORDER BY r.created_at DESC
+                `);
 
-            return res.status(200).json({
-                success: true,
-                rickshaws: result.rows,
-            });
+                return res.status(200).json({
+                    success: true,
+                    rickshaws: result.rows,
+                });
+            } catch (innerErr) {
+                console.warn(
+                    '⚠️  public.rickshaws missing, deriving from drivers:',
+                    innerErr,
+                );
+
+                const result = await pool.query(`
+                    SELECT
+                        d.id,
+                        COALESCE(d.registration_number, 'N/A') AS "registrationNumber",
+                        d.full_name AS driver,
+                        CASE
+                            WHEN d.is_online THEN 'active'
+                            ELSE 'inactive'
+                        END AS status,
+                        d.status AS "verificationStatus"
+                    FROM public.drivers d
+                    WHERE d.registration_number IS NOT NULL
+                    ORDER BY d.created_at DESC
+                `);
+
+                return res.status(200).json({
+                    success: true,
+                    rickshaws: result.rows,
+                });
+            }
         } catch (error: unknown) {
             console.error('❌ Rickshaws error:', error);
 
@@ -841,7 +757,6 @@ app.get(
         }
     },
 );
-
 
 /*
 |--------------------------------------------------------------------------
@@ -1440,46 +1355,40 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 | ⭐ NEW: serves the React SPA from the same Express server.
 */
 
-// The Vite app lives in ../tegaara_admin and builds into backend/public.
-// Support the server running from backend/, backend/src/, or backend/dist/.
-const backendRoot = ['src', 'dist'].includes(path.basename(__dirname))
-    ? path.resolve(__dirname, '..')
-    : __dirname;
-const clientDist = process.env.CLIENT_DIST_DIR
-    ? path.resolve(process.env.CLIENT_DIST_DIR)
-    : path.join(backendRoot, 'public');
-const clientIndex = path.join(clientDist, 'index.html');
+const clientDist = path.resolve(__dirname, '../public');
 
-if (fs.existsSync(clientIndex)) {
-    console.log(`📦 Serving React + TypeScript frontend from ${clientDist}`);
+if (fs.existsSync(clientDist)) {
+    console.log(`📦 Serving frontend from ${clientDist}`);
 
-    // Vite assets are fingerprinted, so they can be cached for a long time.
+    // 1) Static assets (Vite emits hashed filenames → safe to cache).
     app.use(
         express.static(clientDist, {
             index: false,
             maxAge: '1y',
             immutable: true,
+            setHeaders(res, filePath) {
+                if (filePath.endsWith('index.html')) {
+                    res.setHeader('Cache-Control', 'no-cache');
+                }
+            },
         }),
     );
 
-    // React Router fallback. API routes have already been handled above.
+    // 2) SPA fallback — any GET/HEAD without an extension renders index.html
     app.use((req: Request, res: Response, next: NextFunction) => {
         if (req.method !== 'GET' && req.method !== 'HEAD') {
             return next();
         }
-
-        // A missing file (for example /assets/missing.js) must not return HTML.
         if (path.extname(req.path)) {
+            // Missing asset → let it fall through to the JSON 404 below.
             return next();
         }
-
-        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-        return res.sendFile(clientIndex);
+        return res.sendFile(path.join(clientDist, 'index.html'));
     });
 } else {
-    console.warn(`⚠️  React production build not found: ${clientIndex}`);
+    console.warn(`⚠️  Frontend build not found at ${clientDist}`);
     console.warn(
-        '   From tegaara_admin, run `npm run build` to generate ../backend/public.',
+        '   Run `npm run build:all` to build both backend and frontend.',
     );
 }
 
