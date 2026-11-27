@@ -11,7 +11,7 @@ import pool from '../config/database';
 |--------------------------------------------------------------------------
 */
 
-interface AdminUser {
+export interface AdminUser {
     id: number;
     firebase_uid: string;
     email: string;
@@ -24,7 +24,7 @@ interface AdminUser {
     created_at: string;
 }
 
-interface AuthRequest extends Request {
+export interface AuthRequest extends Request {
     adminUser?: AdminUser;
 }
 
@@ -38,20 +38,38 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production';
 const JWT_EXPIRES_IN = '7d';
 const BCRYPT_ROUNDS = 12;
 
-// Columns returned to clients — never include password_hash.
 const ADMIN_PUBLIC_COLUMNS = `
     id, firebase_uid, email, full_name, phone_number,
     username, profile_photo_url, account_status, role, created_at
 `;
 
+function signAdminToken(adminId: number, role?: string | null) {
+    return jwt.sign(
+        { sub: adminId, role: role || 'admin' },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN },
+    );
+}
+
+function publicAdmin(admin: any) {
+    return {
+        id: admin.id,
+        firebaseUid: admin.firebase_uid,
+        email: admin.email,
+        fullName: admin.full_name,
+        phoneNumber: admin.phone_number,
+        username: admin.username,
+        profilePhoto: admin.profile_photo_url,
+        accountStatus: admin.account_status,
+        role: admin.role,
+        createdAt: admin.created_at,
+    };
+}
+
 /*
 |--------------------------------------------------------------------------
 | Routers
 |--------------------------------------------------------------------------
-|
-| publicAdminRouter    -> mounted at /api, NO auth middleware
-| protectedAdminRouter -> mounted at /api, adminAuth applied to everything
-|
 */
 
 export const publicAdminRouter = express.Router();
@@ -59,11 +77,11 @@ export const protectedAdminRouter = express.Router();
 
 /*
 |--------------------------------------------------------------------------
-| JWT auth middleware (replaces Firebase verifyFirebaseToken)
+| JWT auth middleware
 |--------------------------------------------------------------------------
 */
 
-const adminAuth = async (
+export const adminAuth = async (
     req: AuthRequest,
     res: Response,
     next: NextFunction,
@@ -228,27 +246,12 @@ publicAdminRouter.post(
                 });
             }
 
-            const token = jwt.sign(
-                { sub: admin.id, role: admin.role || 'admin' },
-                JWT_SECRET,
-                { expiresIn: JWT_EXPIRES_IN },
-            );
+            const token = signAdminToken(admin.id, admin.role);
 
             return res.status(200).json({
                 success: true,
                 token,
-                admin: {
-                    id: admin.id,
-                    firebaseUid: admin.firebase_uid,
-                    email: admin.email,
-                    fullName: admin.full_name,
-                    phoneNumber: admin.phone_number,
-                    username: admin.username,
-                    profilePhoto: admin.profile_photo_url,
-                    accountStatus: admin.account_status,
-                    role: admin.role,
-                    createdAt: admin.created_at,
-                },
+                admin: publicAdmin(admin),
             });
         } catch (error: unknown) {
             console.error('❌ Admin login error:', error);
@@ -295,8 +298,6 @@ publicAdminRouter.post(
                     ? username.trim()
                     : null;
 
-            // Case-insensitive duplicate-email check, matching the LOWER()
-            // lookup used by /admin/login.
             const existingAdmin = await pool.query(
                 `
                 SELECT id
@@ -314,7 +315,6 @@ publicAdminRouter.post(
                 });
             }
 
-            // Unique-username pre-check (username is nullable-unique).
             if (normalizedUsername) {
                 const existingUsername = await pool.query(
                     `
@@ -339,8 +339,6 @@ publicAdminRouter.post(
                 BCRYPT_ROUNDS,
             );
 
-            // Firebase is gone, but firebase_uid is NOT NULL UNIQUE.
-            // Populate it with a local UUID so existing joins keep working.
             const firebaseUid = randomUUID();
 
             const result = await pool.query(
@@ -379,28 +377,20 @@ publicAdminRouter.post(
 
             const admin = result.rows[0];
 
+            // ⭐ Sign a JWT immediately so the client is logged in
+            // as soon as the account is created — no second login trip.
+            const token = signAdminToken(admin.id, admin.role);
+
             return res.status(201).json({
                 success: true,
                 message: 'Admin created successfully',
+                token,
                 adminId: admin.id,
-                admin: {
-                    id: admin.id,
-                    firebaseUid: admin.firebase_uid,
-                    email: admin.email,
-                    fullName: admin.full_name,
-                    phoneNumber: admin.phone_number,
-                    username: admin.username,
-                    profilePhoto: admin.profile_photo_url,
-                    accountStatus: admin.account_status,
-                    role: admin.role,
-                    createdAt: admin.created_at,
-                },
+                admin: publicAdmin(admin),
             });
         } catch (error: unknown) {
             console.error('❌ Error creating admin:', error);
 
-            // Postgres unique violations as a safety net (race conditions
-            // between the pre-checks and the INSERT).
             const pgErr = error as { code?: string; constraint?: string };
             if (pgErr.code === '23505') {
                 const field = pgErr.constraint?.includes('username')
@@ -425,10 +415,15 @@ publicAdminRouter.post(
 |--------------------------------------------------------------------------
 | ADMIN AUTHENTICATION
 |--------------------------------------------------------------------------
-| Everything below requires a valid admin JWT.
+| Only routes whose path matches one of these prefixes are guarded by
+| adminAuth. Requests for /api/rides, /api/health, etc. that fall through
+| the earlier routers are NOT intercepted.
 */
 
-protectedAdminRouter.use(adminAuth);
+protectedAdminRouter.use(
+    ['/admin', '/stats', '/finance', '/settings', '/rickshaws'],
+    adminAuth,
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -446,29 +441,16 @@ protectedAdminRouter.get(
             });
         }
 
-        const admin = req.adminUser;
-
         return res.status(200).json({
             success: true,
-            admin: {
-                id: admin.id,
-                firebaseUid: admin.firebase_uid,
-                email: admin.email,
-                fullName: admin.full_name,
-                phoneNumber: admin.phone_number,
-                username: admin.username,
-                profilePhoto: admin.profile_photo_url,
-                accountStatus: admin.account_status,
-                role: admin.role || 'admin',
-                createdAt: admin.created_at,
-            },
+            admin: publicAdmin(req.adminUser),
         });
     },
 );
 
 /*
 |--------------------------------------------------------------------------
-| Dashboard Statistics (extended)
+| Dashboard Statistics
 |--------------------------------------------------------------------------
 */
 
@@ -759,11 +741,7 @@ protectedAdminRouter.get(
 protectedAdminRouter.get(
     '/finance',
     async (_req: AuthRequest, res: Response) => {
-        const tables = [
-            'transactions',
-            'payments',
-            'wallet_transactions',
-        ];
+        const tables = ['transactions', 'payments', 'wallet_transactions'];
 
         for (const table of tables) {
             try {
@@ -832,16 +810,13 @@ protectedAdminRouter.get(
 
             return res.status(200).json({
                 name: s.name ?? defaults.name,
-                supportEmail:
-                    s.support_email ?? defaults.supportEmail,
+                supportEmail: s.support_email ?? defaults.supportEmail,
                 driverSearchRadius:
-                    s.driver_search_radius ??
-                    defaults.driverSearchRadius,
+                    s.driver_search_radius ?? defaults.driverSearchRadius,
                 sessionTimeout:
                     s.session_timeout ?? defaults.sessionTimeout,
                 notificationEnabled:
-                    s.notification_enabled ??
-                    defaults.notificationEnabled,
+                    s.notification_enabled ?? defaults.notificationEnabled,
             });
         } catch (err) {
             console.warn(
@@ -872,12 +847,10 @@ protectedAdminRouter.get(
             );
 
             const offset = (page - 1) * limit;
-
             const search = String(req.query.search || '').trim();
             const status = String(req.query.status || 'pending').trim();
 
             const params: any[] = [status];
-
             let whereClause = `WHERE d.status = $1`;
             let parameterIndex = 2;
 
@@ -905,7 +878,6 @@ protectedAdminRouter.get(
             );
 
             const total = countResult.rows[0]?.total || 0;
-
             const dataParams = [...params, limit, offset];
 
             const dataResult = await pool.query(
@@ -1097,7 +1069,6 @@ protectedAdminRouter.post(
     '/admin/drivers/:id/reject',
     async (req: AuthRequest, res: Response) => {
         const driverId = Number(req.params.id);
-
         const reason = String(req.body?.reason || '').trim();
 
         if (!Number.isInteger(driverId)) {
@@ -1191,7 +1162,6 @@ protectedAdminRouter.post(
     '/admin/drivers/:id/request-correction',
     async (req: AuthRequest, res: Response) => {
         const driverId = Number(req.params.id);
-
         const message = String(req.body?.message || '').trim();
 
         if (!Number.isInteger(driverId)) {

@@ -26,6 +26,7 @@ import passengerRoutes from './routes/passengerRoutes';
 import passengerWalletRoutes from './routes/passengerWalletRoutes';
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
+import driverSubscriptionRoutes from './routes/driverSubscriptionRoutes';
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
@@ -238,6 +239,15 @@ app.use('/api/drivers', driverRoutes);
 */
 
 app.use('/api/drivers', driverWalletRoutes);
+
+/*
+|--------------------------------------------------------------------------
+| Driver Subscription Routes
+|--------------------------------------------------------------------------
+| Plans, current subscription, trial activation, payments and verification.
+*/
+
+app.use('/api/drivers/subscription', driverSubscriptionRoutes);
 
 /*
 |--------------------------------------------------------------------------
