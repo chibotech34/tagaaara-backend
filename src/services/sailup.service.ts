@@ -67,46 +67,21 @@ export async function sendSailupSms(
         apiKeyPrefix: apiKey.substring(0, 8),
     });
 
-    // Hard cap so a slow Sailup never hangs the /otp/send request.
-    // Configurable via SAILUP_TIMEOUT_MS; default 15s.
-    const timeoutMs =
-        Number(process.env.SAILUP_TIMEOUT_MS ?? 15000) || 15000;
+    const response = await fetch(apiUrl, {
+        method: 'POST',
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        },
 
-    let response: globalThis.Response;
-
-    try {
-        response = await fetch(apiUrl, {
-            method: 'POST',
-
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-            },
-
-            body: JSON.stringify({
-                from: senderId,
-                to: [phone],
-                body: message,
-            }),
-
-            signal: controller.signal,
-        });
-    } catch (err: any) {
-        if (err?.name === 'AbortError') {
-            const timeoutError: any = new Error(
-                `Sailup SMS request timed out after ${timeoutMs}ms`,
-            );
-            timeoutError.code = 'SAILUP_TIMEOUT';
-            throw timeoutError;
-        }
-        throw err;
-    } finally {
-        clearTimeout(timeoutId);
-    }
+        body: JSON.stringify({
+            from: senderId,
+            to: [phone],
+            body: message,
+        }),
+    });
 
     const rawResponse = await response.text();
 

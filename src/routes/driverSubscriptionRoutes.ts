@@ -95,10 +95,6 @@ function statusMessage(status: PaymentStatus): string {
     }
 }
 
-/**
- * Translates Paystack gateway errors (like "Insufficient funds") into
- * clean, user-facing messages.
- */
 function getUserFriendlyErrorMessage(rawMessage: string): string {
     const lower = rawMessage.toLowerCase();
 
@@ -345,9 +341,14 @@ router.get('/current', authenticateDriver, async (req: AuthedDriverRequest, res)
 });
 
 /* ===========================================================================
- * POST /api/drivers/subscription/activate-trial
+ * POST /api/drivers/subscription/trial
+ * POST /api/drivers/subscription/activate-trial   (legacy alias)
+ *
+ * The Flutter client (api_config.dart) calls /trial. The previous
+ * implementation only registered /activate-trial, which is why the button
+ * was getting "Route not found". Both paths now share one handler.
  * ========================================================================= */
-router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverRequest, res) => {
+const activateTrialHandler = async (req: AuthedDriverRequest, res: Response) => {
     const client = await pool.connect();
 
     try {
@@ -426,7 +427,7 @@ router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverReque
         });
     } catch (err) {
         try { await client.query('ROLLBACK'); } catch { /* ignore */ }
-        console.error('POST /subscription/activate-trial:', err);
+        console.error('POST /subscription/trial:', err);
         res.status(500).json({
             success: false,
             message: 'Failed to activate free trial.',
@@ -434,7 +435,10 @@ router.post('/activate-trial', authenticateDriver, async (req: AuthedDriverReque
     } finally {
         client.release();
     }
-});
+};
+
+router.post('/trial', authenticateDriver, activateTrialHandler);
+router.post('/activate-trial', authenticateDriver, activateTrialHandler);
 
 /* ===========================================================================
  * POST /api/drivers/subscription/initialize
@@ -703,7 +707,6 @@ router.post('/submit-otp', authenticateDriver, async (req: AuthedDriverRequest, 
         }
 
         if (status === 'failed' || status === 'reversed') {
-            // FIX: Cast to any to avoid TypeScript error
             const rawData = (submitted.raw?.data ?? submitted.raw ?? {}) as any;
             const gatewayResponse = rawData?.gateway_response || rawData?.message || '';
             const failureMessage = getUserFriendlyErrorMessage(statusMessage(status) + ' ' + gatewayResponse);
@@ -779,7 +782,6 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
 
         const status = normaliseStatus(verified.status);
 
-        // FIX: Cast to any to avoid TypeScript error
         const paystackData = (verified.raw?.data ?? verified.raw ?? {}) as any;
 
         if (status === 'success') {

@@ -20,9 +20,12 @@ import {
 } from './middleware/firebaseAdmin';
 
 import passengerRoutes from './routes/passengerRoutes';
-import passengerWalletRoutes from './routes/passengerWalletRoutes'; // ✏️ ADDED
+import passengerWalletRoutes from './routes/passengerWalletRoutes';
 import driverRoutes from './routes/driverRoutes';
 import driverWalletRoutes from './routes/driverWalletRoutes';
+import driverSubscriptionRoutes, {
+    handleSubscriptionWebhook,
+} from './routes/driverSubscriptionRoutes'; // ✏️ ADDED
 import rideRoutes from './routes/rideRoutes';
 import mapRoutes from './routes/mapRoutes';
 import notificationRoutes from './routes/notificationRoutes';
@@ -100,16 +103,52 @@ app.use(
 
 /*
 |--------------------------------------------------------------------------
-| ❌ REMOVED: app.use("/api/auth", otpRoutes);
+| PAYSTACK WEBHOOK (must be registered BEFORE express.json())
+|--------------------------------------------------------------------------
 |
-| Firebase Phone Auth now sends & verifies OTPs on the client.
-| The backend only verifies the resulting Firebase ID token
-| (via verifyFirebaseToken inside passengerRoutes).
+| The Paystack signature check needs the *raw* body bytes. If this is
+| mounted after express.json(), req.body is already a parsed object and
+| verifyWebhookSignature() will always return false.
 |
-| If you still have a /routes/otpRoutes.js file that uses Zavu,
-| delete it.
 |--------------------------------------------------------------------------
 */
+
+app.post(
+    '/api/drivers/subscription/webhook',
+    express.raw({ type: 'application/json' }),
+    async (
+        req: Request,
+        res: Response,
+    ) => {
+        try {
+            const signature =
+                (req.headers[
+                    'x-paystack-signature'
+                ] as string | undefined) ?? undefined;
+
+            const result =
+                await handleSubscriptionWebhook(
+                    req.body as Buffer,
+                    signature,
+                );
+
+            return res
+                .status(result.status)
+                .json(result.body);
+        } catch (error) {
+            console.error(
+                '❌ Subscription webhook error:',
+                error,
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    'Webhook processing failed.',
+            });
+        }
+    },
+);
 
 /*
 |--------------------------------------------------------------------------
@@ -260,39 +299,52 @@ app.use(
 | are matched first and are not shadowed by any `/:id` route in
 | passengerRoutes.
 |
-| Endpoints:
-|
-|   GET  /api/passengers/wallet
-|   POST /api/passengers/wallet
-|   GET  /api/passengers/wallet/pending-payment-ride
-|   POST /api/passengers/wallet/topup
-|   POST /api/passengers/wallet/pay
-|   GET  /api/passengers/transactions
-|
 |--------------------------------------------------------------------------
 */
 
 app.use(
     '/api/passengers',
-    passengerWalletRoutes, // ✏️ ADDED
+    passengerWalletRoutes,
 );
 
 /*
 |--------------------------------------------------------------------------
 | Passenger Routes
 |--------------------------------------------------------------------------
-|
-| Passenger registration and login are now backed entirely by
-| Firebase Phone Authentication. The client sends a Firebase ID
-| token; passengerRoutes verifies it and reads the verified phone
-| number from decoded.phone_number.
-|
-|--------------------------------------------------------------------------
 */
 
 app.use(
     '/api/passengers',
     passengerRoutes,
+);
+
+/*
+|--------------------------------------------------------------------------
+| Driver Subscription Routes
+|--------------------------------------------------------------------------
+|
+| MUST be mounted BEFORE driverRoutes: driverRoutes declares generic
+| patterns like /:uid/status, /:uid/current-request and /:id/stats that
+| would otherwise shadow specific /subscription/... paths.
+|
+| Endpoints (mounted at /api/drivers/subscription):
+|
+|   GET  /plans
+|   GET  /current
+|   POST /trial                ← what api_config.dart calls
+|   POST /activate-trial       ← legacy alias (kept for safety)
+|   POST /initialize
+|   POST /submit-otp
+|   GET  /verify/:reference
+|   GET  /payments
+|   POST /webhook              ← mounted above, before express.json()
+|
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    '/api/drivers/subscription',
+    driverSubscriptionRoutes,
 );
 
 /*
@@ -311,21 +363,8 @@ app.use(
 | Driver Wallet Routes
 |--------------------------------------------------------------------------
 |
-| Driver wallet endpoints:
-|
-| GET  /api/drivers/wallet
-| GET  /api/drivers/transactions
-|
-| GET  /api/drivers/wallet/payment-account
-| POST /api/drivers/wallet/payment-account
-|
-| POST /api/drivers/wallet/topup
-|
-| POST /api/drivers/wallet/withdraw
-| GET  /api/drivers/wallet/withdrawals
-|
-| The wallet router handles driver Firebase authentication
-| internally, so it must be registered before adminAuth below.
+| Wallet router handles driver Firebase auth internally, so it must be
+| registered before adminAuth below.
 |
 |--------------------------------------------------------------------------
 */
@@ -349,12 +388,6 @@ app.use(
 /*
 |--------------------------------------------------------------------------
 | PUBLIC ADMIN ROUTES
-|--------------------------------------------------------------------------
-*/
-
-/*
-|--------------------------------------------------------------------------
-| Check whether an admin exists
 |--------------------------------------------------------------------------
 */
 
