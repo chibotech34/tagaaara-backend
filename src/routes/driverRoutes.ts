@@ -18,22 +18,27 @@ import { createOtpRouter } from './otpRouterFactory';
 import { verifyOtp } from '../services/otpService';
 // ---------------------------
 
+// ----- Driver subscription integration -----
+import driverSubscriptionRouter from './driverSubscriptionRoutes';
+// -------------------------------------------
+
 const router = Router();
 
 /*
 |--------------------------------------------------------------------------
 | OTP endpoints (unauthenticated)
 |--------------------------------------------------------------------------
-|
-| Mounts:
-|   POST /api/drivers/otp/send
-|   POST /api/drivers/otp/verify
-|
-| Phone-ownership verification only — no Firebase token required.
-|--------------------------------------------------------------------------
 */
 
 router.use('/otp', createOtpRouter('driver'));
+
+/*
+|--------------------------------------------------------------------------
+| Subscription endpoints (Firebase-authenticated)
+|--------------------------------------------------------------------------
+*/
+
+router.use('/subscription', driverSubscriptionRouter);
 
 /*
 |--------------------------------------------------------------------------
@@ -282,7 +287,6 @@ router.post(
             }
 
             if (
-                !uid ||
                 !full_name ||
                 !phone ||
                 !registration_number
@@ -290,19 +294,28 @@ router.post(
                 return res.status(400).json({
                     success: false,
                     message:
-                        'Missing required fields: uid, full_name, phone, registration_number.',
+                        'Missing required fields: full_name, phone, registration_number.',
                     code: 'REQUIRED_FIELDS_MISSING',
                 });
             }
 
-            // ---- OTP verification gate (optional) ----
+            // The Firebase token is the source of truth for the driver UID.
+            // Keep accepting uid from older Flutter clients, but never trust it.
+            if (uid && uid !== decodedUid) {
+                return res.status(403).json({
+                    success: false,
+                    message:
+                        'UID in request does not match authenticated Firebase user.',
+                    code: 'UID_MISMATCH',
+                });
+            }
 
+            const driverUid = decodedUid;
+
+            // ---- OTP verification gate (optional) ----
             const { otp } = req.body ?? {};
 
-            if (
-                process.env.DRIVER_REGISTER_REQUIRE_OTP ===
-                'true'
-            ) {
+            if (process.env.DRIVER_REGISTER_REQUIRE_OTP === 'true') {
                 if (!otp) {
                     return res.status(400).json({
                         success: false,
@@ -327,17 +340,7 @@ router.post(
                     });
                 }
             }
-
             // ---- end OTP gate ----
-
-            if (uid !== decodedUid) {
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        'UID in request does not match authenticated Firebase user.',
-                    code: 'UID_MISMATCH',
-                });
-            }
 
             const existing = await pool.query(
                 `
@@ -349,7 +352,7 @@ router.post(
                 LIMIT 1
                 `,
                 [
-                    uid,
+                    driverUid,
                     phone,
                     registration_number,
                 ],
@@ -365,6 +368,11 @@ router.post(
                         existing.rows[0].id,
                 });
             }
+
+            // Automatic approval is a server-side business rule. Never allow
+            // the client to choose its own account status. The database check
+            // constraint permits 'approved' and this is the only initial state.
+            const initialStatus = 'approved' as const;
 
             const result = await pool.query(
                 `
@@ -428,7 +436,7 @@ router.post(
                     $23,
                     false,
                     false,
-                    'pending',
+                    $24,
                     5.0,
                     0,
                     0,
@@ -439,7 +447,7 @@ router.post(
                 RETURNING id, uid, status
                 `,
                 [
-                    uid,
+                    driverUid,
                     full_name,
                     phone,
                     email ||
@@ -466,6 +474,7 @@ router.post(
                     mobile_money_provider ||
                     null,
                     mobile_money_number || null,
+                    initialStatus,
                 ],
             );
 
@@ -495,6 +504,20 @@ router.post(
                     message:
                         'A driver with this UID, phone number, or vehicle registration already exists.',
                     code: 'DRIVER_DUPLICATE',
+                });
+            }
+
+            if (dbError.code === '23514') {
+                // Check-constraint violation. Historically produced by
+                // drivers_status_check when 'active' was sent. Now that
+                // the whitelist is narrowed this should not happen, but
+                // we surface a precise error if it ever does.
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        'Registration rejected because a field failed a database constraint.',
+                    code: 'DB_CONSTRAINT_VIOLATION',
+                    detail: dbError.detail,
                 });
             }
 
@@ -998,7 +1021,10 @@ router.get(
             if (
                 !Number.isFinite(latitude) ||
                 !Number.isFinite(longitude) ||
-                !Number.isFinite(searchRadius)
+                !Number.isFinite(searchRadius) ||
+                latitude < -90 || latitude > 90 ||
+                longitude < -180 || longitude > 180 ||
+                searchRadius <= 0 || searchRadius > 50000
             ) {
                 return res.status(400).json({
                     success: false,
@@ -1757,19 +1783,13 @@ router.post(
             const driver =
                 driverResult.rows[0];
 
-            if (
-                isOnline &&
-                driver.status !==
-                'approved'
-            ) {
+            // Only automatically approved accounts may become available to riders.
+            if (isOnline && driver.status !== 'approved') {
                 return res.status(403).json({
                     success: false,
-                    message:
-                        'Cannot go online. Driver account is not approved.',
-                    code:
-                        'NOT_APPROVED',
-                    status:
-                        driver.status,
+                    message: `Cannot go online. Driver account status is ${driver.status}.`,
+                    code: 'DRIVER_NOT_APPROVED',
+                    status: driver.status,
                 });
             }
 
@@ -1923,6 +1943,16 @@ router.patch(
             }
         }
 
+        for (const flag of ['is_online', 'is_available'] as const) {
+            if (Object.prototype.hasOwnProperty.call(update, flag) && typeof update[flag] !== 'boolean') {
+                return res.status(400).json({
+                    success: false,
+                    message: `${flag} must be a boolean value.`,
+                    code: 'INVALID_STATUS',
+                });
+            }
+        }
+
         if (
             Object.keys(update).length ===
             0
@@ -1937,53 +1967,49 @@ router.patch(
         }
 
         try {
-            if (
-                update.is_online ===
-                true
-            ) {
-                const check =
-                    await pool.query(
-                        `
-                        SELECT status
-                        FROM public.drivers
-                        WHERE uid = $1
-                        LIMIT 1
-                        `,
-                        [uid],
-                    );
+            // Fetch current state whenever the patch attempts to enable online
+            // or availability. This prevents pending/blocked accounts from
+            // bypassing /update-status and prevents availability while offline.
+            if (update.is_online === true || update.is_available === true) {
+                const check = await pool.query(
+                    `
+                    SELECT status, is_online
+                    FROM public.drivers
+                    WHERE uid = $1
+                    LIMIT 1
+                    `,
+                    [uid],
+                );
 
-                if (
-                    check.rows.length ===
-                    0
-                ) {
-                    return res
-                        .status(404)
-                        .json({
-                            success: false,
-                            message:
-                                'Driver not found.',
-                            code:
-                                'DRIVER_NOT_FOUND',
-                        });
+                if (check.rows.length === 0) {
+                    return res.status(404).json({
+                        success: false,
+                        message: 'Driver not found.',
+                        code: 'DRIVER_NOT_FOUND',
+                    });
                 }
 
-                if (
-                    check.rows[0]
-                        .status !==
-                    'approved'
-                ) {
-                    return res
-                        .status(403)
-                        .json({
-                            success: false,
-                            message:
-                                'Cannot go online. Driver account is not approved.',
-                            code:
-                                'NOT_APPROVED',
-                            status:
-                                check.rows[0]
-                                    .status,
-                        });
+                const currentDriver = check.rows[0];
+
+                if (currentDriver.status !== 'approved') {
+                    return res.status(403).json({
+                        success: false,
+                        message: `Cannot go online or become available. Driver account status is ${currentDriver.status}.`,
+                        code: 'DRIVER_NOT_APPROVED',
+                        status: currentDriver.status,
+                    });
+                }
+
+                const willBeOnline =
+                    update.is_online === true ||
+                    (update.is_online === undefined && currentDriver.is_online === true);
+
+                if (update.is_available === true && !willBeOnline) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'A driver must be online before becoming available.',
+                        code: 'DRIVER_MUST_BE_ONLINE',
+                    });
                 }
             }
 

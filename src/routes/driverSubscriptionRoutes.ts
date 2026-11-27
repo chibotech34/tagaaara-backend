@@ -343,10 +343,6 @@ router.get('/current', authenticateDriver, async (req: AuthedDriverRequest, res)
 /* ===========================================================================
  * POST /api/drivers/subscription/trial
  * POST /api/drivers/subscription/activate-trial   (legacy alias)
- *
- * The Flutter client (api_config.dart) calls /trial. The previous
- * implementation only registered /activate-trial, which is why the button
- * was getting "Route not found". Both paths now share one handler.
  * ========================================================================= */
 const activateTrialHandler = async (req: AuthedDriverRequest, res: Response) => {
     const client = await pool.connect();
@@ -781,7 +777,6 @@ router.get('/verify/:reference', authenticateDriver, async (req: AuthedDriverReq
         }
 
         const status = normaliseStatus(verified.status);
-
         const paystackData = (verified.raw?.data ?? verified.raw ?? {}) as any;
 
         if (status === 'success') {
