@@ -28,6 +28,12 @@ interface PaystackResponse {
     data?: Record<string, any>;
 }
 
+interface PaystackResult {
+    ok: boolean;
+    httpStatus: number;
+    json: PaystackResponse;
+}
+
 interface Plan {
     id: number;
     name: string;
@@ -44,7 +50,7 @@ interface PaymentForVerification {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Authentication                                                            */
+/* AUTHENTICATION                                                             */
 /* -------------------------------------------------------------------------- */
 
 const verifyFirebaseToken = async (
@@ -85,7 +91,7 @@ const verifyFirebaseToken = async (
         next();
     } catch (error) {
         console.error(
-            '[passenger-sub] Firebase token verification failed:',
+            '[passenger-sub] Firebase authentication failed:',
             (error as Error).message,
         );
 
@@ -102,19 +108,28 @@ function getUid(req: AuthReq): string | null {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Paystack helpers                                                           */
+/* PAYSTACK HELPERS                                                            */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Important:
+ * Do not throw just because Paystack's JSON status is false.
+ *
+ * We need the response payload to inspect its message, code and data.
+ * Otherwise, Mobile Money failures can be converted into generic errors
+ * before the route has a chance to handle them.
+ */
 async function paystackRequest(
     path: string,
     method: 'GET' | 'POST',
     body?: unknown,
-): Promise<{ ok: boolean; status: number; json: PaystackResponse }> {
+): Promise<PaystackResult> {
     if (!PAYSTACK_SECRET) {
         throw new Error('PAYSTACK_SECRET_KEY is not configured.');
     }
 
     const controller = new AbortController();
+
     const timeout = setTimeout(
         () => controller.abort(),
         PAYSTACK_TIMEOUT_MS,
@@ -146,16 +161,9 @@ async function paystackRequest(
             );
         }
 
-        if (!response.ok || json.status !== true) {
-            throw new Error(
-                json.message ||
-                `Paystack request failed (HTTP ${response.status}).`,
-            );
-        }
-
         return {
-            ok: response.ok,
-            status: response.status,
+            ok: response.ok && json.status === true,
+            httpStatus: response.status,
             json,
         };
     } finally {
@@ -166,16 +174,49 @@ async function paystackRequest(
 async function paystackPost(
     path: string,
     body: unknown,
-) {
+): Promise<PaystackResult> {
     return paystackRequest(path, 'POST', body);
 }
 
-async function paystackGet(path: string) {
+async function paystackGet(
+    path: string,
+): Promise<PaystackResult> {
     return paystackRequest(path, 'GET');
 }
 
+function getPaystackData(
+    response: PaystackResponse,
+): Record<string, any> {
+    return response.data ?? {};
+}
+
+function getPaystackMessage(
+    response: PaystackResponse,
+    fallback: string,
+): string {
+    const data = getPaystackData(response);
+
+    const candidates = [
+        data.display_text,
+        data.gateway_response,
+        data.message,
+        response.message,
+    ];
+
+    for (const candidate of candidates) {
+        if (
+            typeof candidate === 'string' &&
+            candidate.trim().length > 0
+        ) {
+            return candidate.trim().slice(0, 500);
+        }
+    }
+
+    return fallback;
+}
+
 /* -------------------------------------------------------------------------- */
-/* General helpers                                                            */
+/* GENERAL HELPERS                                                            */
 /* -------------------------------------------------------------------------- */
 
 function normalizeProvider(
@@ -239,7 +280,9 @@ function normalizeCurrency(value: unknown): string {
     return String(value || 'GHS').trim().toUpperCase();
 }
 
-function amountInPesewas(value: string | number): number | null {
+function amountInPesewas(
+    value: string | number,
+): number | null {
     const amount = Number(value);
 
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -252,7 +295,6 @@ function amountInPesewas(value: string | number): number | null {
         return null;
     }
 
-    // Reject values with more than two meaningful decimal places.
     if (Math.abs(amount * 100 - pesewas) > 0.000001) {
         return null;
     }
@@ -278,29 +320,14 @@ function validatePaystackTransaction(
     );
 }
 
-function safePaystackMessage(
-    data: Record<string, any> | undefined,
-    fallback: string,
-): string {
-    const value =
-        data?.display_text ??
-        data?.gateway_response ??
-        data?.message;
-
-    return typeof value === 'string' && value.trim()
-        ? value.trim().slice(0, 500)
-        : fallback;
-}
-
-/**
- * Maps a free-text Paystack failure message to a stable machine-readable
- * code so the client can pick the right UI (e.g. insufficient funds dialog
- * vs. a generic toast).
- */
-function detectPaymentFailureCode(message: string): string | null {
-    const lower = (message || '').toLowerCase();
+function detectPaymentFailureCode(
+    message: string,
+): string | null {
+    const lower = String(message ?? '').toLowerCase();
 
     if (
+        lower.includes('low_balance_or_payee_limit_reached_or_not_allowed') ||
+        lower.includes('insufficient_funds') ||
         lower.includes('insufficient') ||
         lower.includes('no fund') ||
         lower.includes('not enough') ||
@@ -312,6 +339,7 @@ function detectPaymentFailureCode(message: string): string | null {
     ) {
         return 'INSUFFICIENT_FUNDS';
     }
+
     if (
         lower.includes('wrong pin') ||
         lower.includes('invalid pin') ||
@@ -319,26 +347,32 @@ function detectPaymentFailureCode(message: string): string | null {
     ) {
         return 'WRONG_PIN';
     }
-    if (lower.includes('declined')) return 'DECLINED';
-    if (lower.includes('timeout') || lower.includes('timed out')) {
+
+    if (lower.includes('declined')) {
+        return 'DECLINED';
+    }
+
+    if (
+        lower.includes('timeout') ||
+        lower.includes('timed out')
+    ) {
         return 'TIMEOUT';
     }
-    if (lower.includes('cancel')) return 'CANCELLED';
+
+    if (lower.includes('cancel')) {
+        return 'CANCELLED';
+    }
+
     return null;
 }
 
-/**
- * Resolve the machine-readable failure code for a Paystack charge/verify
- * payload. Paystack's own `data.code` is authoritative — for Mobile Money
- * it can carry `low_balance_or_payee_limit_reached_or_not_allowed` even
- * when the human-readable text is a generic "Declined". We only fall back
- * to scanning the text when no code is present.
- */
 function resolvePaystackFailureCode(
     data: Record<string, any> | undefined,
-    fallbackMessage: string,
+    message: string,
 ): string | null {
-    const rawCode = String(data?.code ?? '').trim().toLowerCase();
+    const rawCode = String(data?.code ?? '')
+        .trim()
+        .toLowerCase();
 
     if (
         rawCode === 'low_balance_or_payee_limit_reached_or_not_allowed' ||
@@ -347,27 +381,50 @@ function resolvePaystackFailureCode(
         return 'INSUFFICIENT_FUNDS';
     }
 
-    return detectPaymentFailureCode(fallbackMessage);
+    return detectPaymentFailureCode(
+        `${rawCode} ${message}`,
+    );
 }
 
-/**
- * When Paystack tells us it is the wallet/payee-limit condition, replace
- * the provider's generic text ("Declined", "Contact your bank") with
- * something the user can act on.
- */
 function friendlyInsufficientFundsMessage(
     data: Record<string, any> | undefined,
     fallback: string,
 ): string {
-    const rawCode = String(data?.code ?? '').trim().toLowerCase();
-    if (rawCode === 'low_balance_or_payee_limit_reached_or_not_allowed') {
+    const rawCode = String(data?.code ?? '').toLowerCase();
+    const rawMessage = String(fallback ?? '').toLowerCase();
+
+    if (
+        rawCode.includes('low_balance_or_payee_limit_reached_or_not_allowed') ||
+        rawMessage.includes('low_balance_or_payee_limit_reached_or_not_allowed') ||
+        rawMessage.includes('insufficient_funds')
+    ) {
         return (
             'Your Mobile Money wallet does not have enough funds, or your ' +
             'payee limit has been reached. Please top up or check your ' +
             'transaction limits and try again.'
         );
     }
+
     return fallback;
+}
+
+function paymentFailureResponse(
+    response: PaystackResponse,
+    fallback: string,
+): {
+    code: string;
+    message: string;
+} {
+    const data = getPaystackData(response);
+    const message = getPaystackMessage(response, fallback);
+    const code = resolvePaystackFailureCode(data, message);
+
+    return {
+        code: code ?? 'CHARGE_FAILED',
+        message: code === 'INSUFFICIENT_FUNDS'
+            ? friendlyInsufficientFundsMessage(data, message)
+            : message,
+    };
 }
 
 async function passengerForUid(uid: string) {
@@ -382,11 +439,6 @@ async function passengerForUid(uid: string) {
     return result.rows[0] ?? null;
 }
 
-/**
- * A reference is only usable by the passenger who owns the payment.
- * Return 404 for both missing and foreign references to avoid leaking
- * whether another passenger's reference exists.
- */
 async function getPassengerPayment(
     reference: string,
     uid: string,
@@ -415,16 +467,37 @@ async function getPassengerPayment(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Subscription activation                                                    */
+/* PAYMENT FAILURE DATABASE UPDATE                                            */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Call this only after an independent Paystack transaction verification
- * has confirmed reference, amount, currency and successful status.
- *
- * It is idempotent: an already-applied payment cannot create a second
- * subscription.
- */
+async function markPaymentFailed(
+    reference: string,
+    message: string,
+): Promise<void> {
+    await pool.query(
+        `UPDATE public.passenger_subscription_payments
+         SET status = 'failed',
+             failure_reason = $1,
+             updated_at = NOW()
+         WHERE reference = $2
+           AND status = 'pending'`,
+        [message, reference],
+    );
+
+    await pool.query(
+        `UPDATE public.paystack_transactions
+         SET status = 'failed',
+             updated_at = NOW()
+         WHERE reference = $1
+           AND purpose = 'passenger_subscription'`,
+        [reference],
+    );
+}
+
+/* -------------------------------------------------------------------------- */
+/* SUBSCRIPTION ACTIVATION                                                    */
+/* -------------------------------------------------------------------------- */
+
 async function activateFromReference(
     reference: string,
 ): Promise<{
@@ -485,7 +558,6 @@ async function activateFromReference(
             };
         }
 
-        // Serialize all subscription changes for this passenger.
         const passengerResult = await client.query(
             `SELECT id
              FROM public.passengers
@@ -522,9 +594,6 @@ async function activateFromReference(
             throw new Error('Invalid paid subscription plan.');
         }
 
-        // The payment amount/currency are the immutable snapshot captured
-        // when the charge was initialized. Do not compare against today's
-        // plan price: an administrator may have changed the plan since then.
         if (amountInPesewas(payment.amount) === null) {
             throw new Error('Invalid stored payment amount.');
         }
@@ -546,7 +615,6 @@ async function activateFromReference(
 
         const existingExpiry = existingResult.rows[0]?.expires_at;
 
-        // Use the database clock to decide whether the old period is active.
         const clockResult = await client.query(
             `SELECT NOW() AS now`,
         );
@@ -566,8 +634,6 @@ async function activateFromReference(
             durationDays * 24 * 60 * 60 * 1000,
         );
 
-        // The passenger row lock prevents concurrent trial/paid activations
-        // that use this same locking convention.
         await client.query(
             `UPDATE public.passenger_subscriptions
              SET status = 'expired',
@@ -825,8 +891,6 @@ router.post('/trial', verifyFirebaseToken, async (req: AuthReq, res) => {
 
         await client.query('BEGIN');
 
-        // Lock the passenger row. Trial activation and paid activation both
-        // lock this row, serializing subscription changes for this passenger.
         const passengerResult = await client.query(
             `SELECT id
              FROM public.passengers
@@ -1015,7 +1079,9 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
+        // These names match your current Flutter service.
         const planId = Number(req.body?.plan_id);
+
         const provider = normalizeProvider(
             String(req.body?.provider ?? ''),
         );
@@ -1110,7 +1176,7 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
 
         reference = makeReference(uid);
 
-        // Create both records atomically before contacting Paystack.
+        // Create the payment records before contacting Paystack.
         const client = await pool.connect();
 
         try {
@@ -1129,8 +1195,10 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
                         channel,
                         phone
                     )
-                 VALUES ($1, $2, $3, $4, $5, 'pending',
-                         'paystack', 'mobile_money', $6)`,
+                 VALUES (
+                    $1, $2, $3, $4, $5,
+                    'pending', 'paystack', 'mobile_money', $6
+                 )`,
                 [
                     passenger.id,
                     planId,
@@ -1176,10 +1244,19 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             } catch {
                 // Ignore rollback errors.
             }
+
             throw error;
         } finally {
             client.release();
         }
+
+        console.log('[passenger-sub] Initializing payment:', {
+            reference,
+            planId,
+            provider,
+            currency,
+            amountPesewas,
+        });
 
         const charge = await paystackPost('/charge', {
             email,
@@ -1192,16 +1269,17 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             },
         });
 
-        const chargeData = charge.json.data ?? {};
+        const chargeData = getPaystackData(charge.json);
         const chargeStatus = String(
             chargeData.status ?? '',
         ).toLowerCase();
 
-        const chargeMessage = safePaystackMessage(
-            chargeData,
+        const chargeMessage = getPaystackMessage(
+            charge.json,
             'Payment request submitted.',
         );
 
+        // Save the complete Paystack response for debugging and reconciliation.
         await pool.query(
             `UPDATE public.passenger_subscription_payments
              SET paystack_init = $1::jsonb,
@@ -1218,55 +1296,60 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             [JSON.stringify(charge.json), reference],
         );
 
-        if (chargeStatus === 'failed') {
-            // Prefer Paystack's own machine-readable code — for MoMo it can
-            // be `low_balance_or_payee_limit_reached_or_not_allowed` even
-            // when the human text is a generic "Declined".
-            const failureCode = resolvePaystackFailureCode(
-                chargeData,
-                chargeMessage,
-            );
-            const failureMessage =
-                failureCode === 'INSUFFICIENT_FUNDS'
-                    ? friendlyInsufficientFundsMessage(
-                        chargeData,
-                        chargeMessage,
-                    )
-                    : chargeMessage;
-
-            await pool.query(
-                `UPDATE public.passenger_subscription_payments
-                 SET status = 'failed',
-                     failure_reason = $1,
-                     updated_at = NOW()
-                 WHERE reference = $2
-                   AND status = 'pending'`,
-                [failureMessage, reference],
+        /*
+         * Paystack API-level rejection:
+         * The request itself was rejected. Do not treat it as a successful
+         * pending charge.
+         */
+        if (!charge.ok) {
+            const failure = paymentFailureResponse(
+                charge.json,
+                'Paystack could not initialize this payment.',
             );
 
-            await pool.query(
-                `UPDATE public.paystack_transactions
-                 SET status = 'failed',
-                     updated_at = NOW()
-                 WHERE reference = $1`,
-                [reference],
-            );
+            await markPaymentFailed(reference, failure.message);
 
             return res.status(400).json({
                 success: false,
-                code: failureCode ?? 'CHARGE_FAILED',
+                code: failure.code,
                 reference,
-                message: failureMessage,
+                status: 'failed',
+                needs_otp: false,
+                message: failure.message,
             });
         }
 
+        /*
+         * Paystack accepted the request but the actual charge failed.
+         */
+        if (chargeStatus === 'failed') {
+            const failure = paymentFailureResponse(
+                charge.json,
+                chargeMessage,
+            );
+
+            await markPaymentFailed(reference, failure.message);
+
+            return res.status(400).json({
+                success: false,
+                code: failure.code,
+                reference,
+                status: 'failed',
+                needs_otp: false,
+                message: failure.message,
+            });
+        }
+
+        /*
+         * Charge reports success.
+         * Independently verify the transaction before activating.
+         */
         if (chargeStatus === 'success') {
-            // Do not trust the charge response alone. Verify independently.
             const verification = await paystackGet(
                 `/transaction/verify/${encodeURIComponent(reference)}`,
             );
 
-            const verifiedData = verification.json.data ?? {};
+            const verifiedData = getPaystackData(verification.json);
 
             await pool.query(
                 `UPDATE public.passenger_subscription_payments
@@ -1285,6 +1368,7 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             );
 
             if (
+                verification.ok &&
                 validatePaystackTransaction(verifiedData, {
                     reference,
                     amount,
@@ -1311,16 +1395,23 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
+        /*
+         * Paystack requires OTP.
+         */
         if (chargeStatus === 'send_otp') {
             return res.status(200).json({
                 success: true,
                 reference,
                 needs_otp: true,
                 status: 'pending',
-                message: chargeMessage || 'Enter the OTP sent to your phone.',
+                message: chargeMessage ||
+                    'Enter the OTP sent to your phone.',
             });
         }
 
+        /*
+         * Customer must authorize the payment on their phone.
+         */
         if (
             chargeStatus === 'pay_offline' ||
             chargeStatus === 'pending' ||
@@ -1336,7 +1427,7 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        // Unknown statuses are left pending for /verify to reconcile.
+        // Unknown provider statuses must be reconciled by verification.
         return res.status(200).json({
             success: true,
             reference,
@@ -1350,15 +1441,18 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
             (error as Error).message,
         );
 
-        // If Paystack timed out after receiving the charge, the charge may
-        // still complete. Return the reference so the client can poll /verify.
+        /*
+         * A timeout may occur after Paystack has received the charge.
+         * Do not mark that payment failed or create a new reference.
+         */
         if (paymentCreated && reference) {
             return res.status(202).json({
                 success: true,
                 reference,
                 needs_otp: false,
                 status: 'pending',
-                message: 'Payment status is being checked. Please do not start another payment yet.',
+                message:
+                    'Payment status is being checked. Please do not start another payment yet.',
             });
         }
 
@@ -1407,35 +1501,10 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
         });
     }
 
-    const client = await pool.connect();
-
     try {
-        await client.query('BEGIN');
+        const payment = await getPassengerPayment(reference, uid);
 
-        // Lock this payment while submitting the OTP to prevent concurrent
-        // OTP submissions for the same reference.
-        const paymentResult = await client.query(
-            `SELECT
-                psp.id,
-                psp.passenger_id,
-                psp.amount,
-                psp.currency,
-                psp.status,
-                psp.applied,
-                p.firebase_uid
-             FROM public.passenger_subscription_payments psp
-             INNER JOIN public.passengers p
-                ON p.id = psp.passenger_id
-             WHERE psp.reference = $1
-               AND p.firebase_uid = $2
-             LIMIT 1
-             FOR UPDATE OF psp`,
-            [reference, uid],
-        );
-
-        if (paymentResult.rows.length === 0) {
-            await client.query('ROLLBACK');
-
+        if (!payment) {
             return res.status(404).json({
                 success: false,
                 code: 'TX_NOT_FOUND',
@@ -1443,11 +1512,7 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             });
         }
 
-        const payment = paymentResult.rows[0];
-
         if (payment.applied || payment.status === 'success') {
-            await client.query('COMMIT');
-
             return res.status(200).json({
                 success: true,
                 status: 'success',
@@ -1456,11 +1521,10 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
         }
 
         if (payment.status !== 'pending') {
-            await client.query('ROLLBACK');
-
             return res.status(409).json({
                 success: false,
                 code: 'PAYMENT_NOT_PENDING',
+                status: String(payment.status),
                 message: 'This payment cannot accept an OTP.',
             });
         }
@@ -1470,33 +1534,62 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             { otp, reference },
         );
 
-        const submitData = submit.json.data ?? {};
+        const submitData = getPaystackData(submit.json);
         const submitStatus = String(
             submitData.status ?? '',
         ).toLowerCase();
-        const submitMessage = safePaystackMessage(
-            submitData,
+
+        const submitMessage = getPaystackMessage(
+            submit.json,
             'OTP verification failed.',
         );
 
-        // Never persist the OTP. Only persist Paystack's response.
-        await client.query(
+        // Persist the provider response. Never persist the OTP itself.
+        await pool.query(
             `UPDATE public.passenger_subscription_payments
-             SET paystack_verify = $1::jsonb,
-                 updated_at = NOW()
-             WHERE id = $2`,
-            [JSON.stringify(submit.json), payment.id],
-        );
-
-        await client.query(
-            `UPDATE public.paystack_transactions
              SET paystack_verify = $1::jsonb,
                  updated_at = NOW()
              WHERE reference = $2`,
             [JSON.stringify(submit.json), reference],
         );
 
-        await client.query('COMMIT');
+        await pool.query(
+            `UPDATE public.paystack_transactions
+             SET paystack_verify = $1::jsonb,
+                 updated_at = NOW()
+             WHERE reference = $1`,
+            [JSON.stringify(submit.json), reference],
+        );
+
+        if (!submit.ok) {
+            const failure = paymentFailureResponse(
+                submit.json,
+                'OTP verification failed.',
+            );
+
+            /*
+             * A failed OTP attempt does not always mean the underlying
+             * payment is permanently failed. Keep it pending for retry
+             * unless Paystack explicitly reports a failed charge.
+             */
+            if (submitStatus === 'failed') {
+                await markPaymentFailed(reference, failure.message);
+
+                return res.status(400).json({
+                    success: false,
+                    status: 'failed',
+                    code: failure.code,
+                    message: failure.message,
+                });
+            }
+
+            return res.status(400).json({
+                success: false,
+                status: 'pending',
+                code: failure.code,
+                message: failure.message,
+            });
+        }
 
         if (
             submitStatus === 'send_otp' ||
@@ -1507,59 +1600,36 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
                 success: false,
                 status: 'pending',
                 code: 'OTP_REQUIRED',
-                message: safePaystackMessage(
-                    submitData,
+                message: submitMessage ||
                     'OTP verification is still pending. Check the code and try again.',
-                ),
             });
         }
 
         if (submitStatus === 'failed') {
-            const failureCode = resolvePaystackFailureCode(
-                submitData,
+            const failure = paymentFailureResponse(
+                submit.json,
                 submitMessage,
             );
-            const failureMessage =
-                failureCode === 'INSUFFICIENT_FUNDS'
-                    ? friendlyInsufficientFundsMessage(
-                        submitData,
-                        submitMessage,
-                    )
-                    : submitMessage;
 
-            await pool.query(
-                `UPDATE public.passenger_subscription_payments
-                 SET status = 'failed',
-                     failure_reason = $1,
-                     updated_at = NOW()
-                 WHERE reference = $2
-                   AND status = 'pending'`,
-                [failureMessage, reference],
-            );
-
-            await pool.query(
-                `UPDATE public.paystack_transactions
-                 SET status = 'failed',
-                     updated_at = NOW()
-                 WHERE reference = $1`,
-                [reference],
-            );
+            await markPaymentFailed(reference, failure.message);
 
             return res.status(400).json({
                 success: false,
                 status: 'failed',
-                code: failureCode ?? 'OTP_FAILED',
-                message: failureMessage,
+                code: failure.code,
+                message: failure.message,
             });
         }
 
-        // Regardless of the OTP response, independently verify the actual
-        // transaction with Paystack before activating the subscription.
+        /*
+         * OTP submission is not proof of payment.
+         * Verify the actual transaction with Paystack.
+         */
         const verification = await paystackGet(
             `/transaction/verify/${encodeURIComponent(reference)}`,
         );
 
-        const verifiedData = verification.json.data ?? {};
+        const verifiedData = getPaystackData(verification.json);
 
         await pool.query(
             `UPDATE public.passenger_subscription_payments
@@ -1573,18 +1643,17 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             `UPDATE public.paystack_transactions
              SET paystack_verify = $1::jsonb,
                  updated_at = NOW()
-             WHERE reference = $2`,
+             WHERE reference = $1`,
             [JSON.stringify(verification.json), reference],
         );
 
-        const valid = validatePaystackTransaction(
-            verifiedData,
-            {
+        const valid =
+            verification.ok &&
+            validatePaystackTransaction(verifiedData, {
                 reference,
                 amount: payment.amount,
                 currency: payment.currency,
-            },
-        );
+            });
 
         if (!valid) {
             return res.status(200).json({
@@ -1602,12 +1671,6 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             message: activated.message,
         });
     } catch (error) {
-        try {
-            await client.query('ROLLBACK');
-        } catch {
-            // The transaction may already have committed.
-        }
-
         console.error(
             '[passenger-sub] /submit-otp:',
             (error as Error).message,
@@ -1618,16 +1681,19 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             code: 'OTP_SUBMIT_FAILED',
             message: 'Unable to process OTP with the payment provider.',
         });
-    } finally {
-        client.release();
     }
 });
 
 /* -------------------------------------------------------------------------- */
-/* POST /verify/:reference                                                    */
+/* GET /verify/:reference                                                     */
 /* -------------------------------------------------------------------------- */
 
-router.post(
+/**
+ * IMPORTANT:
+ * This is GET, matching your Flutter ApiConfig:
+ * passengerSubscriptionVerify(reference)
+ */
+router.get(
     '/verify/:reference',
     verifyFirebaseToken,
     async (req: AuthReq, res) => {
@@ -1662,7 +1728,7 @@ router.post(
                 });
             }
 
-            // Ownership check happens before calling Paystack.
+            // Check ownership before contacting Paystack.
             const payment = await getPassengerPayment(reference, uid);
 
             if (!payment) {
@@ -1673,7 +1739,7 @@ router.post(
                 });
             }
 
-            if (payment.applied) {
+            if (payment.applied || payment.status === 'success') {
                 return res.status(200).json({
                     success: true,
                     status: 'success',
@@ -1693,15 +1759,14 @@ router.post(
                 `/transaction/verify/${encodeURIComponent(reference)}`,
             );
 
-            const data = verification.json.data ?? {};
+            const data = getPaystackData(verification.json);
+
             const status = String(
-                data.status ?? 'pending',
+                data.status ?? '',
             ).toLowerCase();
 
-            // Capture the real provider message so the client can react
-            // to specifics (e.g. "Insufficient funds").
-            const message = safePaystackMessage(
-                data,
+            const message = getPaystackMessage(
+                verification.json,
                 'Payment is still processing.',
             );
 
@@ -1720,6 +1785,18 @@ router.post(
                  WHERE reference = $2`,
                 [JSON.stringify(verification.json), reference],
             );
+
+            /*
+             * Paystack verification API itself rejected the request.
+             * This is not proof that the customer payment failed.
+             */
+            if (!verification.ok) {
+                return res.status(200).json({
+                    success: true,
+                    status: 'pending',
+                    message: 'Payment verification is temporarily unavailable. Please wait.',
+                });
+            }
 
             if (status === 'success') {
                 const valid = validatePaystackTransaction(
@@ -1754,55 +1831,43 @@ router.post(
                 });
             }
 
-            if (status === 'send_otp' || status === 'otp') {
+            if (
+                status === 'send_otp' ||
+                status === 'otp'
+            ) {
                 return res.status(200).json({
                     success: true,
                     status: 'send_otp',
                     needs_otp: true,
-                    message: message || 'Enter the OTP sent to your phone.',
+                    message: message ||
+                        'Enter the OTP sent to your phone.',
                 });
             }
 
-            if (status === 'failed' || status === 'reversed') {
-                const failureCode = resolvePaystackFailureCode(
-                    data,
+            if (
+                status === 'failed' ||
+                status === 'reversed'
+            ) {
+                const failure = paymentFailureResponse(
+                    verification.json,
                     message,
                 );
-                const failureMessage =
-                    failureCode === 'INSUFFICIENT_FUNDS'
-                        ? friendlyInsufficientFundsMessage(data, message)
-                        : message;
 
-                await pool.query(
-                    `UPDATE public.passenger_subscription_payments
-                     SET status = 'failed',
-                         failure_reason = $1,
-                         updated_at = NOW()
-                     WHERE reference = $2
-                       AND status = 'pending'`,
-                    [failureMessage, reference],
+                await markPaymentFailed(
+                    reference,
+                    failure.message,
                 );
 
-                await pool.query(
-                    `UPDATE public.paystack_transactions
-                     SET status = 'failed',
-                         updated_at = NOW()
-                     WHERE reference = $1`,
-                    [reference],
-                );
-
-                // Return 200 on purpose: /verify is polled, and a 4xx would
-                // be swallowed by the client's transient-error catch and
-                // hide the real decline reason from the user.
                 return res.status(200).json({
                     success: false,
                     status: 'failed',
-                    code: failureCode ?? 'VERIFY_FAILED',
-                    message: failureMessage,
+                    code: failure.code === 'CHARGE_FAILED'
+                        ? 'VERIFY_FAILED'
+                        : failure.code,
+                    message: failure.message,
                 });
             }
 
-            // Anything else is still pending.
             return res.status(200).json({
                 success: true,
                 status: 'pending',
