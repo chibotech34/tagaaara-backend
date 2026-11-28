@@ -327,6 +327,49 @@ function detectPaymentFailureCode(message: string): string | null {
     return null;
 }
 
+/**
+ * Resolve the machine-readable failure code for a Paystack charge/verify
+ * payload. Paystack's own `data.code` is authoritative — for Mobile Money
+ * it can carry `low_balance_or_payee_limit_reached_or_not_allowed` even
+ * when the human-readable text is a generic "Declined". We only fall back
+ * to scanning the text when no code is present.
+ */
+function resolvePaystackFailureCode(
+    data: Record<string, any> | undefined,
+    fallbackMessage: string,
+): string | null {
+    const rawCode = String(data?.code ?? '').trim().toLowerCase();
+
+    if (
+        rawCode === 'low_balance_or_payee_limit_reached_or_not_allowed' ||
+        rawCode === 'insufficient_funds'
+    ) {
+        return 'INSUFFICIENT_FUNDS';
+    }
+
+    return detectPaymentFailureCode(fallbackMessage);
+}
+
+/**
+ * When Paystack tells us it is the wallet/payee-limit condition, replace
+ * the provider's generic text ("Declined", "Contact your bank") with
+ * something the user can act on.
+ */
+function friendlyInsufficientFundsMessage(
+    data: Record<string, any> | undefined,
+    fallback: string,
+): string {
+    const rawCode = String(data?.code ?? '').trim().toLowerCase();
+    if (rawCode === 'low_balance_or_payee_limit_reached_or_not_allowed') {
+        return (
+            'Your Mobile Money wallet does not have enough funds, or your ' +
+            'payee limit has been reached. Please top up or check your ' +
+            'transaction limits and try again.'
+        );
+    }
+    return fallback;
+}
+
 async function passengerForUid(uid: string) {
     const result = await pool.query(
         `SELECT id, firebase_uid, full_name, phone, email
@@ -1176,6 +1219,21 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
         );
 
         if (chargeStatus === 'failed') {
+            // Prefer Paystack's own machine-readable code — for MoMo it can
+            // be `low_balance_or_payee_limit_reached_or_not_allowed` even
+            // when the human text is a generic "Declined".
+            const failureCode = resolvePaystackFailureCode(
+                chargeData,
+                chargeMessage,
+            );
+            const failureMessage =
+                failureCode === 'INSUFFICIENT_FUNDS'
+                    ? friendlyInsufficientFundsMessage(
+                        chargeData,
+                        chargeMessage,
+                    )
+                    : chargeMessage;
+
             await pool.query(
                 `UPDATE public.passenger_subscription_payments
                  SET status = 'failed',
@@ -1183,7 +1241,7 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
                      updated_at = NOW()
                  WHERE reference = $2
                    AND status = 'pending'`,
-                [chargeMessage, reference],
+                [failureMessage, reference],
             );
 
             await pool.query(
@@ -1196,11 +1254,9 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
 
             return res.status(400).json({
                 success: false,
-                code:
-                    detectPaymentFailureCode(chargeMessage) ??
-                    'CHARGE_FAILED',
+                code: failureCode ?? 'CHARGE_FAILED',
                 reference,
-                message: chargeMessage,
+                message: failureMessage,
             });
         }
 
@@ -1459,6 +1515,18 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
         }
 
         if (submitStatus === 'failed') {
+            const failureCode = resolvePaystackFailureCode(
+                submitData,
+                submitMessage,
+            );
+            const failureMessage =
+                failureCode === 'INSUFFICIENT_FUNDS'
+                    ? friendlyInsufficientFundsMessage(
+                        submitData,
+                        submitMessage,
+                    )
+                    : submitMessage;
+
             await pool.query(
                 `UPDATE public.passenger_subscription_payments
                  SET status = 'failed',
@@ -1466,7 +1534,7 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
                      updated_at = NOW()
                  WHERE reference = $2
                    AND status = 'pending'`,
-                [submitMessage, reference],
+                [failureMessage, reference],
             );
 
             await pool.query(
@@ -1480,10 +1548,8 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             return res.status(400).json({
                 success: false,
                 status: 'failed',
-                code:
-                    detectPaymentFailureCode(submitMessage) ??
-                    'OTP_FAILED',
-                message: submitMessage,
+                code: failureCode ?? 'OTP_FAILED',
+                message: failureMessage,
             });
         }
 
@@ -1688,53 +1754,59 @@ router.post(
                 });
             }
 
-            if (
-                status === 'failed' ||
-                status === 'reversed' ||
-                status === 'cancelled'
-            ) {
-                // The passenger payment table's CHECK constraint does not
-                // permit "cancelled"; map cancellation to "failed".
-                const databaseStatus =
-                    status === 'cancelled' ? 'failed' : status;
+            if (status === 'send_otp' || status === 'otp') {
+                return res.status(200).json({
+                    success: true,
+                    status: 'send_otp',
+                    needs_otp: true,
+                    message: message || 'Enter the OTP sent to your phone.',
+                });
+            }
+
+            if (status === 'failed' || status === 'reversed') {
+                const failureCode = resolvePaystackFailureCode(
+                    data,
+                    message,
+                );
+                const failureMessage =
+                    failureCode === 'INSUFFICIENT_FUNDS'
+                        ? friendlyInsufficientFundsMessage(data, message)
+                        : message;
 
                 await pool.query(
                     `UPDATE public.passenger_subscription_payments
-                     SET status = $1,
-                         failure_reason = $2,
+                     SET status = 'failed',
+                         failure_reason = $1,
                          updated_at = NOW()
-                     WHERE reference = $3
+                     WHERE reference = $2
                        AND status = 'pending'`,
-                    [databaseStatus, message, reference],
+                    [failureMessage, reference],
                 );
 
                 await pool.query(
                     `UPDATE public.paystack_transactions
-                     SET status = $1,
+                     SET status = 'failed',
                          updated_at = NOW()
-                     WHERE reference = $2`,
-                    [databaseStatus, reference],
+                     WHERE reference = $1`,
+                    [reference],
                 );
 
-                // Return the REAL reason (e.g. "Insufficient funds") plus a
-                // machine-readable code so the client can show the right UI.
+                // Return 200 on purpose: /verify is polled, and a 4xx would
+                // be swallowed by the client's transient-error catch and
+                // hide the real decline reason from the user.
                 return res.status(200).json({
                     success: false,
-                    status,
-                    code:
-                        detectPaymentFailureCode(message) ??
-                        'PAYMENT_FAILED',
-                    message:
-                        message && message !== 'Payment is still processing.'
-                            ? message
-                            : 'Payment was not completed.',
+                    status: 'failed',
+                    code: failureCode ?? 'VERIFY_FAILED',
+                    message: failureMessage,
                 });
             }
 
+            // Anything else is still pending.
             return res.status(200).json({
-                success: false,
+                success: true,
                 status: 'pending',
-                message,
+                message: message || 'Payment is still processing.',
             });
         } catch (error) {
             console.error(
@@ -1745,7 +1817,7 @@ router.post(
             return res.status(502).json({
                 success: false,
                 code: 'VERIFY_FAILED',
-                message: 'Unable to verify payment at this time.',
+                message: 'Unable to verify payment status.',
             });
         }
     },
