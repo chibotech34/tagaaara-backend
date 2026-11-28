@@ -1,4 +1,3 @@
-
 // src/routes/driverSubscriptionRoutes.ts
 
 import { Router, Request, Response, NextFunction } from 'express';
@@ -192,21 +191,25 @@ function resolvePaystackFailure(
         '',
     );
 
+    // Normalize spaces to underscores to make matching more robust
     const combined = [
         rawCode,
         rawMessage,
         String(data.status ?? ''),
     ]
         .join(' ')
-        .toUpperCase();
+        .toUpperCase()
+        .replace(/\s+/g, '_');
 
     const insufficientFunds =
-        combined.includes(
-            'LOW_BALANCE_OR_PAYEE_LIMIT_REACHED_OR_NOT_ALLOWED',
-        ) ||
+        combined.includes('LOW_BALANCE_OR_PAYEE_LIMIT_REACHED_OR_NOT_ALLOWED') ||
         combined.includes('INSUFFICIENT_FUNDS') ||
         combined.includes('INSUFFICIENT_BALANCE') ||
-        combined.includes('LOW_BALANCE');
+        combined.includes('LOW_BALANCE') ||
+        combined.includes('NOT_ENOUGH') ||
+        combined.includes('NO_FUNDS') ||
+        combined.includes('NOT_ENOUGH_FUNDS') ||
+        combined.includes('DECLINED');
 
     if (insufficientFunds) {
         return {
@@ -661,7 +664,8 @@ router.post(
                         ? failure.message
                         : (
                             data.display_text ||
-                            charge.data?.message ||
+                            data.gateway_response ||
+                            data.message ||
                             'Your payment could not be completed.'
                         ),
                 });
@@ -728,10 +732,14 @@ router.post(
                 needs_otp: needsOtp,
                 message:
                     data.display_text ||
+                    data.gateway_response ||
+                    data.message ||
                     charge.data?.message ||
                     '',
                 displayText:
                     data.display_text ||
+                    data.gateway_response ||
+                    data.message ||
                     charge.data?.message ||
                     '',
             });
@@ -863,7 +871,8 @@ router.post(
                     reference,
                     message:
                         data.display_text ||
-                        otpRes.data?.message ||
+                        data.gateway_response ||
+                        data.message ||
                         'Your payment could not be completed.',
                 });
             }
@@ -1046,7 +1055,8 @@ router.get(
                     reference,
                     message:
                         data.display_text ||
-                        check.data?.message ||
+                        data.gateway_response ||
+                        data.message ||
                         'Payment failed.',
                 });
             }
