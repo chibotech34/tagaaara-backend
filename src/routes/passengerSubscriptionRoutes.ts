@@ -292,6 +292,41 @@ function safePaystackMessage(
         : fallback;
 }
 
+/**
+ * Maps a free-text Paystack failure message to a stable machine-readable
+ * code so the client can pick the right UI (e.g. insufficient funds dialog
+ * vs. a generic toast).
+ */
+function detectPaymentFailureCode(message: string): string | null {
+    const lower = (message || '').toLowerCase();
+
+    if (
+        lower.includes('insufficient') ||
+        lower.includes('no fund') ||
+        lower.includes('not enough') ||
+        lower.includes('low balance') ||
+        lower.includes('balance is low') ||
+        lower.includes('not sufficient') ||
+        lower.includes('cannot perform this transaction') ||
+        lower.includes('declined due to insufficient')
+    ) {
+        return 'INSUFFICIENT_FUNDS';
+    }
+    if (
+        lower.includes('wrong pin') ||
+        lower.includes('invalid pin') ||
+        lower.includes('incorrect pin')
+    ) {
+        return 'WRONG_PIN';
+    }
+    if (lower.includes('declined')) return 'DECLINED';
+    if (lower.includes('timeout') || lower.includes('timed out')) {
+        return 'TIMEOUT';
+    }
+    if (lower.includes('cancel')) return 'CANCELLED';
+    return null;
+}
+
 async function passengerForUid(uid: string) {
     const result = await pool.query(
         `SELECT id, firebase_uid, full_name, phone, email
@@ -1161,7 +1196,9 @@ router.post('/initialize', verifyFirebaseToken, async (req: AuthReq, res) => {
 
             return res.status(400).json({
                 success: false,
-                code: 'CHARGE_FAILED',
+                code:
+                    detectPaymentFailureCode(chargeMessage) ??
+                    'CHARGE_FAILED',
                 reference,
                 message: chargeMessage,
             });
@@ -1381,6 +1418,10 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
         const submitStatus = String(
             submitData.status ?? '',
         ).toLowerCase();
+        const submitMessage = safePaystackMessage(
+            submitData,
+            'OTP verification failed.',
+        );
 
         // Never persist the OTP. Only persist Paystack's response.
         await client.query(
@@ -1425,10 +1466,7 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
                      updated_at = NOW()
                  WHERE reference = $2
                    AND status = 'pending'`,
-                [
-                    safePaystackMessage(submitData, 'OTP verification failed.'),
-                    reference,
-                ],
+                [submitMessage, reference],
             );
 
             await pool.query(
@@ -1442,11 +1480,10 @@ router.post('/submit-otp', verifyFirebaseToken, async (req: AuthReq, res) => {
             return res.status(400).json({
                 success: false,
                 status: 'failed',
-                code: 'OTP_FAILED',
-                message: safePaystackMessage(
-                    submitData,
-                    'OTP verification failed.',
-                ),
+                code:
+                    detectPaymentFailureCode(submitMessage) ??
+                    'OTP_FAILED',
+                message: submitMessage,
             });
         }
 
@@ -1595,6 +1632,8 @@ router.post(
                 data.status ?? 'pending',
             ).toLowerCase();
 
+            // Capture the real provider message so the client can react
+            // to specifics (e.g. "Insufficient funds").
             const message = safePaystackMessage(
                 data,
                 'Payment is still processing.',
@@ -1677,10 +1716,18 @@ router.post(
                     [databaseStatus, reference],
                 );
 
+                // Return the REAL reason (e.g. "Insufficient funds") plus a
+                // machine-readable code so the client can show the right UI.
                 return res.status(200).json({
                     success: false,
                     status,
-                    message: 'Payment was not completed.',
+                    code:
+                        detectPaymentFailureCode(message) ??
+                        'PAYMENT_FAILED',
+                    message:
+                        message && message !== 'Payment is still processing.'
+                            ? message
+                            : 'Payment was not completed.',
                 });
             }
 

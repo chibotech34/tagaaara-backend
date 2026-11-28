@@ -55,6 +55,36 @@ interface AuthRequest extends Request {
     adminUser?: AdminUser;
 }
 
+/**
+ * Audit logging is best-effort because verification_audit_log was not
+ * included in the confirmed database schema. Driver status updates must
+ * still succeed when that optional table is absent or has a different schema.
+ */
+async function writeVerificationAudit(
+    driverId: number,
+    adminId: number,
+    action: string,
+    previousStatus: string,
+    newStatus: string,
+    reason?: string,
+): Promise<void> {
+    try {
+        await pool.query(
+            `
+            INSERT INTO public.verification_audit_log
+                (driver_id, admin_id, action, previous_status, new_status, reason)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            `,
+            [driverId, adminId, action, previousStatus, newStatus, reason ?? null],
+        );
+    } catch (error) {
+        console.warn(
+            '⚠️ Driver status changed, but optional verification audit could not be saved:',
+            (error as any)?.message ?? error,
+        );
+    }
+}
+
 /*
 |--------------------------------------------------------------------------
 | App
@@ -536,10 +566,10 @@ app.get(
                 safeCount(
                     'todaysRevenue',
                     `
-                    SELECT COALESCE(SUM(COALESCE(fare, amount, 0)), 0)::float AS v
+                    SELECT COALESCE(SUM(fare), 0)::float AS v
                     FROM public.rides
                     WHERE status = 'completed'
-                      AND DATE(COALESCE(completed_at, updated_at, created_at))
+                      AND DATE(COALESCE(paid_at, completed_at, updated_at, requested_at))
                           = CURRENT_DATE
                     `,
                 ),
@@ -613,7 +643,7 @@ app.get(
                         d.full_name AS name,
                         (SELECT COUNT(*)::int
                          FROM public.rides r
-                         WHERE r.driver_id = d.id) AS "rideCount"
+                         WHERE r.driver_id = d.id::text) AS "rideCount"
                     FROM public.drivers d
                     ORDER BY d.created_at DESC
                 `);
@@ -657,37 +687,29 @@ app.get(
     '/api/admin/passengers',
     async (_req: AuthRequest, res: Response) => {
         try {
-            let result;
-
-            try {
-                result = await pool.query(`
-                    SELECT
-                        id,
-                        full_name AS name,
-                        phone,
-                        region,
-                        status,
-                        COALESCE(total_rides, 0)::int AS "totalRides"
-                    FROM public.passengers
-                    ORDER BY created_at DESC
-                `);
-            } catch (innerErr) {
-                console.warn(
-                    '⚠️  passengers.total_rides missing, falling back to 0:',
-                    innerErr,
-                );
-                result = await pool.query(`
-                    SELECT
-                        id,
-                        full_name AS name,
-                        phone,
-                        region,
-                        status,
-                        0::int AS "totalRides"
-                    FROM public.passengers
-                    ORDER BY created_at DESC
-                `);
-            }
+            const result = await pool.query(`
+                SELECT
+                    p.id,
+                    p.firebase_uid AS "firebaseUid",
+                    p.full_name AS name,
+                    p.phone,
+                    p.email,
+                    p.region,
+                    p.district,
+                    p.town_city AS "townCity",
+                    p.account_status AS status,
+                    p.profile_photo_url AS "profilePhotoUrl",
+                    p.created_at AS "createdAt",
+                    COALESCE(ride_counts.total_rides, 0)::int AS "totalRides"
+                FROM public.passengers p
+                LEFT JOIN (
+                    SELECT passenger_id, COUNT(*)::int AS total_rides
+                    FROM public.rides
+                    GROUP BY passenger_id
+                ) ride_counts
+                    ON ride_counts.passenger_id = p.id
+                ORDER BY p.created_at DESC NULLS LAST
+            `);
 
             return res.status(200).json({
                 success: true,
@@ -696,9 +718,10 @@ app.get(
         } catch (error: unknown) {
             console.error('❌ Admin passengers error:', error);
 
+            const dbError = error as { message?: string };
             return res.status(500).json({
                 success: false,
-                error: 'Failed to fetch passengers',
+                error: dbError.message || 'Failed to fetch passengers',
             });
         }
     },
@@ -714,55 +737,40 @@ app.get(
     '/api/rickshaws',
     async (_req: AuthRequest, res: Response) => {
         try {
-            try {
-                const result = await pool.query(`
-                    SELECT
-                        r.id,
-                        r.registration_number AS "registrationNumber",
-                        COALESCE(d.full_name, 'Unassigned') AS driver,
-                        r.status,
-                        COALESCE(r.verification_status, r.status) AS "verificationStatus"
-                    FROM public.rickshaws r
-                    LEFT JOIN public.drivers d ON r.driver_id = d.id
-                    ORDER BY r.created_at DESC
-                `);
+            const result = await pool.query(`
+                SELECT
+                    d.id,
+                    d.registration_number AS "registrationNumber",
+                    d.full_name AS driver,
+                    CASE
+                        WHEN d.is_available = true THEN 'active'
+                        ELSE 'inactive'
+                    END AS status,
+                    d.status AS "verificationStatus",
+                    d.vehicle_type AS "vehicleType",
+                    d.vehicle_model AS "vehicleModel",
+                    d.vehicle_color AS "vehicleColor",
+                    d.vehicle_year AS "vehicleYear",
+                    d.vehicle_photo_url AS "vehiclePhotoUrl",
+                    d.region,
+                    d.district,
+                    d.town_city AS "townCity"
+                FROM public.drivers d
+                WHERE NULLIF(TRIM(d.registration_number), '') IS NOT NULL
+                ORDER BY d.created_at DESC NULLS LAST
+            `);
 
-                return res.status(200).json({
-                    success: true,
-                    rickshaws: result.rows,
-                });
-            } catch (innerErr) {
-                console.warn(
-                    '⚠️  public.rickshaws missing, deriving from drivers:',
-                    innerErr,
-                );
-
-                const result = await pool.query(`
-                    SELECT
-                        d.id,
-                        COALESCE(d.registration_number, 'N/A') AS "registrationNumber",
-                        d.full_name AS driver,
-                        CASE
-                            WHEN d.is_online THEN 'active'
-                            ELSE 'inactive'
-                        END AS status,
-                        d.status AS "verificationStatus"
-                    FROM public.drivers d
-                    WHERE d.registration_number IS NOT NULL
-                    ORDER BY d.created_at DESC
-                `);
-
-                return res.status(200).json({
-                    success: true,
-                    rickshaws: result.rows,
-                });
-            }
+            return res.status(200).json({
+                success: true,
+                rickshaws: result.rows,
+            });
         } catch (error: unknown) {
             console.error('❌ Rickshaws error:', error);
 
+            const dbError = error as { message?: string };
             return res.status(500).json({
                 success: false,
-                error: 'Failed to fetch rickshaws',
+                error: dbError.message || 'Failed to fetch rickshaws',
             });
         }
     },
@@ -777,48 +785,86 @@ app.get(
 app.get(
     '/api/finance',
     async (_req: AuthRequest, res: Response) => {
-        const tables = [
-            'transactions',
-            'payments',
-            'wallet_transactions',
-        ];
-
-        for (const table of tables) {
-            try {
-                const result = await pool.query(`
+        try {
+            const result = await pool.query(`
+                SELECT *
+                FROM (
                     SELECT
-                        t.id,
+                        t.id::text AS id,
                         t.ride_id AS "rideId",
-                        COALESCE(p.full_name, 'Unknown') AS passenger,
-                        COALESCE(t.amount, 0)::float AS amount,
-                        COALESCE(t.status, 'unknown') AS status
-                    FROM public.${table} t
+                        p.full_name AS passenger,
+                        d.full_name AS driver,
+                        t.amount::float AS amount,
+                        t.status,
+                        t.type AS "transactionType",
+                        t.payment_method AS "paymentMethod",
+                        t.provider,
+                        t.transaction_reference AS reference,
+                        t.created_at AS "createdAt",
+                        'driver_transaction'::text AS source
+                    FROM public.driver_transactions t
+                    LEFT JOIN public.rides r
+                        ON r.id = t.ride_id
                     LEFT JOIN public.passengers p
-                        ON t.passenger_id = p.id
-                    ORDER BY t.created_at DESC
-                    LIMIT 200
-                `);
+                        ON p.id = r.passenger_id
+                    LEFT JOIN public.drivers d
+                        ON d.id = t.driver_id
 
-                return res.status(200).json({
-                    success: true,
-                    finance: result.rows,
-                });
-            } catch (err) {
-                console.warn(
-                    `⚠️  Finance table "${table}" not usable, trying next:`,
-                    (err as any)?.message ?? err,
-                );
-            }
+                    UNION ALL
+
+                    SELECT
+                        wt.id::text AS id,
+                        NULL::integer AS "rideId",
+                        NULL::varchar AS passenger,
+                        d.full_name AS driver,
+                        wt.amount::float AS amount,
+                        wt.status,
+                        wt.transaction_type AS "transactionType",
+                        NULL::varchar AS "paymentMethod",
+                        NULL::varchar AS provider,
+                        wt.reference AS reference,
+                        wt.created_at AS "createdAt",
+                        'driver_wallet_transaction'::text AS source
+                    FROM public.driver_wallet_transactions wt
+                    LEFT JOIN public.drivers d
+                        ON d.id = wt.driver_id
+
+                    UNION ALL
+
+                    SELECT
+                        sp.id::text AS id,
+                        NULL::integer AS "rideId",
+                        NULL::varchar AS passenger,
+                        d.full_name AS driver,
+                        sp.amount::float AS amount,
+                        sp.status,
+                        'subscription_payment'::varchar AS "transactionType",
+                        NULL::varchar AS "paymentMethod",
+                        sp.provider,
+                        sp.reference AS reference,
+                        COALESCE(sp.paid_at, sp.created_at) AS "createdAt",
+                        'driver_subscription_payment'::text AS source
+                    FROM public.driver_subscription_payments sp
+                    LEFT JOIN public.drivers d
+                        ON d.id = sp.driver_id
+                ) AS ledger
+                ORDER BY "createdAt" DESC NULLS LAST
+                LIMIT 200
+            `);
+
+            return res.status(200).json({
+                success: true,
+                finance: result.rows,
+            });
+        } catch (error: unknown) {
+            console.error('❌ Finance error:', error);
+
+            const dbError = error as { message?: string };
+            return res.status(500).json({
+                success: false,
+                error: dbError.message || 'Failed to fetch finance records',
+            });
         }
-
-        console.warn(
-            '⚠️  No finance table found — returning empty finance list.',
-        );
-
-        return res.status(200).json({
-            success: true,
-            finance: [],
-        });
     },
 );
 
@@ -1081,13 +1127,12 @@ app.post(
                 [req.adminUser.id, driverId],
             );
 
-            await pool.query(
-                `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status)
-                VALUES ($1, $2, 'approve', $3, 'approved')
-                `,
-                [driverId, req.adminUser.id, currentStatus],
+            await writeVerificationAudit(
+                driverId,
+                req.adminUser.id,
+                'approve',
+                currentStatus,
+                'approved',
             );
 
             return res.status(200).json({
@@ -1175,13 +1220,13 @@ app.post(
                 [req.adminUser.id, reason, driverId],
             );
 
-            await pool.query(
-                `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status, reason)
-                VALUES ($1, $2, 'reject', $3, 'rejected', $4)
-                `,
-                [driverId, req.adminUser.id, currentStatus, reason],
+            await writeVerificationAudit(
+                driverId,
+                req.adminUser.id,
+                'reject',
+                currentStatus,
+                'rejected',
+                reason,
             );
 
             return res.status(200).json({
@@ -1269,13 +1314,13 @@ app.post(
                 [message, req.adminUser.id, driverId],
             );
 
-            await pool.query(
-                `
-                INSERT INTO public.verification_audit_log
-                (driver_id, admin_id, action, previous_status, new_status, reason)
-                VALUES ($1, $2, 'request_correction', $3, 'action_required', $4)
-                `,
-                [driverId, req.adminUser.id, currentStatus, message],
+            await writeVerificationAudit(
+                driverId,
+                req.adminUser.id,
+                'request_correction',
+                currentStatus,
+                'action_required',
+                message,
             );
 
             return res.status(200).json({
@@ -1331,11 +1376,12 @@ app.get(
                 audit: result.rows,
             });
         } catch (error: unknown) {
-            console.error('❌ Audit log error:', error);
+            console.warn('⚠️ Driver audit log is unavailable:', error);
 
-            return res.status(500).json({
-                success: false,
-                error: 'Failed to fetch audit log',
+            return res.status(200).json({
+                success: true,
+                audit: [],
+                warning: 'Audit history is not configured in the database.',
             });
         }
     },
